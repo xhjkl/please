@@ -1,0 +1,38 @@
+[package]
+name = "please"
+version = "0.1.1"
+edition = "2024"
+
+[dependencies]
+async-trait = { version = "0.1", features = [] }
+atty = { version = "0.2", features = [] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+eyre = { version = "0.6", features = [] }
+nix = { version = "0.30", features = ["process"] }
+postcard = { version = "1", features = ["use-std"] }
+rustyline = { version = "17", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+time = { version = "0.3", features = ["local-offset", "formatting"] }
+tokio = { version = "1", features = ["rt-multi-thread", "full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-ident = { version = "1", features = [] }
+metal = "0.32"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls-native-roots",
+  "stream",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gg = { git = "https://github.com/utilityai/llama-cpp-rs", package = "llama-cpp-2", features = [
+  "native",
+  "metal",
+] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+gg = { git = "https://github.com/utilityai/llama-cpp-rs", package = "llama-cpp-2", features = [
+  "native",
+  # "cuda",
+] }
