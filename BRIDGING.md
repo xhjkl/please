@@ -17,7 +17,9 @@ Host *
   ExitOnForwardFailure yes
   StreamLocalBindMask 0177
   StreamLocalBindUnlink yes
-  RemoteForward /home/%r/.please/socket %d/.please/socket
+  RemoteForward /root/.please/socket %d/.please/socket
+  ## Or, if you have non-root user on the remote:
+  # RemoteForward /home/%r/.please/socket %d/.please/socket
 ```
 
 For *macOS* remotes (if needed):
