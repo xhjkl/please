@@ -15,10 +15,16 @@ You can get it from Homebrew:
 $ brew install xhjkl/made/please
 ```
 
+Or with the installer script:
+```
+# either the above, or this:
+$ curl -fsSL https://raw.githubusercontent.com/xhjkl/please/main/scripts/install.sh | sh
+```
+
 Alternatively, you can install it from source.
 It needs to be pulled from git, crates-io do not have it:
 ```
-# either the above, or this:
+# either one of the above, or this:
 $ cargo install --git https://github.com/xhjkl/please
 ```
 
