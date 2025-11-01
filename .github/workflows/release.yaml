@@ -6,22 +6,24 @@ on:
 
 jobs:
   build-linux-x86_64:
-    name: linux (x86_64 musl)
+    name: linux/x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Setup CUDA
+        uses: Jimver/cuda-toolkit@v0.2.14
+        with:
+          cuda: '12.2.0'
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Build (x86_64-unknown-linux-musl)
-        run: cross build --release --locked --target x86_64-unknown-linux-musl
+      - name: Build
+        run: cargo build --release --locked
       - name: Prepare artifact
         run: |
           mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/please dist/please-linux-x86_64
+          cp target/release/please dist/please-linux-x86_64
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -29,22 +31,25 @@ jobs:
           path: dist/please-linux-x86_64
 
   build-linux-arm64:
-    name: linux (arm64 musl)
+    name: linux/arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Install aarch64 gnu toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Build (aarch64-unknown-linux-musl)
-        run: cross build --release --locked --target aarch64-unknown-linux-musl
+      - name: Build (aarch64-unknown-linux-gnu)
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
       - name: Prepare artifact
         run: |
           mkdir -p dist
-          cp target/aarch64-unknown-linux-musl/release/please dist/please-linux-arm64
+          cp target/aarch64-unknown-linux-gnu/release/please dist/please-linux-arm64
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
