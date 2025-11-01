@@ -10,7 +10,7 @@ pub async fn handle_specials_if_needed() -> Result<bool> {
 
     let arg = args.next().unwrap_or_default();
 
-    if matches!(arg.as_str(), "--help" | "-H" | "-h" | "-?") {
+    if matches!(arg.as_str(), "help" | "--help" | "-H" | "-h" | "-?") {
         println!(
             "{}",
             concat!(
@@ -22,8 +22,33 @@ pub async fn handle_specials_if_needed() -> Result<bool> {
         return Ok(true);
     }
 
-    if matches!(arg.as_str(), "--version" | "-V" | "-v") {
+    if matches!(arg.as_str(), "version" | "--version" | "-V" | "-v") {
         println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(true);
+    }
+
+    if matches!(arg.as_str(), "docker") {
+        // Wrap docker to bind-mount the host socket into the container at /root/.please/socket
+        let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
+        let host_socket = std::path::Path::new(&home).join(".please").join("socket");
+        let _ = std::fs::create_dir_all(std::path::Path::new(&home).join(".please"));
+        let volume = format!("{}:/root/.please/socket", host_socket.display());
+
+        let mut docker_args: Vec<String> = Vec::new();
+        docker_args.push("-v".to_string());
+        docker_args.push(volume);
+        docker_args.extend(args);
+
+        let status = std::process::Command::new("docker")
+            .args(&docker_args)
+            .status()
+            .map_err(|e| eyre::eyre!(e))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    if matches!(arg.as_str(), "run" | "start") {
+        // Launch the hub in the foreground and exit when it stops.
+        crate::hub::run().await?;
         return Ok(true);
     }
 
