@@ -16,17 +16,9 @@ struct Hub {
 }
 
 /// Default UNIX socket location under `~/.please/socket`.
-pub fn default_socket_path() -> std::path::PathBuf {
+pub fn socket_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
     std::path::Path::new(&home).join(".please").join("socket")
-}
-
-/// Resolve socket path, honoring `PLEASE_SOCKET` if set.
-pub fn socket_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("PLEASE_SOCKET") {
-        return std::path::PathBuf::from(p);
-    }
-    default_socket_path()
 }
 
 /// Ensure the socket directory exists and is private (0700 on Unix).
@@ -149,6 +141,9 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Hub>) -> Res
 
 /// Hub main loop: bind socket, load model once, accept clients forever.
 pub async fn run() -> Result<()> {
+    // Set the env so that the logs are visible when started in the foreground.
+    unsafe { std::env::set_var("PLEASE_LOG_EVERYTHING", "yes") };
+
     let socket_path = socket_path();
     ensure_socket_dir(&socket_path)?;
     cleanup_stale_socket(&socket_path)?;
