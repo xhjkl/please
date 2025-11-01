@@ -122,3 +122,49 @@ jobs:
             dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute artifact checksums
+        id: sums
+        shell: bash
+        run: |
+          set -euo pipefail
+          linux_amd64_sha=$(sha256sum dist/please-linux-x86_64 | awk '{print $1}')
+          linux_arm64_sha=$(sha256sum dist/please-linux-arm64 | awk '{print $1}')
+          darwin_arm64_sha=$(sha256sum dist/please-darwin-arm64 | awk '{print $1}')
+          echo "sha_linux_x86_64=$linux_amd64_sha" >> "$GITHUB_OUTPUT"
+          echo "sha_linux_arm64=$linux_arm64_sha" >> "$GITHUB_OUTPUT"
+          echo "sha_darwin_arm64=$darwin_arm64_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v5
+        with:
+          repository: xhjkl/homebrew-made
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Render Homebrew formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tap/Formula
+          cp homebrew/Formula/please.rb tap/Formula/please.rb
+          # Substitute pilcrow tokens
+          sed -i \
+            -e "s|¶version|${{ steps.tag.outputs.tag }}|g" \
+            -e "s|¶sha256_darwin_arm64|${{ steps.sums.outputs.sha_darwin_arm64 }}|g" \
+            -e "s|¶sha256_linux_x86_64|${{ steps.sums.outputs.sha_linux_x86_64 }}|g" \
+            -e "s|¶sha256_linux_arm64|${{ steps.sums.outputs.sha_linux_arm64 }}|g" tap/Formula/please.rb
+
+      - name: Commit and push tap update
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C tap add Formula/please.rb
+          if git -C tap diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git -C tap commit -m "please: bump to ${{ steps.tag.outputs.tag }}"
+          git -C tap push origin HEAD:main --force-with-lease
