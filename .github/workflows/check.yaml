@@ -1,0 +1,33 @@
+name: Check
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  check:
+    name: check (linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Run tests
+        run: cargo test --locked --verbose
+
+      - name: Smoke check
+        run: |
+          ./target/release/please --version
