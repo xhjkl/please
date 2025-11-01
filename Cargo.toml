@@ -36,3 +36,11 @@ gg = { git = "https://github.com/utilityai/llama-cpp-rs", package = "llama-cpp-2
   "native",
   # "cuda",
 ] }
+
+[profile.release]
+opt-level = "z"
+debug = false
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
