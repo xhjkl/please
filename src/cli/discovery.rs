@@ -143,6 +143,7 @@ pub fn choose_best_model_path() -> Option<PathBuf> {
         return None;
     }
 
+    // Choose largest, break ties by freshness.
     candidates.sort_by(|a, b| match b.size_bytes.cmp(&a.size_bytes) {
         Ordering::Equal => b.mtime.cmp(&a.mtime),
         other => other,
