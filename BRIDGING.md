@@ -32,6 +32,7 @@ Host my.macos.box
 
 Use absolute paths in `RemoteForward`: `~` is not reliably expanded by `sshd`.
 Ensure the directory exists on both sides: `mkdir -p ~/.please`.
+Also ensure there is no lingering socket file on the remote end: `rm -f ~/.please/socket`.
 
 ## Start the Local Hub
 
