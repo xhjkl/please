@@ -5,7 +5,6 @@ use crate::cli::specials;
 use crate::display;
 use crate::display::Display;
 use crate::history;
-use crate::hub;
 use crate::protocol::Message;
 
 use super::connect::obtain_control_stream;
@@ -23,22 +22,14 @@ fn start_display() -> Result<Display> {
 /// CLI entrypoint: decide between hub mode, REPL, or one-shot batch prompt.
 /// Keeps top-level flow readable while deferring details to real implementations.
 pub async fn run() -> Result<()> {
-    // If the program was started like `PLEASE_BECOME_HUB=yes please`, then this process is the hub.
-    // This will only show the technical readout of the inference process, not user input.
-    let we_were_asked_to_become_hub = std::env::var("PLEASE_BECOME_HUB").is_ok();
-    if we_were_asked_to_become_hub {
-        hub::run().await?;
-        return Ok(());
-    }
+    // Start display; all user-visible output goes through it
+    let display = start_display()?;
 
     // One-shot specials (help/version/load) should exit early before any UI/hub work.
     let did_handle_specials = specials::handle_specials_if_needed().await?;
     if did_handle_specials {
         return Ok(());
     }
-
-    // Start display; all user-visible output goes through it
-    let display = start_display()?;
 
     let stdout_is_tty = atty::is(atty::Stream::Stdout);
     let stderr_is_tty = atty::is(atty::Stream::Stderr);
@@ -64,9 +55,9 @@ pub async fn run() -> Result<()> {
 
     // If there are no weights, show the onboarding and exit.
     let mut stream = match stream {
-        Err(e) => {
+        Err(_) => {
             display.show_onboarding().await;
-            return Err(e);
+            return Ok(());
         }
         Ok(stream) => stream,
     };
