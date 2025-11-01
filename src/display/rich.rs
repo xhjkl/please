@@ -25,7 +25,7 @@ impl AnyDisplay for RichDisplay {
     }
 
     async fn show_log(&self, line: &str) {
-        let we_are_hub = std::env::var("PLEASE_BECOME_HUB").is_ok();
+        let we_are_hub = std::env::var("PLEASE_LOG_EVERYTHING").is_ok();
         if !we_are_hub {
             return;
         }
@@ -109,43 +109,20 @@ impl AnyDisplay for RichDisplay {
     async fn show_onboarding(&self) {
         use crossterm::style::{Attribute, SetAttribute};
 
-        fn ollama_available() -> bool {
-            std::process::Command::new("ollama")
-                .arg("--version")
-                .output()
-                .is_ok()
-        }
-
         let _ = crossterm::execute!(
             std::io::stderr(),
+            Print("\rTo get started with please, load the model once by running:"),
+            Print("\n"),
+            Print("\n"),
             SetAttribute(Attribute::Bold),
-            Print(
-                "To use please, you first need to load the model. This only needs to be done once."
-            ),
+            Print("$ please load"),
+            SetAttribute(Attribute::Reset),
+            Print("\n"),
+            Print("\n"),
+            Print("Wait until it finishes; the weights will be stored in `~/.please/weights`."),
+            Print("\n"),
             Print("\n"),
         );
-
-        if ollama_available() {
-            let _ = crossterm::execute!(
-                std::io::stderr(),
-                SetAttribute(Attribute::Bold),
-                Print(
-                    "Since you have ollama installed, you can just run: `ollama pull gpt-oss:20b`, wait until completion, and then run `please` again."
-                ),
-                Print("\n"),
-            );
-        };
-
-        let _ = crossterm::execute!(
-            std::io::stderr(),
-            SetAttribute(Attribute::Bold),
-            Print(
-                "If you want to download the weights manually, you can run `please load`. It will place the weights to `~/.please/weights`."
-            ),
-            Print("\n"),
-        );
-
-        let _ = crossterm::execute!(std::io::stderr(), SetAttribute(Attribute::Reset));
     }
 }
 
