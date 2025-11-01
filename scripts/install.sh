@@ -63,8 +63,18 @@ This installer will:
 Proceed? [y/N]
 MSG
 
-# Read confirmation
-read ans || true
+# Read confirmation from the controlling terminal; ignore empty input
+ans=""
+if [ -r /dev/tty ]; then
+  while :; do
+    IFS='' read -r ans </dev/tty || exit 1
+    [ -n "$ans" ] && break
+  done
+else
+  # No TTY available; default to abort
+  echo "no TTY available to confirm; aborted" >&2
+  exit 1
+fi
 case "$ans" in
   y|Y|yes|YES)
     ;;
@@ -72,7 +82,7 @@ case "$ans" in
     echo "aborted by user"
     exit 0
     ;;
- esac
+esac
 
 TMP=$(mktemp "please.XXXXXXXXXX")
 cleanup() { rm -f "$TMP" 2>/dev/null || true; }
