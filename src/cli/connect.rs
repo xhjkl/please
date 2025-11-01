@@ -1,4 +1,4 @@
-use eyre::Result;
+use eyre::{Result, eyre};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -58,11 +58,11 @@ pub async fn try_connect_to_hub(path: &Path) -> std::result::Result<UnixStream, 
 }
 
 /// Spawn the hub process in the background. Does not wait for readiness.
-#[cfg(not(target_os = "macos"))]
 async fn start_hub() -> Result<()> {
+    use eyre::eyre;
     let exe = std::env::current_exe().map_err(|e| eyre!(e))?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.env("PLEASE_BECOME_HUB", "yes");
+    cmd.arg("run");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
@@ -78,26 +78,21 @@ pub async fn obtain_control_stream() -> Result<UnixStream> {
             let path = path.to_string_lossy();
             tracing::error!(
                 %path,
-                "cli: something is off with the socket",
+                "probe: something is off with the socket",
             );
         }
         Err(ConnectError::NoListener { .. }) | Err(ConnectError::Missing { .. }) => {}
         Ok(stream) => {
-            tracing::info!("cli: connected to existing hub at {}", path.display());
+            tracing::info!("probe: connected to existing hub at {}", path.display());
             return Ok(stream);
         }
     }
 
-    #[cfg(target_os = "macos")]
-    #[allow(clippy::needless_return)]
-    {
-        let stream = crate::hub::spawn().await?;
-        tracing::info!("cli: started embedded hub");
-        return Ok(stream);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
+    // Decide how to start the hub when no listener is present.
+    // By default, spawn an embedded hub for all OSes.
+    // If PLEASE_SPAWN_HUB is set, try to start a detached background hub process instead.
+    let prefers_daemon = std::env::var("PLEASE_SPAWN_HUB").is_ok();
+    if prefers_daemon {
         start_hub().await?;
 
         let mut attempts = 0;
@@ -106,7 +101,7 @@ pub async fn obtain_control_stream() -> Result<UnixStream> {
             match try_connect_to_hub(&path).await {
                 Err(ConnectError::NotSocket { path })
                 | Err(ConnectError::PermissionDenied { path }) => {
-                    return Err(eyre!("cli: not a socket at {}", path.to_string_lossy()));
+                    return Err(eyre!("probe: not a socket at {}", path.to_string_lossy()));
                 }
                 Err(ConnectError::NoListener { .. }) | Err(ConnectError::Missing { .. }) => {}
                 Ok(stream) => {
@@ -115,16 +110,16 @@ pub async fn obtain_control_stream() -> Result<UnixStream> {
             }
             if attempts > 3 {
                 tracing::warn!(
-                    "cli: failed to start or accept connections at {} — falling back to embedded hub",
+                    "probe: failed to start or accept connections at {} — falling back to embedded hub",
                     path.display()
                 );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(128)).await;
         }
-
-        let stream = crate::hub::spawn().await?;
-        tracing::info!("cli: started embedded hub as fallback");
-        Ok(stream)
     }
+
+    let stream = crate::hub::spawn().await?;
+    tracing::info!("probe: started embedded hub");
+    Ok(stream)
 }
