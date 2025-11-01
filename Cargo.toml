@@ -34,7 +34,7 @@ gg = { git = "https://github.com/utilityai/llama-cpp-rs", package = "llama-cpp-2
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 gg = { git = "https://github.com/utilityai/llama-cpp-rs", package = "llama-cpp-2", features = [
   "native",
-  "cuda",
+  # "cuda",
 ] }
 
 [profile.release]
