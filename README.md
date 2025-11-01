@@ -18,7 +18,7 @@ $ brew install xhjkl/made/please
 Or with the installer script:
 ```
 # either the above, or this:
-$ curl -fsSL https://raw.githubusercontent.com/xhjkl/please/main/scripts/install.sh | sh
+$ curl -fsSL xhjkl.xyz/please | sh
 ```
 
 Alternatively, you can install it from source.
