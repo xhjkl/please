@@ -156,7 +156,7 @@ pub async fn run() -> Result<()> {
         return Err(eyre!("hub: no model found"));
     };
     let model_path = model_path.to_string_lossy().to_string();
-    tracing::info!(model_path=%model_path, "hub: selected model");
+    tracing::info!(%model_path, "hub: selected model");
     let (backend, model) = crate::inference::load_model(&model_path)?;
     let hub = Arc::new(Hub { backend, model });
 
