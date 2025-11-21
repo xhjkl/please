@@ -1,8 +1,8 @@
 use eyre::{Result, eyre};
 use tokio::net::UnixStream;
 
-use crate::protocol::Message;
 use crate::display::Display;
+use crate::protocol::Message;
 
 use super::turn::run_turn;
 
