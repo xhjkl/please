@@ -23,13 +23,6 @@ Or with the installer script:
 $ curl -fsSL xhjkl.xyz/please | sh
 ```
 
-Alternatively, you can install it from source.
-It needs to be pulled from git, crates-io do not have it:
-```
-# either one of the above, or this:
-$ cargo install --git https://github.com/xhjkl/please
-```
-
 Then, download the weights just once:
 ```
 $ please load
