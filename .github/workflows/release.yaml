@@ -12,7 +12,7 @@ jobs:
     name: linux/x86_64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       # - name: Setup CUDA
       #   uses: Jimver/cuda-toolkit@v0.2.28
@@ -37,7 +37,7 @@ jobs:
     name: linux/arm64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install aarch64 gnu toolchain
         run: |
@@ -68,7 +68,7 @@ jobs:
     name: macos
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -91,7 +91,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
       - name: Download Linux artifact
         uses: actions/download-artifact@v6
         with:
@@ -138,7 +138,7 @@ jobs:
           echo "sha_darwin_arm64=$darwin_arm64_sha" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: xhjkl/homebrew-made
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
