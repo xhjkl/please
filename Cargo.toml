@@ -19,21 +19,19 @@ tokio = { version = "1", features = ["rt-multi-thread", "full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unicode-ident = { version = "1", features = [] }
-reqwest = { version = "0.12", default-features = false, features = [
-  "rustls-tls-native-roots",
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
   "stream",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.32"
+metal = "0.33"
 gg = { git = "https://github.com/utilityai/llama-cpp-rs", package = "llama-cpp-2", features = [
-  "native",
   "metal",
 ] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 gg = { git = "https://github.com/utilityai/llama-cpp-rs", package = "llama-cpp-2", features = [
-  "native",
   # "cuda",
 ] }
 
