@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{env, io};
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone)]
 pub enum ParamType {
@@ -24,14 +25,18 @@ pub struct Param {
     pub required: bool,
 }
 
-/// Anything that can be called with a `serde_json::Value` payload.
+/// Anything that can be called with a `serde_json::Value` payload plus an optional output sink.
 pub type AsyncFn = Box<
-    dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send>>
+    dyn Fn(
+            serde_json::Value,
+            Option<UnboundedSender<String>>,
+        ) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send>>
         + Send
         + Sync,
 >;
 
-/// Adapt a typed async handler to an LLM/tool-call friendly `Fn(Value) -> Future<Value>`.
+/// Adapt a typed async handler to an LLM/tool-call friendly `Fn(Value, Sink) -> Future<Value>`.
+/// The optional sink allows tools to stream live output while still returning a full result.
 /// That keeps strongly-typed ergonomics at the edges; the closure is `Arc`-cloned for reuse.
 /// Use this when registering typed tools behind a single uniform entrypoint expected by function-calling runtimes.
 ///
@@ -39,7 +44,7 @@ pub type AsyncFn = Box<
 /// #[derive(serde::Deserialize)]
 /// struct Hello { name: String }
 ///
-/// async fn hello(args: Hello) -> serde_json::Value {
+/// async fn hello(args: Hello, _sink: Option<UnboundedSender<String>>) -> serde_json::Value {
 ///     serde_json::json!({ "hi": args.name })
 /// }
 ///
@@ -47,29 +52,33 @@ pub type AsyncFn = Box<
 /// let wrapped = with_args(hello);
 ///
 /// // Invoke with raw JSON like a function-calling payload
-/// let out = wrapped(serde_json::json!({ "name": "Ada" })).await;
+/// let out = wrapped(serde_json::json!({ "name": "Ada" }), None).await;
 /// assert_eq!(out, serde_json::json!({ "hi": "Ada" }));
 ///
 /// // Invalid inputs yield a normalized error object
-/// let err = wrapped(serde_json::json!({ "name": 123 })).await;
+/// let err = wrapped(serde_json::json!({ "name": 123 }), None).await;
 /// assert!(err.get("error").is_some());
 /// ```
 pub fn with_args<Args, Fut, F>(f: F) -> AsyncFn
 where
     Args: serde::de::DeserializeOwned + Send + 'static,
-    F: Fn(Args) -> Fut + Send + Sync + 'static,
+    F: Fn(Args, Option<UnboundedSender<String>>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = serde_json::Value> + Send + 'static,
 {
     let f = Arc::new(f);
-    Box::new(move |args: serde_json::Value| {
-        let args = serde_json::from_value::<Args>(args).map_err(|e| e.to_string());
-        let args = match args {
-            Ok(args) => args,
-            Err(error) => return Box::pin(async move { serde_json::json!({ "error": error }) }),
-        };
-        let f = Arc::clone(&f);
-        Box::pin(async move { (f)(args).await })
-    })
+    Box::new(
+        move |args: serde_json::Value, sink: Option<UnboundedSender<String>>| {
+            let args = serde_json::from_value::<Args>(args).map_err(|e| e.to_string());
+            let args = match args {
+                Ok(args) => args,
+                Err(error) => {
+                    return Box::pin(async move { serde_json::json!({ "error": error }) });
+                }
+            };
+            let f = Arc::clone(&f);
+            Box::pin(async move { (f)(args, sink).await })
+        },
+    )
 }
 
 /// Resolve a user-supplied path to a relative path confined to the current working

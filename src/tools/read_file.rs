@@ -13,7 +13,10 @@ fn default_max_bytes() -> usize {
     512 * 1024
 }
 
-pub async fn call(args: Args) -> serde_json::Value {
+pub async fn call(
+    args: Args,
+    _sink: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> serde_json::Value {
     let res = (|| -> Result<String, String> {
         let rel = resolve_path_within_cwd(&args.path).map_err(|e| e.to_string())?;
         let file = std::fs::File::open(rel).map_err(|e| e.to_string())?;

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use tokio::sync::mpsc::UnboundedSender;
 
 pub mod common;
 use self::common::{AsyncFn, Param, with_args};
@@ -41,13 +42,17 @@ pub fn all_tools() -> ExposedTools {
     collect_tools![list_files, read_file, run_command, apply_patch]
 }
 
+/// Invoke a tool with optional live-output sink.
+/// - `sink` is for streaming live output (such as `run_command`) while still returning full JSON.
+/// - Most tools ignore it; they return only their final result.
 pub async fn invoke(
     tools: &ExposedTools,
     name: &str,
     args: serde_json::Value,
+    sink: Option<UnboundedSender<String>>,
 ) -> Result<serde_json::Value, String> {
     let Some((_, work, _)) = tools.get(name) else {
         return Err("No such function".to_string());
     };
-    Ok(work(args).await)
+    Ok(work(args, sink).await)
 }

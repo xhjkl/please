@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Deserialize)]
 pub struct Args {
@@ -10,7 +11,28 @@ pub struct Args {
     argv: Vec<String>,
 }
 
-pub async fn call(args: Args) -> serde_json::Value {
+async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    sink: Option<&UnboundedSender<String>>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = reader.read(&mut buf).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+        if let Some(tx) = sink {
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+        }
+    }
+    out
+}
+
+/// Run a command and optionally stream stdout/stderr chunks to `sink`.
+/// The returned JSON still includes full stdout/stderr for history use.
+pub async fn call(args: Args, sink: Option<UnboundedSender<String>>) -> serde_json::Value {
     if args.argv.is_empty() {
         return json!({ "error": "argv must be non-empty" });
     }
@@ -35,18 +57,16 @@ pub async fn call(args: Args) -> serde_json::Value {
     // Read to completion (no truncation, no timeout)
     let wait_fut = child.wait();
     let read_out = async {
-        let mut out = Vec::new();
-        if let Some(mut s) = stdout_pipe {
-            let _ = s.read_to_end(&mut out).await;
+        match stdout_pipe {
+            Some(s) => read_stream(s, sink.as_ref()).await,
+            None => Vec::new(),
         }
-        out
     };
     let read_err = async {
-        let mut err = Vec::new();
-        if let Some(mut s) = stderr_pipe {
-            let _ = s.read_to_end(&mut err).await;
+        match stderr_pipe {
+            Some(s) => read_stream(s, sink.as_ref()).await,
+            None => Vec::new(),
         }
-        err
     };
     let (status_res, stdout_bytes, stderr_bytes) = tokio::join!(wait_fut, read_out, read_err);
     let status = match status_res {

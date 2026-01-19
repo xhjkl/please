@@ -1,5 +1,7 @@
+mod pane;
 mod spinner;
 
+pub use pane::ExecutionPane;
 pub use spinner::Spinner;
 
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
@@ -20,6 +22,7 @@ enum Phase {
     #[default]
     Answering,
     Thinking,
+    Executing,
 }
 
 /// Display interface used by CLI components.
@@ -95,6 +98,9 @@ impl Display {
                 // `stdout` should be free from control sequences so it can be piped.
                 let _ = crossterm::execute!(std::io::stdout(), Print(s));
             }
+            Phase::Executing => {
+                // should never happen
+            }
         }
     }
 
@@ -114,6 +120,31 @@ impl Display {
         } else {
             eprintln!("call: {name} {args}");
         }
+    }
+
+    /// Show stdout/stderr from a tool invocation.
+    pub async fn show_tool_output(&self, name: &str, stdout: &str, stderr: &str) {
+        if stdout.is_empty() && stderr.is_empty() {
+            return;
+        }
+        if self.caps.colorful {
+            let _ = crossterm::execute!(
+                std::io::stderr(),
+                SetForegroundColor(Color::DarkCyan),
+                Print(format!("{name} output:")),
+                ResetColor,
+                Print("\n"),
+            );
+        } else {
+            eprintln!("{name} output:");
+        }
+        if !stdout.is_empty() {
+            eprintln!("stdout:\n{stdout}");
+        }
+        if !stderr.is_empty() {
+            eprintln!("stderr:\n{stderr}");
+        }
+        eprintln!();
     }
 
     /// Ask the user to confirm executing a command represented by argv.

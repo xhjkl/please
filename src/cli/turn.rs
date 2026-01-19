@@ -5,7 +5,7 @@ use tokio::net::UnixStream;
 use crate::display::Display;
 use crate::harmony::{HarmonyEvent, HarmonyMessageHandler, HarmonyParser};
 use crate::protocol::{Frame, Message, read_frame_from_stream};
-use crate::tools::{all_tools, invoke, summarize_patch_for_preview, to_harmony};
+use crate::tools::{all_tools, summarize_patch_for_preview, to_harmony};
 
 use super::connect::obtain_control_stream;
 
@@ -167,7 +167,7 @@ pub async fn attempt_turn_on_stream(
             // Show pretty formatted function call
             let _ = display.show_tool_call(&name, &args).await;
 
-            let approved = gate_risky_if_needed(&*display, &name, &args).await;
+            let approved = gate_risky_if_needed(&display, &name, &args).await;
             if !approved {
                 let tool_payload = serde_json::json!({
                     "tool": name,
@@ -178,11 +178,28 @@ pub async fn attempt_turn_on_stream(
                 continue;
             }
 
-            let result = invoke(&tools, &name, args.clone())
+            // Only `run_command` gets a live output pane for streaming stdout/stderr.
+            let execution_pane = if name == "run_command" {
+                display.start_executing()
+            } else {
+                None
+            };
+            let sink = execution_pane.as_ref().map(|pane| pane.sender());
+            let streamed = sink.is_some();
+            let result = crate::tools::invoke(&tools, &name, args.clone(), sink)
                 .await
                 .unwrap_or_else(|e| serde_json::json!({ "error": e }));
 
-            forward_output_if_needed(&*display, &name, &result).await;
+            drop(execution_pane);
+
+            if !streamed && name == "run_command" {
+                // For plain display mode, forward stdout/stderr all at once.
+                if let Some(obj) = result.as_object() {
+                    let stdout = obj.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+                    let stderr = obj.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+                    display.show_tool_output(&name, stdout, stderr).await;
+                }
+            }
 
             let tool_payload =
                 serde_json::json!({ "tool": name, "arguments": args.clone(), "result": result });
@@ -264,18 +281,4 @@ async fn gate_risky_if_needed(display: &Display, name: &str, args: &serde_json::
         return display.confirm_apply_patch_edits(&preview).await;
     }
     true
-}
-
-async fn forward_output_if_needed(display: &Display, name: &str, result: &serde_json::Value) {
-    if name == "run_command"
-        && let Some(obj) = result.as_object()
-        && obj.get("ok").and_then(|v| v.as_bool()) == Some(true)
-    {
-        if let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str()) {
-            let _ = display.show_log(&format!("stdout:\n{}", stdout)).await;
-        }
-        if let Some(stderr) = obj.get("stderr").and_then(|v| v.as_str()) {
-            let _ = display.show_log(&format!("stderr:\n{}", stderr)).await;
-        }
-    }
 }

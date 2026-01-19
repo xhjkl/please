@@ -19,7 +19,10 @@ fn default_depth() -> usize {
     0
 }
 
-pub async fn call(args: Args) -> serde_json::Value {
+pub async fn call(
+    args: Args,
+    _sink: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> serde_json::Value {
     let root = match resolve_path_within_cwd(&args.path) {
         Ok(p) => p,
         Err(e) => return serde_json::json!({ "error": e.to_string() }),

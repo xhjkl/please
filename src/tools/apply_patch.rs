@@ -21,7 +21,10 @@ pub struct Args {
     patch: Option<String>,
 }
 
-pub async fn call(args: Args) -> serde_json::Value {
+pub async fn call(
+    args: Args,
+    _sink: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> serde_json::Value {
     let content = match args.patch {
         Some(s) => s,
         None => return json!({ "error": "apply_patch requires parameter `patch`" }),
