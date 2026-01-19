@@ -1,5 +1,5 @@
 class Please < Formula
-  desc "Interact with your terminal in natural language; all inference stays local."
+  desc "Interact with your terminal in natural language; all inference stays local"
   homepage "https://github.com/xhjkl/please"
   license "MIT"
   version "¶version"
