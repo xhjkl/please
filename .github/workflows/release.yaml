@@ -93,17 +93,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
       - name: Download Linux artifact
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: please-linux-x86_64
           path: dist
       - name: Download Linux ARM64 artifact
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: please-linux-arm64
           path: dist
       - name: Download macOS artifact
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: please-darwin-arm64
           path: dist
