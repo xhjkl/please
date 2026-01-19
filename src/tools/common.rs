@@ -2,6 +2,7 @@ use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::{env, io};
 
 #[derive(Debug, Clone)]
@@ -59,14 +60,14 @@ where
     F: Fn(Args) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = serde_json::Value> + Send + 'static,
 {
-    let f = std::sync::Arc::new(f);
+    let f = Arc::new(f);
     Box::new(move |args: serde_json::Value| {
         let args = serde_json::from_value::<Args>(args).map_err(|e| e.to_string());
         let args = match args {
             Ok(args) => args,
             Err(error) => return Box::pin(async move { serde_json::json!({ "error": error }) }),
         };
-        let f = std::sync::Arc::clone(&f);
+        let f = Arc::clone(&f);
         Box::pin(async move { (f)(args).await })
     })
 }

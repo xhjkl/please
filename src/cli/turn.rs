@@ -1,4 +1,5 @@
 use eyre::{Result, eyre};
+use std::sync::Arc;
 use tokio::net::UnixStream;
 
 use crate::display::Display;
@@ -13,7 +14,7 @@ use super::connect::obtain_control_stream;
 /// Returns the final answer string.
 pub async fn attempt_turn_on_stream(
     stream: &mut UnixStream,
-    display: Display,
+    display: Arc<Display>,
     messages: &mut Vec<Message>,
 ) -> Result<String> {
     use tokio::io::AsyncWriteExt;
@@ -166,7 +167,7 @@ pub async fn attempt_turn_on_stream(
             // Show pretty formatted function call
             let _ = display.show_tool_call(&name, &args).await;
 
-            let approved = gate_risky_if_needed(&display, &name, &args).await;
+            let approved = gate_risky_if_needed(&*display, &name, &args).await;
             if !approved {
                 let tool_payload = serde_json::json!({
                     "tool": name,
@@ -181,7 +182,7 @@ pub async fn attempt_turn_on_stream(
                 .await
                 .unwrap_or_else(|e| serde_json::json!({ "error": e }));
 
-            forward_output_if_needed(&display, &name, &result).await;
+            forward_output_if_needed(&*display, &name, &result).await;
 
             let tool_payload =
                 serde_json::json!({ "tool": name, "arguments": args.clone(), "result": result });
@@ -197,7 +198,7 @@ pub async fn attempt_turn_on_stream(
 /// Returns the final answer string.
 pub async fn run_turn(
     stream: &mut UnixStream,
-    display: Display,
+    display: Arc<Display>,
     messages: Vec<Message>,
 ) -> Result<String> {
     use std::time::Duration;

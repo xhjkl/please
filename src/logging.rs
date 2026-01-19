@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /// Writer that forwards writes to a logging channel.
 struct DisplayWriter {
     sender: tokio::sync::mpsc::UnboundedSender<String>,
@@ -16,7 +18,7 @@ impl std::io::Write for DisplayWriter {
 
 async fn pump(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
-    display: crate::display::Display,
+    display: Arc<crate::display::Display>,
 ) {
     while let Some(line) = rx.recv().await {
         display.show_log(&line).await;
@@ -24,7 +26,7 @@ async fn pump(
 }
 
 /// Route tracing logs into the display renderer.
-pub fn setup_tracing_display_logger(display: crate::display::Display) {
+pub fn setup_tracing_display_logger(display: Arc<crate::display::Display>) {
     gg::send_logs_to_tracing(gg::LogOptions::default().with_logs_enabled(true));
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();

@@ -141,9 +141,6 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Hub>) -> Res
 
 /// Hub main loop: bind socket, load model once, accept clients forever.
 pub async fn run() -> Result<()> {
-    // Set the env so that the logs are visible when started in the foreground.
-    unsafe { std::env::set_var("PLEASE_LOG_EVERYTHING", "yes") };
-
     let socket_path = socket_path();
     ensure_socket_dir(&socket_path)?;
     cleanup_stale_socket(&socket_path)?;

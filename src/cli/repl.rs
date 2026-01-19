@@ -1,4 +1,5 @@
 use eyre::{Result, eyre};
+use std::sync::Arc;
 use tokio::net::UnixStream;
 
 use crate::display::Display;
@@ -8,7 +9,7 @@ use super::turn::run_turn;
 
 pub async fn interact_forever(
     stream: &mut UnixStream,
-    display: Display,
+    display: Arc<Display>,
     history: Vec<Message>,
 ) -> Result<()> {
     use rustyline::error::ReadlineError::{Eof, Interrupted};

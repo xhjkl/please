@@ -1,9 +1,9 @@
 use eyre::Result;
+use std::sync::Arc;
 
 use crate::cli::io;
 use crate::cli::specials;
 use crate::display;
-use crate::display::Display;
 use crate::history;
 use crate::protocol::Message;
 
@@ -13,8 +13,8 @@ use super::turn::run_turn;
 
 /// Initialize the UI pipeline and spawn the renderer.
 /// Returns channels the rest of the app can use to stream status and content.
-fn start_display() -> Result<Display> {
-    let display = display::make_display();
+fn start_display() -> Result<Arc<display::Display>> {
+    let display = Arc::new(display::make_display());
     crate::logging::setup_tracing_display_logger(display.clone());
     Ok(display)
 }
@@ -69,7 +69,7 @@ pub async fn run() -> Result<()> {
     } else {
         // One-shot: append the user turn to the initial history and infer once.
         history.push(Message::User(prompt.to_string()));
-        run_turn(&mut stream, display.clone(), history).await?;
+        run_turn(&mut stream, display, history).await?;
     }
 
     Ok(())
