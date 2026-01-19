@@ -55,7 +55,7 @@ fn build_http_client() -> Result<reqwest::Client> {
     );
     let client = reqwest::Client::builder()
         .default_headers(headers)
-        .use_rustls_tls()
+        .tls_backend_rustls()
         .build()?;
     Ok(client)
 }
