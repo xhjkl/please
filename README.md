@@ -47,10 +47,5 @@ $ please fix all clippy diagnostics
 
 # Bridging
 
-You can run `please` on a remote machine while using your local inference engine and downloaded weights.
-See [BRIDGING.md](BRIDGING.md) for SSH forwarding instructions.
-
-# Docker
-
-You can also run `please` in a Docker container while inferring on the host machine.
-See [DOCKER.md](DOCKER.md) for the instructions.
+You can run `please` in a different environment, such as a remote shell or a container, while keeping inference and weights on your machine.
+This avoids copying weights around and lets you keep using your local compute power. For a remote machine, set up SSH socket forwarding as described in [BRIDGING.md](BRIDGING.md); for a Docker container, mount the host socket into the container as described in [DOCKER.md](DOCKER.md).
