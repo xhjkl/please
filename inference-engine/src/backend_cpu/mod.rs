@@ -4,8 +4,8 @@ use crate::harmony_adapter::HarmonyAdapter;
 use crate::model_store::{self, SourceModelReport};
 use crate::runtime_core::{
     CpuLayer0Report, CpuOracleReport, CpuProbeReport, CpuPromptPrefillReport, CpuSingleTokenReport,
-    ExpertScore, GreedyDecodeProbeReport, GreedyTokenReport, LayerCheckpoint, LogitScore,
-    PromptFixture, SelectedLogit, StopReason,
+    ExpertScore, GenerationReport, GreedyTokenReport, LayerCheckpoint, LogitScore, PromptFixture,
+    SelectedLogit, StopReason,
 };
 
 pub const PROMPT_PREFILL_TOKEN_LIMIT: usize = 4;
@@ -507,7 +507,7 @@ pub fn probe_greedy_decode(
     prompt_tokens: &[u32],
     layers: usize,
     max_new_tokens: usize,
-) -> Result<GreedyDecodeProbeReport> {
+) -> Result<GenerationReport> {
     if prompt_tokens.is_empty() {
         return Err(eyre!("cpu greedy decode needs at least one prompt token"));
     }
@@ -560,7 +560,7 @@ pub fn probe_greedy_decode(
         .iter()
         .map(|token| token.token)
         .collect::<Vec<_>>();
-    Ok(GreedyDecodeProbeReport {
+    Ok(GenerationReport {
         name: format!(
             "greedy_decode.layers{layers}.prompt{}.new{}",
             prompt_tokens.len(),

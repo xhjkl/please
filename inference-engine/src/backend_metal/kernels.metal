@@ -1141,7 +1141,7 @@ kernel void write_f32_slots_batch(
     output[(start_slot + slot) * width + col] = input[gid];
 }
 
-kernel void read_f32_slot(
+kernel void copy_f32_slot(
     device const float* input [[buffer(0)]],
     device float* output [[buffer(1)]],
     constant uint& slot [[buffer(2)]],

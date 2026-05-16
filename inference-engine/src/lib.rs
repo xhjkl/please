@@ -8,9 +8,9 @@ pub mod runtime_core;
 pub use runtime_core::sampler::{SampleCandidate, Sampler};
 pub use runtime_core::{
     ContextNotice, CpuLayer0Report, CpuOracleReport, CpuProbeReport, CpuPromptPrefillReport,
-    CpuSingleTokenReport, EngineRequest, GenerationEvent, GenerationLimits,
-    GreedyDecodeProbeReport, GreedyTextProbeReport, GreedyTokenReport, LayerCheckpoint,
-    LmHeadTopKProbeReport, LogitScore, MetalMatvecProbeReport, MetalRmsNormProbeReport,
-    MetalSelectedLogitsProbeReport, MetalTopKProbeReport, MetalVectorProbeReport, PromptFixture,
-    PromptPlan, RuntimeNotice, SamplingConfig, SelectedLogit, StopReason,
+    CpuSingleTokenReport, EngineRequest, GenerationEvent, GenerationLimits, GenerationReport,
+    GreedyTextProbeReport, GreedyTokenReport, LayerCheckpoint, LmHeadTopKProbeReport, LogitScore,
+    MetalMatvecProbeReport, MetalRmsNormProbeReport, MetalSelectedLogitsProbeReport,
+    MetalTopKProbeReport, MetalVectorProbeReport, PromptFixture, PromptPlan, RuntimeNotice,
+    SamplingConfig, SelectedLogit, StopReason,
 };

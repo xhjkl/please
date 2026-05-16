@@ -2,8 +2,8 @@ use eyre::{Result, eyre};
 
 use super::{
     ATTN_VALUES, HIDDEN_SIZE, KV_HEADS, KV_VALUES, LAYERS, LM_HEAD_TOP1_BLOCK_SIZE,
-    MAX_RESIDENT_CONTEXT_TOKENS, MetalOracleContext, Q_HEADS, StageMarker, TokenStage,
-    decode_token_text, decode_tokens_text, metal_sampler_description, platform, stage_marker,
+    MAX_RESIDENT_CONTEXT_TOKENS, MetalRuntime, Q_HEADS, StageMarker, TokenStage, decode_token_text,
+    decode_tokens_text, metal_sampler_description, platform, stage_marker,
     weights::{GptOssLayerWeights, GptOssWeights},
 };
 #[cfg(feature = "profile")]
@@ -13,7 +13,7 @@ use crate::harmony_adapter::HarmonyAdapter;
 use crate::model_store;
 use crate::runtime_core::sampler::{SampleCandidate, Sampler};
 use crate::runtime_core::{
-    EngineRequest, GenerationEvent, GreedyDecodeProbeReport, GreedyTokenReport, RuntimeNotice,
+    EngineRequest, GenerationEvent, GenerationReport, GreedyTokenReport, RuntimeNotice,
     SamplingConfig, StopReason,
 };
 #[cfg(feature = "profile")]
@@ -25,7 +25,26 @@ use std::time::{Duration, Instant};
 const PREFILL_MOE_CHUNK_TOKENS: usize = 16;
 const PREFILL_SUFFIX_DECODE_THRESHOLD: usize = 4;
 
-struct ResidentDecodeScratch {
+#[derive(Clone, Copy)]
+enum PingPong {
+    Ping,
+    Pong,
+}
+
+impl PingPong {
+    fn next(self) -> Self {
+        match self {
+            Self::Ping => Self::Pong,
+            Self::Pong => Self::Ping,
+        }
+    }
+
+    fn is_ping(self) -> bool {
+        matches!(self, Self::Ping)
+    }
+}
+
+struct GenerationScratch {
     hidden_ping: platform::F32VectorBuffer,
     hidden_pong: platform::F32VectorBuffer,
     normed: platform::F32VectorBuffer,
@@ -68,7 +87,7 @@ struct ResidentDecodeScratch {
     lm_top_values: platform::F32VectorBuffer,
 }
 
-impl ResidentDecodeScratch {
+impl GenerationScratch {
     fn new(platform: &platform::MetalContext, vocab: usize, context_tokens: usize) -> Result<Self> {
         let lm_top1_blocks = vocab.div_ceil(LM_HEAD_TOP1_BLOCK_SIZE);
         let prefill_values = context_tokens
@@ -137,18 +156,18 @@ impl ResidentDecodeScratch {
 }
 
 #[derive(Clone)]
-struct ResidentGpuKvCache {
-    layers: Vec<ResidentGpuLayerKvCache>,
+struct GpuKvCache {
+    layers: Vec<LayerKvCache>,
     capacity: usize,
 }
 
 #[derive(Clone)]
-struct ResidentGpuLayerKvCache {
+struct LayerKvCache {
     k: platform::F32VectorBuffer,
     v: platform::F32VectorBuffer,
 }
 
-impl ResidentGpuKvCache {
+impl GpuKvCache {
     fn new(platform: &platform::MetalContext, layers: usize, capacity: usize) -> Result<Self> {
         if capacity == 0 {
             return Err(eyre!("resident KV cache needs non-zero capacity"));
@@ -160,7 +179,7 @@ impl ResidentGpuKvCache {
         }
         let mut layer_caches = Vec::with_capacity(layers);
         for _ in 0..layers {
-            layer_caches.push(ResidentGpuLayerKvCache {
+            layer_caches.push(LayerKvCache {
                 k: platform.alloc_f32_vector(capacity * KV_VALUES)?,
                 v: platform.alloc_f32_vector(capacity * KV_VALUES)?,
             });
@@ -171,7 +190,7 @@ impl ResidentGpuKvCache {
         })
     }
 
-    fn layer(&self, layer: usize) -> Result<&ResidentGpuLayerKvCache> {
+    fn layer(&self, layer: usize) -> Result<&LayerKvCache> {
         self.layers
             .get(layer)
             .ok_or_else(|| eyre!("resident KV cache has no layer {layer}"))
@@ -180,23 +199,23 @@ impl ResidentGpuKvCache {
 
 // Prefix K/V is stored in the session working KV cache. This metadata is
 // invalidated before that buffer is reused for any different prompt shape.
-struct ResidentPrefixCache {
+struct PrefixCache {
     tokens: Vec<u32>,
     layers: usize,
     capacity: usize,
     final_hidden: platform::F32VectorBuffer,
 }
 
-struct ResidentSession {
-    scratch: ResidentDecodeScratch,
-    kv_cache: ResidentGpuKvCache,
-    prefix_cache: Option<ResidentPrefixCache>,
+struct MetalSession {
+    scratch: GenerationScratch,
+    kv_cache: GpuKvCache,
+    prefix_cache: Option<PrefixCache>,
     context_capacity: usize,
     layers: usize,
     vocab: usize,
 }
 
-impl ResidentSession {
+impl MetalSession {
     fn new(
         platform: &platform::MetalContext,
         vocab: usize,
@@ -204,8 +223,8 @@ impl ResidentSession {
         context_capacity: usize,
     ) -> Result<Self> {
         Ok(Self {
-            scratch: ResidentDecodeScratch::new(platform, vocab, context_capacity)?,
-            kv_cache: ResidentGpuKvCache::new(platform, layers, context_capacity)?,
+            scratch: GenerationScratch::new(platform, vocab, context_capacity)?,
+            kv_cache: GpuKvCache::new(platform, layers, context_capacity)?,
             prefix_cache: None,
             context_capacity,
             layers,
@@ -238,10 +257,10 @@ impl ResidentSession {
 
 pub struct MetalEngine {
     harmony: HarmonyAdapter,
-    ctx: MetalOracleContext,
+    ctx: MetalRuntime,
     weights: GptOssWeights,
     layers: usize,
-    session: Mutex<Option<ResidentSession>>,
+    session: Mutex<Option<MetalSession>>,
 }
 
 impl MetalEngine {
@@ -266,7 +285,7 @@ impl MetalEngine {
         let source = model_store::SafeTensorMap::open(report)?;
 
         let harmony = HarmonyAdapter::gpt_oss()?;
-        let ctx = MetalOracleContext::with_lm_head_map(&source)?;
+        let ctx = MetalRuntime::with_lm_head_map(&source)?;
         let weights = GptOssWeights::load(&ctx, &source, layers)?;
         Ok(Self {
             harmony,
@@ -315,7 +334,7 @@ impl MetalEngine {
         }
 
         let mut session = self.session.lock().unwrap();
-        let generated = resident_sample_decode(
+        let generated = generate_resident(
             &self.ctx,
             &self.weights,
             &self.harmony,
@@ -356,8 +375,8 @@ fn request_prompt_tokens(request: &EngineRequest) -> Result<Vec<u32>> {
     Err(eyre!("MetalEngine request has no prompt tokens"))
 }
 
-fn resident_sample_decode(
-    ctx: &MetalOracleContext,
+fn generate_resident(
+    ctx: &MetalRuntime,
     weights: &GptOssWeights,
     harmony: &HarmonyAdapter,
     prompt_tokens: &[u32],
@@ -366,32 +385,28 @@ fn resident_sample_decode(
     context_capacity: usize,
     pinned_prefix_len: usize,
     sampling: SamplingConfig,
-    session: &mut Option<ResidentSession>,
-) -> Result<GreedyDecodeProbeReport> {
+    session: &mut Option<MetalSession>,
+) -> Result<GenerationReport> {
     #[cfg(feature = "profile")]
     {
-        ctx.profile_op(
-            "phase.resident_sample_decode",
-            ProfileDelta::default(),
-            || {
-                resident_sample_decode_inner(
-                    ctx,
-                    weights,
-                    harmony,
-                    prompt_tokens,
-                    layers,
-                    max_new_tokens,
-                    context_capacity,
-                    pinned_prefix_len,
-                    sampling,
-                    session,
-                )
-            },
-        )
+        ctx.profile_op("phase.generate_resident", ProfileDelta::default(), || {
+            generate_resident_inner(
+                ctx,
+                weights,
+                harmony,
+                prompt_tokens,
+                layers,
+                max_new_tokens,
+                context_capacity,
+                pinned_prefix_len,
+                sampling,
+                session,
+            )
+        })
     }
     #[cfg(not(feature = "profile"))]
     {
-        resident_sample_decode_inner(
+        generate_resident_inner(
             ctx,
             weights,
             harmony,
@@ -406,8 +421,8 @@ fn resident_sample_decode(
     }
 }
 
-fn resident_sample_decode_inner(
-    ctx: &MetalOracleContext,
+fn generate_resident_inner(
+    ctx: &MetalRuntime,
     weights: &GptOssWeights,
     harmony: &HarmonyAdapter,
     prompt_tokens: &[u32],
@@ -416,8 +431,8 @@ fn resident_sample_decode_inner(
     context_capacity: usize,
     pinned_prefix_len: usize,
     sampling: SamplingConfig,
-    session: &mut Option<ResidentSession>,
-) -> Result<GreedyDecodeProbeReport> {
+    session: &mut Option<MetalSession>,
+) -> Result<GenerationReport> {
     #[cfg(feature = "profile")]
     let infer_started = Instant::now();
     if prompt_tokens.is_empty() {
@@ -457,14 +472,14 @@ fn resident_sample_decode_inner(
     #[cfg(feature = "profile")]
     ctx.reset_stage_profile(context_tokens);
 
-    let session = ResidentSession::ensure(
+    let session = MetalSession::ensure(
         session,
         &ctx.platform,
         weights.lm_head.rows(),
         layers,
         context_tokens,
     )?;
-    let current_is_ping = resident_prepare_prompt_state(
+    let current = prepare_prompt_state(
         ctx,
         weights,
         session,
@@ -480,13 +495,13 @@ fn resident_sample_decode_inner(
     let mut sampler = Sampler::new(sampling.clone());
 
     let first_output_position = prompt_tokens.len();
-    let current_hidden = resident_current_hidden(&session.scratch, current_is_ping);
-    let mut sampled = resident_sample_from_hidden(
+    let hidden = current_hidden(&session.scratch, current);
+    let mut sampled = sample_from_hidden(
         ctx,
         harmony,
         weights,
         &mut session.scratch,
-        &current_hidden,
+        &hidden,
         &mut sampler,
         first_output_position,
     )?;
@@ -511,7 +526,7 @@ fn resident_sample_decode_inner(
 
         #[cfg(feature = "profile")]
         let started = Instant::now();
-        let scored = resident_decode_and_score_next_token(
+        let scored = decode_and_score_next_token(
             ctx,
             harmony,
             weights,
@@ -542,9 +557,9 @@ fn resident_sample_decode_inner(
         .map(|token| token.token)
         .collect::<Vec<_>>();
     let text = decode_tokens_text(harmony, &token_ids)?;
-    Ok(GreedyDecodeProbeReport {
+    Ok(GenerationReport {
         name: format!(
-            "resident_sample_decode.layers{layers}.prompt{}.new{}",
+            "generate_resident.layers{layers}.prompt{}.new{}",
             prompt_tokens.len(),
             max_new_tokens
         ),
@@ -559,22 +574,22 @@ fn resident_sample_decode_inner(
     })
 }
 
-fn resident_hidden_pair(
-    scratch: &ResidentDecodeScratch,
-    current_is_ping: bool,
+fn hidden_pair(
+    scratch: &GenerationScratch,
+    current: PingPong,
 ) -> (platform::F32VectorBuffer, platform::F32VectorBuffer) {
-    if current_is_ping {
+    if current.is_ping() {
         (scratch.hidden_ping.clone(), scratch.hidden_pong.clone())
     } else {
         (scratch.hidden_pong.clone(), scratch.hidden_ping.clone())
     }
 }
 
-fn resident_prefill_hidden_pair(
-    scratch: &ResidentDecodeScratch,
-    current_is_ping: bool,
+fn prefill_hidden_pair(
+    scratch: &GenerationScratch,
+    current: PingPong,
 ) -> (platform::F32VectorBuffer, platform::F32VectorBuffer) {
-    if current_is_ping {
+    if current.is_ping() {
         (
             scratch.prefill_hidden_ping.clone(),
             scratch.prefill_hidden_pong.clone(),
@@ -587,37 +602,34 @@ fn resident_prefill_hidden_pair(
     }
 }
 
-fn resident_current_hidden(
-    scratch: &ResidentDecodeScratch,
-    current_is_ping: bool,
-) -> platform::F32VectorBuffer {
-    if current_is_ping {
+fn current_hidden(scratch: &GenerationScratch, current: PingPong) -> platform::F32VectorBuffer {
+    if current.is_ping() {
         scratch.hidden_ping.clone()
     } else {
         scratch.hidden_pong.clone()
     }
 }
 
-struct ResidentScoredToken {
+struct ScoredToken {
     token: GreedyTokenReport,
     #[cfg(feature = "profile")]
     gpu_ns: u128,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resident_prepare_prompt_state(
-    ctx: &MetalOracleContext,
+fn prepare_prompt_state(
+    ctx: &MetalRuntime,
     weights: &GptOssWeights,
-    session: &mut ResidentSession,
+    session: &mut MetalSession,
     layers: usize,
     prompt_tokens: &[u32],
     context_tokens: usize,
     pinned_prefix_len: usize,
-) -> Result<bool> {
+) -> Result<PingPong> {
     if pinned_prefix_len == 0 {
         session.prefix_cache = None;
-        resident_prefill_embeddings(ctx, weights, &session.scratch, prompt_tokens)?;
-        let current_is_ping = resident_prefill_layers(
+        prefill_embeddings(ctx, weights, &session.scratch, prompt_tokens)?;
+        let current = prefill_layers(
             ctx,
             weights,
             &session.scratch,
@@ -626,7 +638,7 @@ fn resident_prepare_prompt_state(
             0,
             prompt_tokens.len(),
         )?;
-        return Ok(current_is_ping);
+        return Ok(current);
     }
 
     let prefix_tokens = &prompt_tokens[..pinned_prefix_len];
@@ -649,11 +661,11 @@ fn resident_prepare_prompt_state(
                 .ok_or_else(|| eyre!("resident prefix cache disappeared after hit"))?
                 .final_hidden
                 .clone();
-            resident_copy_hidden(ctx, &final_hidden, &session.scratch.hidden_ping)?;
-            return Ok(true);
+            copy_hidden(ctx, &final_hidden, &session.scratch.hidden_ping)?;
+            return Ok(PingPong::Ping);
         }
 
-        let current_is_ping = resident_prefill_suffix(
+        let current = prefill_suffix(
             ctx,
             weights,
             &mut session.scratch,
@@ -662,7 +674,7 @@ fn resident_prepare_prompt_state(
             pinned_prefix_len,
             &prompt_tokens[pinned_prefix_len..],
         )?;
-        return Ok(current_is_ping);
+        return Ok(current);
     }
 
     #[cfg(feature = "profile")]
@@ -674,8 +686,8 @@ fn resident_prepare_prompt_state(
         },
     );
     session.prefix_cache = None;
-    resident_prefill_embeddings(ctx, weights, &session.scratch, prefix_tokens)?;
-    let current_is_ping = resident_prefill_layers(
+    prefill_embeddings(ctx, weights, &session.scratch, prefix_tokens)?;
+    let current = prefill_layers(
         ctx,
         weights,
         &session.scratch,
@@ -685,10 +697,10 @@ fn resident_prepare_prompt_state(
         pinned_prefix_len,
     )?;
     let final_hidden = ctx.platform.alloc_f32_vector(HIDDEN_SIZE)?;
-    let current_hidden = resident_current_hidden(&session.scratch, current_is_ping);
-    resident_copy_hidden(ctx, &current_hidden, &final_hidden)?;
+    let hidden = current_hidden(&session.scratch, current);
+    copy_hidden(ctx, &hidden, &final_hidden)?;
 
-    session.prefix_cache = Some(ResidentPrefixCache {
+    session.prefix_cache = Some(PrefixCache {
         tokens: prefix_tokens.to_vec(),
         layers,
         capacity: context_tokens,
@@ -696,10 +708,10 @@ fn resident_prepare_prompt_state(
     });
 
     if prompt_tokens.len() == pinned_prefix_len {
-        return Ok(current_is_ping);
+        return Ok(current);
     }
 
-    let current_is_ping = resident_prefill_suffix(
+    let current = prefill_suffix(
         ctx,
         weights,
         &mut session.scratch,
@@ -708,38 +720,38 @@ fn resident_prepare_prompt_state(
         pinned_prefix_len,
         &prompt_tokens[pinned_prefix_len..],
     )?;
-    Ok(current_is_ping)
+    Ok(current)
 }
 
-fn resident_copy_hidden(
-    ctx: &MetalOracleContext,
+fn copy_hidden(
+    ctx: &MetalRuntime,
     input: &platform::F32VectorBuffer,
     output: &platform::F32VectorBuffer,
 ) -> Result<()> {
     let batch = ctx.platform.begin_batch();
-    batch.read_f32_slot_into(input, 0, HIDDEN_SIZE, output)?;
-    finish_resident_batch(ctx, batch, no_stage_marker());
+    batch.copy_f32_slot_into(input, 0, HIDDEN_SIZE, output)?;
+    finish_generation_batch(ctx, batch, no_stage_marker());
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resident_decode_token(
-    ctx: &MetalOracleContext,
+fn decode_token_into_state(
+    ctx: &MetalRuntime,
     weights: &GptOssWeights,
-    scratch: &mut ResidentDecodeScratch,
-    kv_cache: &mut ResidentGpuKvCache,
+    scratch: &mut GenerationScratch,
+    kv_cache: &mut GpuKvCache,
     layers: usize,
     position: usize,
     token: u32,
-) -> Result<bool> {
+) -> Result<PingPong> {
     let batch = ctx.platform.begin_batch();
     batch.embedding_lookup_bf16_into(&weights.embed, token as usize, &scratch.hidden_ping)?;
-    let mut current_is_ping = true;
+    let mut current = PingPong::Ping;
 
     for layer in 0..layers {
-        let (input, output) = resident_hidden_pair(scratch, current_is_ping);
+        let (input, output) = hidden_pair(scratch, current);
         let layer_weights = weights.layer(layer)?;
-        resident_decode_layer(
+        encode_decode_layer(
             &batch,
             scratch,
             kv_cache,
@@ -749,23 +761,23 @@ fn resident_decode_token(
             &input,
             &output,
         )?;
-        current_is_ping = !current_is_ping;
+        current = current.next();
     }
 
-    finish_resident_batch(ctx, batch, stage_marker(position, TokenStage::Token));
-    Ok(current_is_ping)
+    finish_generation_batch(ctx, batch, stage_marker(position, TokenStage::Token));
+    Ok(current)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resident_prefill_suffix(
-    ctx: &MetalOracleContext,
+fn prefill_suffix(
+    ctx: &MetalRuntime,
     weights: &GptOssWeights,
-    scratch: &mut ResidentDecodeScratch,
-    kv_cache: &mut ResidentGpuKvCache,
+    scratch: &mut GenerationScratch,
+    kv_cache: &mut GpuKvCache,
     layers: usize,
     start_position: usize,
     suffix_tokens: &[u32],
-) -> Result<bool> {
+) -> Result<PingPong> {
     if suffix_tokens.is_empty() {
         return Err(eyre!("resident suffix prefill needs at least one token"));
     }
@@ -780,9 +792,9 @@ fn resident_prefill_suffix(
     }
 
     if suffix_tokens.len() <= PREFILL_SUFFIX_DECODE_THRESHOLD {
-        let mut current_is_ping = true;
+        let mut current = PingPong::Ping;
         for (offset, token) in suffix_tokens.iter().enumerate() {
-            current_is_ping = resident_decode_token(
+            current = decode_token_into_state(
                 ctx,
                 weights,
                 scratch,
@@ -792,11 +804,11 @@ fn resident_prefill_suffix(
                 *token,
             )?;
         }
-        return Ok(current_is_ping);
+        return Ok(current);
     }
 
-    resident_prefill_embeddings(ctx, weights, scratch, suffix_tokens)?;
-    resident_prefill_layers(
+    prefill_embeddings(ctx, weights, scratch, suffix_tokens)?;
+    prefill_layers(
         ctx,
         weights,
         scratch,
@@ -808,26 +820,26 @@ fn resident_prefill_suffix(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resident_decode_and_score_next_token(
-    ctx: &MetalOracleContext,
+fn decode_and_score_next_token(
+    ctx: &MetalRuntime,
     harmony: &HarmonyAdapter,
     weights: &GptOssWeights,
-    scratch: &mut ResidentDecodeScratch,
-    kv_cache: &mut ResidentGpuKvCache,
+    scratch: &mut GenerationScratch,
+    kv_cache: &mut GpuKvCache,
     layers: usize,
     position: usize,
     token: u32,
     sampler: &mut Sampler,
-) -> Result<ResidentScoredToken> {
+) -> Result<ScoredToken> {
     let output_position = position + 1;
     let batch = ctx.platform.begin_batch();
     batch.embedding_lookup_bf16_into(&weights.embed, token as usize, &scratch.hidden_ping)?;
-    let mut current_is_ping = true;
+    let mut current = PingPong::Ping;
 
     for layer in 0..layers {
-        let (input, output) = resident_hidden_pair(scratch, current_is_ping);
+        let (input, output) = hidden_pair(scratch, current);
         let layer_weights = weights.layer(layer)?;
-        resident_decode_layer(
+        encode_decode_layer(
             &batch,
             scratch,
             kv_cache,
@@ -837,10 +849,10 @@ fn resident_decode_and_score_next_token(
             &input,
             &output,
         )?;
-        current_is_ping = !current_is_ping;
+        current = current.next();
     }
 
-    let hidden = resident_current_hidden(scratch, current_is_ping);
+    let hidden = current_hidden(scratch, current);
     batch.rms_norm_into(&hidden, &weights.final_norm, &scratch.final_hidden)?;
     if sampler.needs_full_vocab() {
         batch.bf16_matrix_logits_into(
@@ -872,13 +884,13 @@ fn resident_decode_and_score_next_token(
         }
     }
     #[cfg(feature = "profile")]
-    let gpu_ns = finish_resident_batch(
+    let gpu_ns = finish_generation_batch(
         ctx,
         batch,
         stage_marker(output_position, TokenStage::HotToken),
     );
     #[cfg(not(feature = "profile"))]
-    finish_resident_batch(
+    finish_generation_batch(
         ctx,
         batch,
         stage_marker(output_position, TokenStage::HotToken),
@@ -901,26 +913,20 @@ fn resident_decode_and_score_next_token(
             text: decode_token_text(harmony, sampled.token)?,
         }
     } else {
-        resident_sample_from_topk_buffers(
-            ctx,
-            harmony,
-            scratch,
-            sampler.candidate_count(),
-            sampler,
-        )?
+        sample_from_topk_buffers(ctx, harmony, scratch, sampler.candidate_count(), sampler)?
     };
 
-    Ok(ResidentScoredToken {
+    Ok(ScoredToken {
         token,
         #[cfg(feature = "profile")]
         gpu_ns,
     })
 }
 
-fn resident_prefill_embeddings(
-    ctx: &MetalOracleContext,
+fn prefill_embeddings(
+    ctx: &MetalRuntime,
     weights: &GptOssWeights,
-    scratch: &ResidentDecodeScratch,
+    scratch: &GenerationScratch,
     prompt_tokens: &[u32],
 ) -> Result<()> {
     let vocab = weights.embed.rows();
@@ -950,25 +956,25 @@ fn resident_prefill_embeddings(
         prompt_tokens.len(),
         &scratch.prefill_hidden_ping,
     )?;
-    finish_resident_batch(ctx, batch, no_stage_marker());
+    finish_generation_batch(ctx, batch, no_stage_marker());
     Ok(())
 }
 
-fn resident_prefill_layers(
-    ctx: &MetalOracleContext,
+fn prefill_layers(
+    ctx: &MetalRuntime,
     weights: &GptOssWeights,
-    scratch: &ResidentDecodeScratch,
-    kv_cache: &mut ResidentGpuKvCache,
+    scratch: &GenerationScratch,
+    kv_cache: &mut GpuKvCache,
     layers: usize,
     start_position: usize,
     token_count: usize,
-) -> Result<bool> {
-    let mut current_is_ping = true;
+) -> Result<PingPong> {
+    let mut current = PingPong::Ping;
 
     for layer in 0..layers {
-        let (input, output) = resident_prefill_hidden_pair(scratch, current_is_ping);
+        let (input, output) = prefill_hidden_pair(scratch, current);
         let layer_weights = weights.layer(layer)?;
-        resident_prefill_layer(
+        prefill_layer(
             ctx,
             scratch,
             kv_cache,
@@ -979,29 +985,29 @@ fn resident_prefill_layers(
             &input,
             &output,
         )?;
-        current_is_ping = !current_is_ping;
+        current = current.next();
     }
 
-    let final_prompt_hidden = if current_is_ping {
+    let final_prompt_hidden = if current.is_ping() {
         scratch.prefill_hidden_ping.clone()
     } else {
         scratch.prefill_hidden_pong.clone()
     };
     let batch = ctx.platform.begin_batch();
-    batch.read_f32_slot_into(
+    batch.copy_f32_slot_into(
         &final_prompt_hidden,
         token_count - 1,
         HIDDEN_SIZE,
         &scratch.hidden_ping,
     )?;
-    finish_resident_batch(ctx, batch, no_stage_marker());
-    Ok(true)
+    finish_generation_batch(ctx, batch, no_stage_marker());
+    Ok(PingPong::Ping)
 }
 
-fn resident_prefill_layer(
-    ctx: &MetalOracleContext,
-    scratch: &ResidentDecodeScratch,
-    kv_cache: &mut ResidentGpuKvCache,
+fn prefill_layer(
+    ctx: &MetalRuntime,
+    scratch: &GenerationScratch,
+    kv_cache: &mut GpuKvCache,
     weights: &GptOssLayerWeights,
     layer: usize,
     start_position: usize,
@@ -1156,21 +1162,21 @@ fn resident_prefill_layer(
         )?;
     }
 
-    finish_resident_batch(ctx, batch, no_stage_marker());
+    finish_generation_batch(ctx, batch, no_stage_marker());
     Ok(())
 }
 
-fn resident_sample_from_hidden(
-    ctx: &MetalOracleContext,
+fn sample_from_hidden(
+    ctx: &MetalRuntime,
     harmony: &HarmonyAdapter,
     weights: &GptOssWeights,
-    scratch: &mut ResidentDecodeScratch,
+    scratch: &mut GenerationScratch,
     hidden: &platform::F32VectorBuffer,
     sampler: &mut Sampler,
     output_position: usize,
 ) -> Result<GreedyTokenReport> {
     if sampler.needs_full_vocab() {
-        resident_lm_head_full_vocab_sample(
+        sample_full_vocab_debug(
             ctx,
             harmony,
             weights,
@@ -1180,7 +1186,7 @@ fn resident_sample_from_hidden(
             output_position,
         )
     } else {
-        let candidates = resident_lm_head_topk(
+        let candidates = score_topk(
             ctx,
             harmony,
             weights,
@@ -1189,14 +1195,14 @@ fn resident_sample_from_hidden(
             sampler.candidate_count(),
             output_position,
         )?;
-        resident_sample_from_candidates(harmony, &candidates, sampler)
+        sample_from_candidates(harmony, &candidates, sampler)
     }
 }
 
-fn resident_sample_from_topk_buffers(
-    ctx: &MetalOracleContext,
+fn sample_from_topk_buffers(
+    ctx: &MetalRuntime,
     harmony: &HarmonyAdapter,
-    scratch: &ResidentDecodeScratch,
+    scratch: &GenerationScratch,
     k: usize,
     sampler: &mut Sampler,
 ) -> Result<GreedyTokenReport> {
@@ -1214,10 +1220,10 @@ fn resident_sample_from_topk_buffers(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    resident_sample_from_candidates(harmony, &candidates, sampler)
+    sample_from_candidates(harmony, &candidates, sampler)
 }
 
-fn resident_sample_from_candidates(
+fn sample_from_candidates(
     harmony: &HarmonyAdapter,
     candidates: &[GreedyTokenReport],
     sampler: &mut Sampler,
@@ -1243,11 +1249,11 @@ fn resident_sample_from_candidates(
     })
 }
 
-fn resident_lm_head_topk(
-    ctx: &MetalOracleContext,
+fn score_topk(
+    ctx: &MetalRuntime,
     harmony: &HarmonyAdapter,
     weights: &GptOssWeights,
-    scratch: &mut ResidentDecodeScratch,
+    scratch: &mut GenerationScratch,
     hidden: &platform::F32VectorBuffer,
     k: usize,
     output_position: usize,
@@ -1274,7 +1280,7 @@ fn resident_lm_head_topk(
             k,
         )?;
     }
-    finish_resident_batch(
+    finish_generation_batch(
         ctx,
         batch,
         stage_marker(output_position, TokenStage::LmHead),
@@ -1296,11 +1302,11 @@ fn resident_lm_head_topk(
         .collect()
 }
 
-fn resident_lm_head_full_vocab_sample(
-    ctx: &MetalOracleContext,
+fn sample_full_vocab_debug(
+    ctx: &MetalRuntime,
     harmony: &HarmonyAdapter,
     weights: &GptOssWeights,
-    scratch: &mut ResidentDecodeScratch,
+    scratch: &mut GenerationScratch,
     hidden: &platform::F32VectorBuffer,
     sampler: &mut Sampler,
     output_position: usize,
@@ -1308,7 +1314,7 @@ fn resident_lm_head_full_vocab_sample(
     let batch = ctx.platform.begin_batch();
     batch.rms_norm_into(hidden, &weights.final_norm, &scratch.final_hidden)?;
     batch.bf16_matrix_logits_into(&weights.lm_head, &scratch.final_hidden, &scratch.lm_logits)?;
-    finish_resident_batch(
+    finish_generation_batch(
         ctx,
         batch,
         stage_marker(output_position, TokenStage::LmHead),
@@ -1331,10 +1337,10 @@ fn resident_lm_head_full_vocab_sample(
     })
 }
 
-fn resident_decode_layer(
+fn encode_decode_layer(
     batch: &platform::MetalBatch<'_>,
-    scratch: &mut ResidentDecodeScratch,
-    kv_cache: &mut ResidentGpuKvCache,
+    scratch: &mut GenerationScratch,
+    kv_cache: &mut GpuKvCache,
     weights: &GptOssLayerWeights,
     layer: usize,
     position: usize,
@@ -1424,8 +1430,8 @@ fn resident_decode_layer(
     Ok(())
 }
 
-fn finish_resident_batch(
-    ctx: &MetalOracleContext,
+fn finish_generation_batch(
+    ctx: &MetalRuntime,
     batch: platform::MetalBatch<'_>,
     stage: StageMarker,
 ) -> u128 {
@@ -1437,7 +1443,7 @@ fn finish_resident_batch(
     }
     #[cfg(feature = "profile")]
     ctx.record_profile(
-        "phase.resident_sample_decode",
+        "phase.generate_resident",
         ProfileDelta {
             command_buffers: 1,
             ..ProfileDelta::default()
@@ -1460,7 +1466,7 @@ fn no_stage_marker() -> StageMarker {
 }
 
 #[cfg(feature = "profile")]
-fn record_hot_token_metric(ctx: &MetalOracleContext, wall: Duration, gpu_ns: u128) {
+fn record_hot_token_metric(ctx: &MetalRuntime, wall: Duration, gpu_ns: u128) {
     ctx.record_profile(
         "metric.hot_token",
         ProfileDelta {

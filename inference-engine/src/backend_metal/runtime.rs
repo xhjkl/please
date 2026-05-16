@@ -75,7 +75,7 @@ pub(crate) mod platform {
         kv_cache_decode_attention: Retained<MetalComputePipelineState>,
         write_f32_slot: Retained<MetalComputePipelineState>,
         write_f32_slots_batch: Retained<MetalComputePipelineState>,
-        read_f32_slot: Retained<MetalComputePipelineState>,
+        copy_f32_slot: Retained<MetalComputePipelineState>,
         vector_add: Retained<MetalComputePipelineState>,
         top4_softmax: Retained<MetalComputePipelineState>,
         top4_softmax_batch: Retained<MetalComputePipelineState>,
@@ -179,7 +179,7 @@ pub(crate) mod platform {
                 )?,
                 write_f32_slot: pipeline(&device, &library, "write_f32_slot")?,
                 write_f32_slots_batch: pipeline(&device, &library, "write_f32_slots_batch")?,
-                read_f32_slot: pipeline(&device, &library, "read_f32_slot")?,
+                copy_f32_slot: pipeline(&device, &library, "copy_f32_slot")?,
                 vector_add: pipeline(&device, &library, "vector_add")?,
                 top4_softmax: pipeline(&device, &library, "top4_softmax")?,
                 top4_softmax_batch: pipeline(&device, &library, "top4_softmax_batch")?,
@@ -1970,7 +1970,7 @@ pub(crate) mod platform {
             Ok(())
         }
 
-        pub fn read_f32_slot_into(
+        pub fn copy_f32_slot_into(
             &self,
             input: &F32VectorBuffer,
             slot: usize,
@@ -1979,17 +1979,17 @@ pub(crate) mod platform {
         ) -> Result<()> {
             if output.len != width {
                 return Err(eyre!(
-                    "slot read output has {} values, expected {width}",
+                    "slot copy output has {} values, expected {width}",
                     output.len
                 ));
             }
             let required = slot
                 .checked_add(1)
                 .and_then(|slots| slots.checked_mul(width))
-                .ok_or_else(|| eyre!("slot read length overflow"))?;
+                .ok_or_else(|| eyre!("slot copy length overflow"))?;
             if input.len < required {
                 return Err(eyre!(
-                    "slot read input has {} values, needs at least {required}",
+                    "slot copy input has {} values, needs at least {required}",
                     input.len
                 ));
             }
@@ -2000,7 +2000,7 @@ pub(crate) mod platform {
             let width_buffer = buffer_with_data(&self.context.device, &[width]);
 
             let encoder = self.command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.context.read_f32_slot);
+            encoder.set_compute_pipeline_state(&self.context.copy_f32_slot);
             encoder.set_buffer(0, Some(&input.buffer), 0);
             encoder.set_buffer(1, Some(&output.buffer), 0);
             encoder.set_buffer(2, Some(&slot_buffer), 0);
@@ -3203,7 +3203,7 @@ pub(crate) mod platform {
             Err(eyre!("Metal backend is only available on macOS"))
         }
 
-        pub fn read_f32_slot_into(
+        pub fn copy_f32_slot_into(
             &self,
             _input: &F32VectorBuffer,
             _slot: usize,

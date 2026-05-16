@@ -1,6 +1,6 @@
 use eyre::{Result, eyre};
 
-use super::{EXPERTS, MXFP4_BYTES_PER_GROUP, MXFP4_GROUPS, MetalOracleContext, platform};
+use super::{EXPERTS, MXFP4_BYTES_PER_GROUP, MXFP4_GROUPS, MetalRuntime, platform};
 use crate::model_store::{self, SafeTensorMap, SourceModelReport};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -46,7 +46,7 @@ pub(crate) fn mxfp4_slab_scales_len(rows: usize) -> Result<usize> {
 // The resident path currently keeps a full per-layer experts carousel on GPU.
 // Later pageable mode can replace these all-expert slabs with carousel slots
 // addressed through a GPU expert_slot[layer][expert] table.
-pub(crate) struct ResidentExpertsCarouselSlabs {
+pub(crate) struct ExpertsCarouselSlabs {
     pub(crate) gate_up_blocks: platform::U8Buffer,
     pub(crate) gate_up_scales: platform::U8Buffer,
     pub(crate) gate_up_bias: platform::Bf16MatrixBuffer,
@@ -79,7 +79,7 @@ pub(crate) struct AttentionWeights {
 
 pub(crate) struct SparseMlpWeights {
     pub(crate) router: Bf16Linear,
-    pub(crate) experts_carousel: ResidentExpertsCarouselSlabs,
+    pub(crate) experts_carousel: ExpertsCarouselSlabs,
 }
 
 pub(crate) struct Bf16Linear {
@@ -88,14 +88,10 @@ pub(crate) struct Bf16Linear {
 }
 
 impl GptOssWeights {
-    pub(crate) fn load(
-        ctx: &MetalOracleContext,
-        source: &SafeTensorMap,
-        layers: usize,
-    ) -> Result<Self> {
+    pub(crate) fn load(ctx: &MetalRuntime, source: &SafeTensorMap, layers: usize) -> Result<Self> {
         let Some(lm_head) = ctx.lm_head.clone() else {
             return Err(eyre!(
-                "Metal lm_head weight is not cached; construct MetalOracleContext::with_lm_head"
+                "Metal lm_head weight is not cached; construct MetalRuntime::with_lm_head"
             ));
         };
         let embed = ctx.bf16_matrix_buffer_from_map(
@@ -127,7 +123,7 @@ impl GptOssWeights {
 }
 
 impl GptOssLayerWeights {
-    fn load(ctx: &MetalOracleContext, source: &SafeTensorMap, layer: usize) -> Result<Self> {
+    fn load(ctx: &MetalRuntime, source: &SafeTensorMap, layer: usize) -> Result<Self> {
         let prefix = format!("model.layers.{layer}");
         let input_norm = ctx.bf16_vector_buffer_from_map(
             source,
@@ -196,7 +192,7 @@ impl GptOssLayerWeights {
 
 impl Bf16Linear {
     fn load(
-        ctx: &MetalOracleContext,
+        ctx: &MetalRuntime,
         source: &SafeTensorMap,
         weight_name: &str,
         bias_name: &str,
@@ -210,14 +206,14 @@ impl Bf16Linear {
 }
 
 #[derive(Default)]
-pub(crate) struct ResidentWeights {
+pub(crate) struct WeightCache {
     bf16_matrices: Mutex<HashMap<String, Arc<model_store::Bf16Matrix>>>,
     bf16_vectors: Mutex<HashMap<String, Arc<Vec<f32>>>>,
     bf16_rows: Mutex<HashMap<(String, usize), Arc<Vec<f32>>>>,
     u8_slices: Mutex<HashMap<(String, usize, usize), Arc<Vec<u8>>>>,
 }
 
-impl ResidentWeights {
+impl WeightCache {
     pub(crate) fn bf16_matrix(
         &self,
         report: &SourceModelReport,

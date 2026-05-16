@@ -4,7 +4,7 @@ use inference_engine::backend_metal;
 use inference_engine::gptoss_spec::weights;
 use inference_engine::harmony_adapter::{HarmonyAdapter, Message, Role};
 use inference_engine::model_store;
-use inference_engine::{GreedyDecodeProbeReport, PromptFixture, SamplingConfig};
+use inference_engine::{GenerationReport, PromptFixture, SamplingConfig};
 
 const FULL_DEPTH_LAYERS: usize = 24;
 
@@ -30,10 +30,10 @@ fn main() -> Result<()> {
     let Some(token) = fixture.prompt_tokens.first().copied() else {
         return Err(eyre!("metal oracle fixture produced no prompt tokens"));
     };
-    let ctx = backend_metal::MetalOracleContext::with_lm_head(&report)?;
+    let ctx = backend_metal::MetalRuntime::with_lm_head(&report)?;
 
     if args.decode_only {
-        let greedy_decode = backend_metal::probe_sample_decode(
+        let greedy_decode = backend_metal::probes::probe_sample_decode(
             &ctx,
             &report,
             &harmony,
@@ -51,7 +51,7 @@ fn main() -> Result<()> {
                 args.cpu_check_layers,
                 args.cpu_check_max_new,
             )?;
-            let metal = backend_metal::probe_greedy_decode(
+            let metal = backend_metal::probes::probe_greedy_decode(
                 &ctx,
                 &report,
                 &harmony,
@@ -65,12 +65,12 @@ fn main() -> Result<()> {
         }
         if args.kv_stress {
             let stress_tokens = repeated_tokens(&fixture.prompt_tokens, args.kv_stress_tokens)?;
-            let window = backend_metal::probe_kv_cache_window_rollover_attention(
+            let window = backend_metal::probes::probe_kv_cache_window_rollover_attention(
                 &ctx,
                 &report,
                 &stress_tokens,
             )?;
-            let dense = backend_metal::probe_kv_cache_dense_accumulation_attention(
+            let dense = backend_metal::probes::probe_kv_cache_dense_accumulation_attention(
                 &ctx,
                 &report,
                 &stress_tokens,
@@ -109,33 +109,45 @@ fn main() -> Result<()> {
         out.push_str(&format!("  - token {}: {:.7}\n", logit.token, logit.logit));
     }
 
-    let metal = backend_metal::probe_rms_norm_embedding(&ctx, &report, token)?;
+    let metal = backend_metal::probes::probe_rms_norm_embedding(&ctx, &report, token)?;
     out.push_str(&metal.render_for_cli());
-    let q_proj = backend_metal::probe_layer0_q_proj(&ctx, &report, token)?;
+    let q_proj = backend_metal::probes::probe_layer0_q_proj(&ctx, &report, token)?;
     out.push_str(&q_proj.render_for_cli());
-    let k_proj = backend_metal::probe_layer0_k_proj(&ctx, &report, token)?;
+    let k_proj = backend_metal::probes::probe_layer0_k_proj(&ctx, &report, token)?;
     out.push_str(&k_proj.render_for_cli());
-    let v_proj = backend_metal::probe_layer0_v_proj(&ctx, &report, token)?;
+    let v_proj = backend_metal::probes::probe_layer0_v_proj(&ctx, &report, token)?;
     out.push_str(&v_proj.render_for_cli());
-    let q_rope = backend_metal::probe_layer0_q_rope(&ctx, &report, token, 0)?;
+    let q_rope = backend_metal::probes::probe_layer0_q_rope(&ctx, &report, token, 0)?;
     out.push_str(&q_rope.render_for_cli());
-    let k_rope = backend_metal::probe_layer0_k_rope(&ctx, &report, token, 0)?;
+    let k_rope = backend_metal::probes::probe_layer0_k_rope(&ctx, &report, token, 0)?;
     out.push_str(&k_rope.render_for_cli());
-    let attention = backend_metal::probe_layer0_single_token_attention(&ctx, &report, token)?;
+    let attention =
+        backend_metal::probes::probe_layer0_single_token_attention(&ctx, &report, token)?;
     out.push_str(&attention.render_for_cli());
     let sequence_attention =
-        backend_metal::probe_layer0_sequence_attention(&ctx, &report, &prefill_tokens)?;
+        backend_metal::probes::probe_layer0_sequence_attention(&ctx, &report, &prefill_tokens)?;
     out.push_str(&sequence_attention.render_for_cli());
-    let kv_decode =
-        backend_metal::probe_layer0_kv_cache_decode_attention(&ctx, &report, &prefill_tokens)?;
+    let kv_decode = backend_metal::probes::probe_layer0_kv_cache_decode_attention(
+        &ctx,
+        &report,
+        &prefill_tokens,
+    )?;
     out.push_str(&kv_decode.render_for_cli());
-    let prefill_output =
-        backend_metal::probe_prefill_layers_output(&ctx, &report, &prefill_tokens, args.layers)?;
+    let prefill_output = backend_metal::probes::probe_prefill_layers_output(
+        &ctx,
+        &report,
+        &prefill_tokens,
+        args.layers,
+    )?;
     out.push_str(&prefill_output.render_for_cli());
-    let prefill_final_norm =
-        backend_metal::probe_prefill_final_norm(&ctx, &report, &prefill_tokens, args.layers)?;
+    let prefill_final_norm = backend_metal::probes::probe_prefill_final_norm(
+        &ctx,
+        &report,
+        &prefill_tokens,
+        args.layers,
+    )?;
     out.push_str(&prefill_final_norm.render_for_cli());
-    let prefill_logits = backend_metal::probe_prefill_selected_logits(
+    let prefill_logits = backend_metal::probes::probe_prefill_selected_logits(
         &ctx,
         &report,
         &prefill_tokens,
@@ -144,7 +156,7 @@ fn main() -> Result<()> {
     )?;
     out.push_str(&prefill_logits.render_for_cli());
     if let Some(decode_token) = fixture.prompt_tokens.get(prefill_tokens.len()).copied() {
-        let decode_final_norm = backend_metal::probe_decode_one_final_norm(
+        let decode_final_norm = backend_metal::probes::probe_decode_one_final_norm(
             &ctx,
             &report,
             &prefill_tokens,
@@ -152,7 +164,7 @@ fn main() -> Result<()> {
             args.layers,
         )?;
         out.push_str(&decode_final_norm.render_for_cli());
-        let decode_logits = backend_metal::probe_decode_one_selected_logits(
+        let decode_logits = backend_metal::probes::probe_decode_one_selected_logits(
             &ctx,
             &report,
             &prefill_tokens,
@@ -161,7 +173,7 @@ fn main() -> Result<()> {
             &args.logit_tokens,
         )?;
         out.push_str(&decode_logits.render_for_cli());
-        let decode_text = backend_metal::probe_decode_one_greedy_text(
+        let decode_text = backend_metal::probes::probe_decode_one_greedy_text(
             &ctx,
             &report,
             &harmony,
@@ -170,7 +182,7 @@ fn main() -> Result<()> {
             args.layers,
         )?;
         out.push_str(&decode_text.render_for_cli());
-        let decode_lm_head_topk = backend_metal::probe_decode_one_lm_head_topk(
+        let decode_lm_head_topk = backend_metal::probes::probe_decode_one_lm_head_topk(
             &ctx,
             &report,
             &harmony,
@@ -185,7 +197,7 @@ fn main() -> Result<()> {
             "\nmetal decode-one oracle probe:\n- skipped: fixture has no token after prefill prefix\n",
         );
     }
-    let greedy_decode = backend_metal::probe_sample_decode(
+    let greedy_decode = backend_metal::probes::probe_sample_decode(
         &ctx,
         &report,
         &harmony,
@@ -195,31 +207,31 @@ fn main() -> Result<()> {
         args.sampling.clone(),
     )?;
     out.push_str(&greedy_decode.render_for_cli());
-    let o_proj = backend_metal::probe_layer0_o_proj(&ctx, &report, token)?;
+    let o_proj = backend_metal::probes::probe_layer0_o_proj(&ctx, &report, token)?;
     out.push_str(&o_proj.render_for_cli());
-    let residual = backend_metal::probe_layer0_attention_residual(&ctx, &report, token)?;
+    let residual = backend_metal::probes::probe_layer0_attention_residual(&ctx, &report, token)?;
     out.push_str(&residual.render_for_cli());
     let post_attention_norm =
-        backend_metal::probe_layer0_post_attention_rms_norm(&ctx, &report, token)?;
+        backend_metal::probes::probe_layer0_post_attention_rms_norm(&ctx, &report, token)?;
     out.push_str(&post_attention_norm.render_for_cli());
-    let router = backend_metal::probe_layer0_router(&ctx, &report, token)?;
+    let router = backend_metal::probes::probe_layer0_router(&ctx, &report, token)?;
     out.push_str(&router.render_for_cli());
-    let router_top4 = backend_metal::probe_layer0_router_top4(&ctx, &report, token)?;
+    let router_top4 = backend_metal::probes::probe_layer0_router_top4(&ctx, &report, token)?;
     out.push_str(&router_top4.render_for_cli());
-    let gate_up = backend_metal::probe_layer0_top_expert_gate_up(&ctx, &report, token)?;
+    let gate_up = backend_metal::probes::probe_layer0_top_expert_gate_up(&ctx, &report, token)?;
     out.push_str(&gate_up.render_for_cli());
-    let swiglu = backend_metal::probe_layer0_top_expert_swiglu(&ctx, &report, token)?;
+    let swiglu = backend_metal::probes::probe_layer0_top_expert_swiglu(&ctx, &report, token)?;
     out.push_str(&swiglu.render_for_cli());
-    let down_proj = backend_metal::probe_layer0_top_expert_down_proj(&ctx, &report, token)?;
+    let down_proj = backend_metal::probes::probe_layer0_top_expert_down_proj(&ctx, &report, token)?;
     out.push_str(&down_proj.render_for_cli());
-    let moe = backend_metal::probe_layer0_moe_top4(&ctx, &report, token)?;
+    let moe = backend_metal::probes::probe_layer0_moe_top4(&ctx, &report, token)?;
     out.push_str(&moe.render_for_cli());
-    let layer0 = backend_metal::probe_layer0_output(&ctx, &report, token)?;
+    let layer0 = backend_metal::probes::probe_layer0_output(&ctx, &report, token)?;
     out.push_str(&layer0.render_for_cli());
     let stack_final_norm =
-        backend_metal::probe_single_token_final_norm(&ctx, &report, token, args.layers)?;
+        backend_metal::probes::probe_single_token_final_norm(&ctx, &report, token, args.layers)?;
     out.push_str(&stack_final_norm.render_for_cli());
-    let stack_logits = backend_metal::probe_single_token_selected_logits(
+    let stack_logits = backend_metal::probes::probe_single_token_selected_logits(
         &ctx,
         &report,
         token,
@@ -408,10 +420,7 @@ fn repeated_tokens(tokens: &[u32], len: usize) -> Result<Vec<u32>> {
     Ok(tokens.iter().copied().cycle().take(len).collect())
 }
 
-fn render_greedy_decode_comparison(
-    cpu: &GreedyDecodeProbeReport,
-    metal: &GreedyDecodeProbeReport,
-) -> String {
+fn render_greedy_decode_comparison(cpu: &GenerationReport, metal: &GenerationReport) -> String {
     let mut out = String::new();
     let cpu_tokens = cpu
         .generated

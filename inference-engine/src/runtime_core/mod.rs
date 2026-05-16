@@ -502,7 +502,7 @@ impl PromptPlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GreedyDecodeProbeReport {
+pub struct GenerationReport {
     pub name: String,
     pub backend: String,
     pub scorer: String,
@@ -514,10 +514,10 @@ pub struct GreedyDecodeProbeReport {
     pub text: String,
 }
 
-impl GreedyDecodeProbeReport {
+impl GenerationReport {
     pub fn render_for_cli(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("\n{} greedy decode probe:\n", self.backend));
+        out.push_str(&format!("\n{} greedy decode:\n", self.backend));
         out.push_str(&format!("- name: {}\n", self.name));
         out.push_str(&format!("- layers: {}\n", self.layers));
         out.push_str(&format!("- prompt tokens: {}\n", self.prompt_tokens));
