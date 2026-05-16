@@ -108,6 +108,42 @@ kernel void apply_rms_norm_from_partials(
     out[gid] = x[gid] * scale * weight[gid];
 }
 
+kernel void rms_norm_batch(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]
+) {
+    threadgroup float scratch[256];
+    if (row >= rows) {
+        return;
+    }
+
+    uint row_start = row * cols;
+    float sum = 0.0f;
+    for (uint col = tid; col < cols; col += 256u) {
+        float value = input[row_start + col];
+        sum += value * value;
+    }
+    scratch[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float scale = rsqrt(scratch[0] / float(cols) + 1.0e-5f);
+    for (uint col = tid; col < cols; col += 256u) {
+        out[row_start + col] = input[row_start + col] * scale * weight[col];
+    }
+}
+
 kernel void embedding_lookup_bf16(
     device const ushort* weight [[buffer(0)]],
     device float* out [[buffer(1)]],
@@ -118,6 +154,25 @@ kernel void embedding_lookup_bf16(
     if (gid < cols) {
         out[gid] = bf16_to_float(weight[token * cols + gid]);
     }
+}
+
+kernel void embedding_lookup_bf16_batch(
+    device const ushort* weight [[buffer(0)]],
+    device const uint* tokens [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    constant uint& token_count [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = cols * token_count;
+    if (gid >= total) {
+        return;
+    }
+
+    uint row = gid / cols;
+    uint col = gid - row * cols;
+    uint token = tokens[row];
+    out[row * cols + col] = bf16_to_float(weight[token * cols + col]);
 }
 
 kernel void bf16_matvec(
@@ -150,6 +205,45 @@ kernel void bf16_matvec(
 
     if (tid == 0 && row < rows) {
         out[row] = scratch[0] + bias[row];
+    }
+}
+
+kernel void bf16_matvec_batch(
+    device const ushort* weight [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    constant uint& batch_rows [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]
+) {
+    threadgroup float scratch[256];
+    uint out_row = group.x;
+    uint batch_row = group.y;
+    if (out_row >= rows || batch_row >= batch_rows) {
+        return;
+    }
+
+    uint weight_start = out_row * cols;
+    uint input_start = batch_row * cols;
+    float sum = 0.0f;
+    for (uint col = tid; col < cols; col += 256u) {
+        sum += bf16_to_float(weight[weight_start + col]) * input[input_start + col];
+    }
+    scratch[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        out[batch_row * rows + out_row] = scratch[0] + bias[out_row];
     }
 }
 
@@ -349,6 +443,40 @@ kernel void rope_row(
     }
 }
 
+kernel void rope_batch(
+    device const float* input [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& heads [[buffer(2)]],
+    constant uint& start_position [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint width = heads * 64u;
+    uint total = rows * width;
+    if (gid >= total) {
+        return;
+    }
+
+    uint row = gid / width;
+    uint local = gid - row * width;
+    uint head_offset = row * width + (local / 64u) * 64u;
+    uint dim = local % 64u;
+    uint pair_dim = dim % 32u;
+    float theta = float(start_position + row) * rope_inv_freq(pair_dim);
+    float c = cos(theta) * rope_concentration();
+    float s = sin(theta) * rope_concentration();
+
+    if (dim < 32u) {
+        float x1 = input[head_offset + dim];
+        float x2 = input[head_offset + dim + 32u];
+        out[gid] = x1 * c - x2 * s;
+    } else {
+        float x1 = input[head_offset + dim - 32u];
+        float x2 = input[head_offset + dim];
+        out[gid] = x2 * c + x1 * s;
+    }
+}
+
 kernel void single_token_attention(
     device const float* q [[buffer(0)]],
     device const float* k [[buffer(1)]],
@@ -419,6 +547,43 @@ kernel void sequence_attention(
     uint kv_head = head / 8u;
     uint q_start = query_position * 4096u + head * 64u;
     uint kv_start = kv_head * 64u;
+
+    if (key_count > 256u) {
+        if (tid != 0u) {
+            return;
+        }
+
+        float max_value = sinks[head];
+        float denom = 1.0f;
+        float values[64];
+        for (uint dim = 0u; dim < 64u; dim++) {
+            values[dim] = 0.0f;
+        }
+
+        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
+            uint key_position = key_start + key_offset;
+            uint k_start = key_position * 512u + kv_start;
+            uint v_start = key_position * 512u + kv_start;
+            float sum = 0.0f;
+            for (uint dim = 0u; dim < 64u; dim++) {
+                sum += q[q_start + dim] * k[k_start + dim];
+            }
+            float score = sum * 0.125f;
+            float next_max = max(max_value, score);
+            float old_scale = exp(max_value - next_max);
+            float new_scale = exp(score - next_max);
+            for (uint dim = 0u; dim < 64u; dim++) {
+                values[dim] = values[dim] * old_scale + v[v_start + dim] * new_scale;
+            }
+            denom = denom * old_scale + new_scale;
+            max_value = next_max;
+        }
+
+        for (uint dim = 0u; dim < 64u; dim++) {
+            out[q_start + dim] = values[dim] / denom;
+        }
+        return;
+    }
 
     for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
         uint key_position = key_start + key_offset;
@@ -617,6 +782,36 @@ kernel void write_f32_slot(
 ) {
     if (gid < width) {
         output[slot * width + gid] = input[gid];
+    }
+}
+
+kernel void write_f32_slots_batch(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& start_slot [[buffer(2)]],
+    constant uint& slots [[buffer(3)]],
+    constant uint& width [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = slots * width;
+    if (gid >= total) {
+        return;
+    }
+
+    uint slot = gid / width;
+    uint col = gid - slot * width;
+    output[(start_slot + slot) * width + col] = input[gid];
+}
+
+kernel void read_f32_slot(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& slot [[buffer(2)]],
+    constant uint& width [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < width) {
+        output[gid] = input[slot * width + gid];
     }
 }
 

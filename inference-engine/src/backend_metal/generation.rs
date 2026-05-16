@@ -15,6 +15,7 @@ use crate::runtime_core::{
     EngineRequest, GenerationEvent, GreedyDecodeProbeReport, GreedyTokenReport, RuntimeNotice,
     SamplingConfig, StopReason,
 };
+use std::mem::size_of;
 use std::time::Instant;
 
 struct ResidentDecodeScratch {
@@ -35,6 +36,19 @@ struct ResidentDecodeScratch {
     router_selected_logits: platform::F32VectorBuffer,
     router_weights: platform::F32VectorBuffer,
     expert_acts_packed: platform::F32VectorBuffer,
+    prefill_hidden: platform::F32VectorBuffer,
+    prefill_hidden_b: platform::F32VectorBuffer,
+    prefill_normed: platform::F32VectorBuffer,
+    prefill_q: platform::F32VectorBuffer,
+    prefill_q_rope: platform::F32VectorBuffer,
+    prefill_k: platform::F32VectorBuffer,
+    prefill_k_rope: platform::F32VectorBuffer,
+    prefill_v: platform::F32VectorBuffer,
+    prefill_attn: platform::F32VectorBuffer,
+    prefill_projected: platform::F32VectorBuffer,
+    prefill_residual: platform::F32VectorBuffer,
+    prefill_router_input: platform::F32VectorBuffer,
+    prefill_router_logits: platform::F32VectorBuffer,
     final_hidden: platform::F32VectorBuffer,
     lm_logits: platform::F32VectorBuffer,
     lm_top1_block_indices: platform::U32Buffer,
@@ -44,8 +58,20 @@ struct ResidentDecodeScratch {
 }
 
 impl ResidentDecodeScratch {
-    fn new(platform: &platform::MetalContext, vocab: usize) -> Result<Self> {
+    fn new(platform: &platform::MetalContext, vocab: usize, context_tokens: usize) -> Result<Self> {
         let lm_top1_blocks = vocab.div_ceil(LM_HEAD_TOP1_BLOCK_SIZE);
+        let prefill_values = context_tokens
+            .checked_mul(HIDDEN_SIZE)
+            .ok_or_else(|| eyre!("prefill hidden buffer length overflow"))?;
+        let prefill_attn_values = context_tokens
+            .checked_mul(ATTN_VALUES)
+            .ok_or_else(|| eyre!("prefill attention buffer length overflow"))?;
+        let prefill_kv_values = context_tokens
+            .checked_mul(KV_VALUES)
+            .ok_or_else(|| eyre!("prefill KV buffer length overflow"))?;
+        let prefill_router_values = context_tokens
+            .checked_mul(32)
+            .ok_or_else(|| eyre!("prefill router buffer length overflow"))?;
         Ok(Self {
             hidden_a: platform.alloc_f32_vector(HIDDEN_SIZE)?,
             hidden_b: platform.alloc_f32_vector(HIDDEN_SIZE)?,
@@ -64,6 +90,19 @@ impl ResidentDecodeScratch {
             router_selected_logits: platform.alloc_f32_vector(4)?,
             router_weights: platform.alloc_f32_vector(4)?,
             expert_acts_packed: platform.alloc_f32_vector(4 * HIDDEN_SIZE)?,
+            prefill_hidden: platform.alloc_f32_vector(prefill_values)?,
+            prefill_hidden_b: platform.alloc_f32_vector(prefill_values)?,
+            prefill_normed: platform.alloc_f32_vector(prefill_values)?,
+            prefill_q: platform.alloc_f32_vector(prefill_attn_values)?,
+            prefill_q_rope: platform.alloc_f32_vector(prefill_attn_values)?,
+            prefill_k: platform.alloc_f32_vector(prefill_kv_values)?,
+            prefill_k_rope: platform.alloc_f32_vector(prefill_kv_values)?,
+            prefill_v: platform.alloc_f32_vector(prefill_kv_values)?,
+            prefill_attn: platform.alloc_f32_vector(prefill_attn_values)?,
+            prefill_projected: platform.alloc_f32_vector(prefill_values)?,
+            prefill_residual: platform.alloc_f32_vector(prefill_values)?,
+            prefill_router_input: platform.alloc_f32_vector(prefill_values)?,
+            prefill_router_logits: platform.alloc_f32_vector(prefill_router_values)?,
             final_hidden: platform.alloc_f32_vector(HIDDEN_SIZE)?,
             lm_logits: platform.alloc_f32_vector(vocab)?,
             lm_top1_block_indices: platform.alloc_u32_buffer(lm_top1_blocks)?,
@@ -293,21 +332,18 @@ fn resident_sample_decode_inner(
     #[cfg(feature = "metal-stage-profile")]
     ctx.reset_stage_profile(context_tokens);
 
-    let mut scratch = ResidentDecodeScratch::new(&ctx.platform, weights.lm_head.rows())?;
+    let mut scratch =
+        ResidentDecodeScratch::new(&ctx.platform, weights.lm_head.rows(), context_tokens)?;
     let mut kv_cache = ResidentGpuKvCache::new(&ctx.platform, layers, context_tokens)?;
-
-    let mut current_is_a = true;
-    for (position, token) in prompt_tokens.iter().copied().enumerate() {
-        current_is_a = resident_decode_token(
-            ctx,
-            weights,
-            &mut scratch,
-            &mut kv_cache,
-            layers,
-            position,
-            token,
-        )?;
-    }
+    resident_prefill_embeddings(ctx, weights, &scratch, prompt_tokens)?;
+    let mut current_is_a = resident_prefill_layers(
+        ctx,
+        weights,
+        &scratch,
+        &mut kv_cache,
+        layers,
+        prompt_tokens.len(),
+    )?;
 
     let stop_tokens = harmony.stop_tokens()?;
     let mut generated = Vec::with_capacity(max_new_tokens);
@@ -400,6 +436,23 @@ fn resident_hidden_pair(
     }
 }
 
+fn resident_prefill_hidden_pair(
+    scratch: &ResidentDecodeScratch,
+    current_is_a: bool,
+) -> (platform::F32VectorBuffer, platform::F32VectorBuffer) {
+    if current_is_a {
+        (
+            scratch.prefill_hidden.clone(),
+            scratch.prefill_hidden_b.clone(),
+        )
+    } else {
+        (
+            scratch.prefill_hidden_b.clone(),
+            scratch.prefill_hidden.clone(),
+        )
+    }
+}
+
 fn resident_current_hidden(
     scratch: &ResidentDecodeScratch,
     current_is_a: bool,
@@ -443,6 +496,231 @@ fn resident_decode_token(
 
     finish_resident_batch(ctx, batch, stage_marker(position, TokenStage::Token));
     Ok(current_is_a)
+}
+
+fn resident_prefill_embeddings(
+    ctx: &MetalOracleContext,
+    weights: &GptOssWeights,
+    scratch: &ResidentDecodeScratch,
+    prompt_tokens: &[u32],
+) -> Result<()> {
+    let tokens = ctx.platform.upload_u32_buffer(prompt_tokens)?;
+    ctx.record_profile(
+        "op.input.prompt_tokens",
+        ProfileDelta {
+            upload_bytes: prompt_tokens.len() * size_of::<u32>(),
+            cache_misses: 1,
+            ..ProfileDelta::default()
+        },
+    );
+    let batch = ctx.platform.begin_batch();
+    batch.embedding_lookup_bf16_batch_into(
+        &weights.embed,
+        &tokens,
+        prompt_tokens.len(),
+        &scratch.prefill_hidden,
+    )?;
+    finish_resident_batch(ctx, batch, no_stage_marker());
+    Ok(())
+}
+
+fn resident_prefill_layers(
+    ctx: &MetalOracleContext,
+    weights: &GptOssWeights,
+    scratch: &ResidentDecodeScratch,
+    kv_cache: &mut ResidentGpuKvCache,
+    layers: usize,
+    prompt_len: usize,
+) -> Result<bool> {
+    let mut current_is_a = true;
+
+    for layer in 0..layers {
+        let (input, output) = resident_prefill_hidden_pair(scratch, current_is_a);
+        let layer_weights = weights.layer(layer)?;
+        resident_prefill_layer(
+            ctx,
+            scratch,
+            kv_cache,
+            layer_weights,
+            layer,
+            prompt_len,
+            &input,
+            &output,
+        )?;
+        current_is_a = !current_is_a;
+    }
+
+    let final_prompt_hidden = if current_is_a {
+        scratch.prefill_hidden.clone()
+    } else {
+        scratch.prefill_hidden_b.clone()
+    };
+    let batch = ctx.platform.begin_batch();
+    batch.read_f32_slot_into(
+        &final_prompt_hidden,
+        prompt_len - 1,
+        HIDDEN_SIZE,
+        &scratch.hidden_a,
+    )?;
+    finish_resident_batch(ctx, batch, no_stage_marker());
+    Ok(true)
+}
+
+fn resident_prefill_layer(
+    ctx: &MetalOracleContext,
+    scratch: &ResidentDecodeScratch,
+    kv_cache: &mut ResidentGpuKvCache,
+    weights: &GptOssLayerWeights,
+    layer: usize,
+    prompt_len: usize,
+    input: &platform::F32VectorBuffer,
+    output: &platform::F32VectorBuffer,
+) -> Result<()> {
+    if prompt_len > kv_cache.capacity {
+        return Err(eyre!(
+            "resident prefill prompt length {prompt_len} exceeds KV capacity {}",
+            kv_cache.capacity
+        ));
+    }
+
+    let layer_cache = kv_cache.layer(layer)?;
+    let batch = ctx.platform.begin_batch();
+    batch.rms_norm_batch_into(
+        input,
+        &weights.input_norm,
+        &scratch.prefill_normed,
+        prompt_len,
+        HIDDEN_SIZE,
+    )?;
+    batch.bf16_matrix_matvec_batch_into(
+        &weights.attn.q.weight,
+        &scratch.prefill_normed,
+        &weights.attn.q.bias,
+        &scratch.prefill_q,
+        prompt_len,
+    )?;
+    batch.bf16_matrix_matvec_batch_into(
+        &weights.attn.k.weight,
+        &scratch.prefill_normed,
+        &weights.attn.k.bias,
+        &scratch.prefill_k,
+        prompt_len,
+    )?;
+    batch.bf16_matrix_matvec_batch_into(
+        &weights.attn.v.weight,
+        &scratch.prefill_normed,
+        &weights.attn.v.bias,
+        &scratch.prefill_v,
+        prompt_len,
+    )?;
+    batch.rope_batch_into(
+        &scratch.prefill_q,
+        &scratch.prefill_q_rope,
+        Q_HEADS,
+        0,
+        prompt_len,
+    )?;
+    batch.rope_batch_into(
+        &scratch.prefill_k,
+        &scratch.prefill_k_rope,
+        KV_HEADS,
+        0,
+        prompt_len,
+    )?;
+    batch.write_f32_slots_batch_into(
+        &scratch.prefill_k_rope,
+        &layer_cache.k,
+        0,
+        prompt_len,
+        KV_VALUES,
+    )?;
+    batch.write_f32_slots_batch_into(
+        &scratch.prefill_v,
+        &layer_cache.v,
+        0,
+        prompt_len,
+        KV_VALUES,
+    )?;
+    batch.sequence_attention_into(
+        layer,
+        &scratch.prefill_q_rope,
+        &scratch.prefill_k_rope,
+        &scratch.prefill_v,
+        &weights.attn.sinks,
+        &scratch.prefill_attn,
+        prompt_len,
+    )?;
+    batch.bf16_matrix_matvec_batch_into(
+        &weights.attn.o.weight,
+        &scratch.prefill_attn,
+        &weights.attn.o.bias,
+        &scratch.prefill_projected,
+        prompt_len,
+    )?;
+    batch.vector_add_into(input, &scratch.prefill_projected, &scratch.prefill_residual)?;
+    batch.rms_norm_batch_into(
+        &scratch.prefill_residual,
+        &weights.post_attn_norm,
+        &scratch.prefill_router_input,
+        prompt_len,
+        HIDDEN_SIZE,
+    )?;
+    batch.bf16_matrix_matvec_batch_into(
+        &weights.sparse_mlp.router.weight,
+        &scratch.prefill_router_input,
+        &weights.sparse_mlp.router.bias,
+        &scratch.prefill_router_logits,
+        prompt_len,
+    )?;
+
+    for position in 0..prompt_len {
+        batch.read_f32_slot_into(
+            &scratch.prefill_router_logits,
+            position,
+            32,
+            &scratch.router_logits,
+        )?;
+        batch.top4_softmax_into(
+            &scratch.router_logits,
+            &scratch.router_indices,
+            &scratch.router_selected_logits,
+            &scratch.router_weights,
+        )?;
+        batch.read_f32_slot_into(
+            &scratch.prefill_router_input,
+            position,
+            HIDDEN_SIZE,
+            &scratch.router_input,
+        )?;
+        batch.read_f32_slot_into(
+            &scratch.prefill_residual,
+            position,
+            HIDDEN_SIZE,
+            &scratch.residual,
+        )?;
+        batch.mxfp4_top4_gate_swiglu_into(
+            &weights.sparse_mlp.experts.gate_up_blocks,
+            &weights.sparse_mlp.experts.gate_up_scales,
+            &weights.sparse_mlp.experts.gate_up_bias,
+            &scratch.router_input,
+            &scratch.router_indices,
+            &scratch.expert_acts_packed,
+        )?;
+        batch.mxfp4_top4_down_weighted_into(
+            &weights.sparse_mlp.experts.down_blocks,
+            &weights.sparse_mlp.experts.down_scales,
+            &weights.sparse_mlp.experts.down_bias,
+            &scratch.expert_acts_packed,
+            &scratch.router_indices,
+            &scratch.router_weights,
+            &scratch.residual,
+            &scratch.hidden_a,
+        )?;
+        batch.write_f32_slot_into(&scratch.hidden_a, output, position, HIDDEN_SIZE)?;
+    }
+
+    finish_resident_batch(ctx, batch, no_stage_marker());
+    Ok(())
 }
 
 fn resident_lm_head_topk(
@@ -619,4 +897,13 @@ fn finish_resident_batch(
     if let Some((token_position, stage)) = stage {
         ctx.record_token_stage(token_position, stage, gpu_ns);
     }
+}
+
+fn no_stage_marker() -> StageMarker {
+    #[cfg(feature = "metal-stage-profile")]
+    {
+        None
+    }
+    #[cfg(not(feature = "metal-stage-profile"))]
+    {}
 }

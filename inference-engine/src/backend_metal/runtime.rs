@@ -55,17 +55,23 @@ pub(crate) mod platform {
         partial_sum_squares: Retained<MetalComputePipelineState>,
         apply_rms_norm: Retained<MetalComputePipelineState>,
         apply_rms_norm_from_partials: Retained<MetalComputePipelineState>,
+        rms_norm_batch: Retained<MetalComputePipelineState>,
         bf16_matvec: Retained<MetalComputePipelineState>,
+        bf16_matvec_batch: Retained<MetalComputePipelineState>,
         bf16_matvec_logits: Retained<MetalComputePipelineState>,
         top1_logits_blocks: Retained<MetalComputePipelineState>,
         top1_logits_final: Retained<MetalComputePipelineState>,
         topk_logits: Retained<MetalComputePipelineState>,
         embedding_lookup_bf16: Retained<MetalComputePipelineState>,
+        embedding_lookup_bf16_batch: Retained<MetalComputePipelineState>,
         rope_row: Retained<MetalComputePipelineState>,
+        rope_batch: Retained<MetalComputePipelineState>,
         single_token_attention: Retained<MetalComputePipelineState>,
         sequence_attention: Retained<MetalComputePipelineState>,
         kv_cache_decode_attention: Retained<MetalComputePipelineState>,
         write_f32_slot: Retained<MetalComputePipelineState>,
+        write_f32_slots_batch: Retained<MetalComputePipelineState>,
+        read_f32_slot: Retained<MetalComputePipelineState>,
         vector_add: Retained<MetalComputePipelineState>,
         top4_softmax: Retained<MetalComputePipelineState>,
         mxfp4_matvec: Retained<MetalComputePipelineState>,
@@ -133,13 +139,21 @@ pub(crate) mod platform {
                     &library,
                     "apply_rms_norm_from_partials",
                 )?,
+                rms_norm_batch: pipeline(&device, &library, "rms_norm_batch")?,
                 bf16_matvec: pipeline(&device, &library, "bf16_matvec")?,
+                bf16_matvec_batch: pipeline(&device, &library, "bf16_matvec_batch")?,
                 bf16_matvec_logits: pipeline(&device, &library, "bf16_matvec_logits")?,
                 top1_logits_blocks: pipeline(&device, &library, "top1_logits_blocks")?,
                 top1_logits_final: pipeline(&device, &library, "top1_logits_final")?,
                 topk_logits: pipeline(&device, &library, "topk_logits")?,
                 embedding_lookup_bf16: pipeline(&device, &library, "embedding_lookup_bf16")?,
+                embedding_lookup_bf16_batch: pipeline(
+                    &device,
+                    &library,
+                    "embedding_lookup_bf16_batch",
+                )?,
                 rope_row: pipeline(&device, &library, "rope_row")?,
+                rope_batch: pipeline(&device, &library, "rope_batch")?,
                 single_token_attention: pipeline(&device, &library, "single_token_attention")?,
                 sequence_attention: pipeline(&device, &library, "sequence_attention")?,
                 kv_cache_decode_attention: pipeline(
@@ -148,6 +162,8 @@ pub(crate) mod platform {
                     "kv_cache_decode_attention",
                 )?,
                 write_f32_slot: pipeline(&device, &library, "write_f32_slot")?,
+                write_f32_slots_batch: pipeline(&device, &library, "write_f32_slots_batch")?,
+                read_f32_slot: pipeline(&device, &library, "read_f32_slot")?,
                 vector_add: pipeline(&device, &library, "vector_add")?,
                 top4_softmax: pipeline(&device, &library, "top4_softmax")?,
                 mxfp4_matvec: pipeline(&device, &library, "mxfp4_matvec")?,
@@ -208,6 +224,13 @@ pub(crate) mod platform {
                     MTLResourceOptions::StorageModeShared,
                 ),
                 len,
+            })
+        }
+
+        pub fn upload_u32_buffer(&self, values: &[u32]) -> Result<U32Buffer> {
+            Ok(U32Buffer {
+                buffer: buffer_with_data(&self.device, values),
+                len: values.len(),
             })
         }
 
@@ -1153,6 +1176,52 @@ pub(crate) mod platform {
             Ok(())
         }
 
+        pub fn embedding_lookup_bf16_batch_into(
+            &self,
+            weight: &Bf16MatrixBuffer,
+            tokens: &U32Buffer,
+            token_count: usize,
+            out: &F32VectorBuffer,
+        ) -> Result<()> {
+            if token_count == 0 {
+                return Ok(());
+            }
+            if tokens.len < token_count {
+                return Err(eyre!(
+                    "batched embedding has {} token ids, expected at least {token_count}",
+                    tokens.len
+                ));
+            }
+            let expected = token_count
+                .checked_mul(weight.cols)
+                .ok_or_else(|| eyre!("batched embedding output length overflow"))?;
+            if out.len < expected {
+                return Err(eyre!(
+                    "batched embedding output has {} values, expected at least {expected}",
+                    out.len
+                ));
+            }
+
+            let cols = weight.cols as u32;
+            let token_count = token_count as u32;
+            let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
+            let token_count_buffer = buffer_with_data(&self.context.device, &[token_count]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.embedding_lookup_bf16_batch);
+            encoder.set_buffer(0, Some(&weight.buffer), 0);
+            encoder.set_buffer(1, Some(&tokens.buffer), 0);
+            encoder.set_buffer(2, Some(&out.buffer), 0);
+            encoder.set_buffer(3, Some(&cols_buffer), 0);
+            encoder.set_buffer(4, Some(&token_count_buffer), 0);
+            encoder.dispatch_threads(
+                mtl_size(expected as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
         pub fn rms_norm_into(
             &self,
             input: &F32VectorBuffer,
@@ -1207,6 +1276,54 @@ pub(crate) mod platform {
             Ok(())
         }
 
+        pub fn rms_norm_batch_into(
+            &self,
+            input: &F32VectorBuffer,
+            weight: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+            rows: usize,
+            cols: usize,
+        ) -> Result<()> {
+            if rows == 0 {
+                return Ok(());
+            }
+            if weight.len != cols {
+                return Err(eyre!(
+                    "batched RMSNorm weight has {} values, expected {cols}",
+                    weight.len
+                ));
+            }
+            let expected = rows
+                .checked_mul(cols)
+                .ok_or_else(|| eyre!("batched RMSNorm length overflow"))?;
+            if input.len < expected || out.len < expected {
+                return Err(eyre!(
+                    "batched RMSNorm buffer length mismatch: input {}, out {}, expected at least {expected}",
+                    input.len,
+                    out.len
+                ));
+            }
+
+            let rows = rows as u32;
+            let cols = cols as u32;
+            let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
+            let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.rms_norm_batch);
+            encoder.set_buffer(0, Some(&input.buffer), 0);
+            encoder.set_buffer(1, Some(&weight.buffer), 0);
+            encoder.set_buffer(2, Some(&out.buffer), 0);
+            encoder.set_buffer(3, Some(&rows_buffer), 0);
+            encoder.set_buffer(4, Some(&cols_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
         pub fn bf16_matrix_matvec_into(
             &self,
             weight: &Bf16MatrixBuffer,
@@ -1245,6 +1362,62 @@ pub(crate) mod platform {
             encoder.set_buffer(5, Some(&cols_buffer), 0);
             encoder.dispatch_thread_groups(
                 mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn bf16_matrix_matvec_batch_into(
+            &self,
+            weight: &Bf16MatrixBuffer,
+            input: &F32VectorBuffer,
+            bias: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+            batch_rows: usize,
+        ) -> Result<()> {
+            if batch_rows == 0 {
+                return Ok(());
+            }
+            let input_expected = batch_rows
+                .checked_mul(weight.cols)
+                .ok_or_else(|| eyre!("batched BF16 matvec input length overflow"))?;
+            let out_expected = batch_rows
+                .checked_mul(weight.rows)
+                .ok_or_else(|| eyre!("batched BF16 matvec output length overflow"))?;
+            if input.len < input_expected {
+                return Err(eyre!(
+                    "batched BF16 matvec input has {} values, expected at least {input_expected}",
+                    input.len
+                ));
+            }
+            if bias.len != weight.rows || out.len < out_expected {
+                return Err(eyre!(
+                    "batched BF16 matvec shape mismatch: bias {}, out {}, rows {}, expected output at least {out_expected}",
+                    bias.len,
+                    out.len,
+                    weight.rows
+                ));
+            }
+
+            let rows = weight.rows as u32;
+            let cols = weight.cols as u32;
+            let batch_rows = batch_rows as u32;
+            let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
+            let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
+            let batch_rows_buffer = buffer_with_data(&self.context.device, &[batch_rows]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.bf16_matvec_batch);
+            encoder.set_buffer(0, Some(&weight.buffer), 0);
+            encoder.set_buffer(1, Some(&input.buffer), 0);
+            encoder.set_buffer(2, Some(&bias.buffer), 0);
+            encoder.set_buffer(3, Some(&out.buffer), 0);
+            encoder.set_buffer(4, Some(&rows_buffer), 0);
+            encoder.set_buffer(5, Some(&cols_buffer), 0);
+            encoder.set_buffer(6, Some(&batch_rows_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(rows as NSUInteger, batch_rows as NSUInteger, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
@@ -1432,6 +1605,53 @@ pub(crate) mod platform {
             Ok(())
         }
 
+        pub fn rope_batch_into(
+            &self,
+            input: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+            heads: usize,
+            start_position: usize,
+            rows: usize,
+        ) -> Result<()> {
+            if rows == 0 {
+                return Ok(());
+            }
+            let width = heads
+                .checked_mul(64)
+                .ok_or_else(|| eyre!("batched RoPE row width overflow"))?;
+            let expected = rows
+                .checked_mul(width)
+                .ok_or_else(|| eyre!("batched RoPE length overflow"))?;
+            if input.len < expected || out.len < expected {
+                return Err(eyre!(
+                    "batched RoPE length mismatch: input {}, out {}, expected at least {expected}",
+                    input.len,
+                    out.len
+                ));
+            }
+
+            let heads = heads as u32;
+            let start_position = start_position as u32;
+            let rows = rows as u32;
+            let heads_buffer = buffer_with_data(&self.context.device, &[heads]);
+            let start_position_buffer = buffer_with_data(&self.context.device, &[start_position]);
+            let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.rope_batch);
+            encoder.set_buffer(0, Some(&input.buffer), 0);
+            encoder.set_buffer(1, Some(&out.buffer), 0);
+            encoder.set_buffer(2, Some(&heads_buffer), 0);
+            encoder.set_buffer(3, Some(&start_position_buffer), 0);
+            encoder.set_buffer(4, Some(&rows_buffer), 0);
+            encoder.dispatch_threads(
+                mtl_size(expected as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
         pub fn write_f32_slot_into(
             &self,
             input: &F32VectorBuffer,
@@ -1469,6 +1689,165 @@ pub(crate) mod platform {
             encoder.set_buffer(3, Some(&width_buffer), 0);
             encoder.dispatch_threads(
                 mtl_size(width as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn write_f32_slots_batch_into(
+            &self,
+            input: &F32VectorBuffer,
+            output: &F32VectorBuffer,
+            start_slot: usize,
+            slots: usize,
+            width: usize,
+        ) -> Result<()> {
+            if slots == 0 {
+                return Ok(());
+            }
+            let input_expected = slots
+                .checked_mul(width)
+                .ok_or_else(|| eyre!("batched slot write input length overflow"))?;
+            if input.len < input_expected {
+                return Err(eyre!(
+                    "batched slot write input has {} values, expected at least {input_expected}",
+                    input.len
+                ));
+            }
+            let output_expected = start_slot
+                .checked_add(slots)
+                .and_then(|slot_count| slot_count.checked_mul(width))
+                .ok_or_else(|| eyre!("batched slot write output length overflow"))?;
+            if output.len < output_expected {
+                return Err(eyre!(
+                    "batched slot write output has {} values, needs at least {output_expected}",
+                    output.len
+                ));
+            }
+
+            let start_slot = start_slot as u32;
+            let slots = slots as u32;
+            let width = width as u32;
+            let start_slot_buffer = buffer_with_data(&self.context.device, &[start_slot]);
+            let slots_buffer = buffer_with_data(&self.context.device, &[slots]);
+            let width_buffer = buffer_with_data(&self.context.device, &[width]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.write_f32_slots_batch);
+            encoder.set_buffer(0, Some(&input.buffer), 0);
+            encoder.set_buffer(1, Some(&output.buffer), 0);
+            encoder.set_buffer(2, Some(&start_slot_buffer), 0);
+            encoder.set_buffer(3, Some(&slots_buffer), 0);
+            encoder.set_buffer(4, Some(&width_buffer), 0);
+            encoder.dispatch_threads(
+                mtl_size(input_expected as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn read_f32_slot_into(
+            &self,
+            input: &F32VectorBuffer,
+            slot: usize,
+            width: usize,
+            output: &F32VectorBuffer,
+        ) -> Result<()> {
+            if output.len != width {
+                return Err(eyre!(
+                    "slot read output has {} values, expected {width}",
+                    output.len
+                ));
+            }
+            let required = slot
+                .checked_add(1)
+                .and_then(|slots| slots.checked_mul(width))
+                .ok_or_else(|| eyre!("slot read length overflow"))?;
+            if input.len < required {
+                return Err(eyre!(
+                    "slot read input has {} values, needs at least {required}",
+                    input.len
+                ));
+            }
+
+            let slot = slot as u32;
+            let width = width as u32;
+            let slot_buffer = buffer_with_data(&self.context.device, &[slot]);
+            let width_buffer = buffer_with_data(&self.context.device, &[width]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.read_f32_slot);
+            encoder.set_buffer(0, Some(&input.buffer), 0);
+            encoder.set_buffer(1, Some(&output.buffer), 0);
+            encoder.set_buffer(2, Some(&slot_buffer), 0);
+            encoder.set_buffer(3, Some(&width_buffer), 0);
+            encoder.dispatch_threads(
+                mtl_size(width as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn sequence_attention_into(
+            &self,
+            layer: usize,
+            q: &F32VectorBuffer,
+            k: &F32VectorBuffer,
+            v: &F32VectorBuffer,
+            sinks: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+            seq_len: usize,
+        ) -> Result<()> {
+            if seq_len == 0 {
+                return Ok(());
+            }
+            let q_len = seq_len
+                .checked_mul(ATTN_VALUES)
+                .ok_or_else(|| eyre!("resident sequence attention q length overflow"))?;
+            let kv_len = seq_len
+                .checked_mul(KV_VALUES)
+                .ok_or_else(|| eyre!("resident sequence attention kv length overflow"))?;
+            if q.len < q_len || out.len < q_len {
+                return Err(eyre!(
+                    "resident sequence attention q/out length mismatch: q {}, out {}, expected at least {q_len}",
+                    q.len,
+                    out.len
+                ));
+            }
+            if k.len < kv_len || v.len < kv_len {
+                return Err(eyre!(
+                    "resident sequence attention K/V length mismatch: k {}, v {}, expected at least {kv_len}",
+                    k.len,
+                    v.len
+                ));
+            }
+            if sinks.len != Q_HEADS {
+                return Err(eyre!(
+                    "resident sequence attention sinks has {} values, expected {Q_HEADS}",
+                    sinks.len
+                ));
+            }
+
+            let seq_len = seq_len as u32;
+            let layer = layer as u32;
+            let seq_len_buffer = buffer_with_data(&self.context.device, &[seq_len]);
+            let layer_buffer = buffer_with_data(&self.context.device, &[layer]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.sequence_attention);
+            encoder.set_buffer(0, Some(&q.buffer), 0);
+            encoder.set_buffer(1, Some(&k.buffer), 0);
+            encoder.set_buffer(2, Some(&v.buffer), 0);
+            encoder.set_buffer(3, Some(&sinks.buffer), 0);
+            encoder.set_buffer(4, Some(&out.buffer), 0);
+            encoder.set_buffer(5, Some(&seq_len_buffer), 0);
+            encoder.set_buffer(6, Some(&layer_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(Q_HEADS as NSUInteger, seq_len as NSUInteger, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
@@ -1951,6 +2330,10 @@ pub(crate) mod platform {
             Err(eyre!("Metal backend is only available on macOS"))
         }
 
+        pub fn upload_u32_buffer(&self, _values: &[u32]) -> Result<U32Buffer> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
         pub fn read_f32_vector(&self, _buffer: &F32VectorBuffer) -> Vec<f32> {
             Vec::new()
         }
@@ -2101,11 +2484,32 @@ pub(crate) mod platform {
             Err(eyre!("Metal backend is only available on macOS"))
         }
 
+        pub fn embedding_lookup_bf16_batch_into(
+            &self,
+            _weight: &Bf16MatrixBuffer,
+            _tokens: &U32Buffer,
+            _token_count: usize,
+            _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
         pub fn rms_norm_into(
             &self,
             _input: &F32VectorBuffer,
             _weight: &F32VectorBuffer,
             _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn rms_norm_batch_into(
+            &self,
+            _input: &F32VectorBuffer,
+            _weight: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+            _rows: usize,
+            _cols: usize,
         ) -> Result<()> {
             Err(eyre!("Metal backend is only available on macOS"))
         }
@@ -2116,6 +2520,17 @@ pub(crate) mod platform {
             _input: &F32VectorBuffer,
             _bias: &F32VectorBuffer,
             _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn bf16_matrix_matvec_batch_into(
+            &self,
+            _weight: &Bf16MatrixBuffer,
+            _input: &F32VectorBuffer,
+            _bias: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+            _batch_rows: usize,
         ) -> Result<()> {
             Err(eyre!("Metal backend is only available on macOS"))
         }
@@ -2156,12 +2571,58 @@ pub(crate) mod platform {
             Err(eyre!("Metal backend is only available on macOS"))
         }
 
+        pub fn rope_batch_into(
+            &self,
+            _input: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+            _heads: usize,
+            _start_position: usize,
+            _rows: usize,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
         pub fn write_f32_slot_into(
             &self,
             _input: &F32VectorBuffer,
             _output: &F32VectorBuffer,
             _slot: usize,
             _width: usize,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn write_f32_slots_batch_into(
+            &self,
+            _input: &F32VectorBuffer,
+            _output: &F32VectorBuffer,
+            _start_slot: usize,
+            _slots: usize,
+            _width: usize,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn read_f32_slot_into(
+            &self,
+            _input: &F32VectorBuffer,
+            _slot: usize,
+            _width: usize,
+            _output: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn sequence_attention_into(
+            &self,
+            _layer: usize,
+            _q: &F32VectorBuffer,
+            _k: &F32VectorBuffer,
+            _v: &F32VectorBuffer,
+            _sinks: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+            _seq_len: usize,
         ) -> Result<()> {
             Err(eyre!("Metal backend is only available on macOS"))
         }
