@@ -179,6 +179,30 @@ pub fn read_bf16_matrix_row(
     tensor_name: &str,
     row_index: usize,
 ) -> Result<Vec<f32>> {
+    let bytes = read_bf16_matrix_row_bytes(report, tensor_name, row_index)?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|bytes| bf16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])))
+        .collect())
+}
+
+pub fn read_bf16_matrix_row_bits(
+    report: &SourceModelReport,
+    tensor_name: &str,
+    row_index: usize,
+) -> Result<Vec<u16>> {
+    let bytes = read_bf16_matrix_row_bytes(report, tensor_name, row_index)?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect())
+}
+
+fn read_bf16_matrix_row_bytes(
+    report: &SourceModelReport,
+    tensor_name: &str,
+    row_index: usize,
+) -> Result<Vec<u8>> {
     let Some((shard, tensor)) = report.shards.iter().find_map(|shard| {
         shard
             .tensors
@@ -247,10 +271,7 @@ pub fn read_bf16_matrix_row(
         eyre!("could not read row {row_index} from tensor {tensor_name}: {error}")
     })?;
 
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|bytes| bf16_to_f32(u16::from_le_bytes([bytes[0], bytes[1]])))
-        .collect())
+    Ok(bytes)
 }
 
 pub fn read_bf16_vector(report: &SourceModelReport, tensor_name: &str) -> Result<Vec<f32>> {

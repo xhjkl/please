@@ -25,14 +25,18 @@ const ATTN_VALUES: usize = Q_HEADS * HEAD_DIM;
 const KV_VALUES: usize = KV_HEADS * HEAD_DIM;
 const HIDDEN_SIZE: usize = 2880;
 const GATE_UP_VALUES: usize = HIDDEN_SIZE * 2;
+const EXPERTS: usize = 32;
 const MXFP4_GROUPS: usize = HIDDEN_SIZE / 32;
 const MXFP4_BYTES_PER_GROUP: usize = 16;
 const MAX_PREFILL_PROBE_TOKENS: usize = 128;
 const MAX_KV_CACHE_PROBE_TOKENS: usize = 256;
+const LM_HEAD_TOP1_BLOCK_SIZE: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct MetalProfileReport {
     pub records: Vec<MetalProfileRecord>,
+    #[cfg(feature = "metal-stage-profile")]
+    pub stage_profile: Option<MetalStageProfileReport>,
 }
 
 impl MetalProfileReport {
@@ -70,6 +74,7 @@ impl MetalProfileReport {
             if record.wall_ns == 0
                 && record.upload_bytes == 0
                 && record.readback_bytes == 0
+                && record.command_buffers == 0
                 && record.cache_hits == 0
                 && record.cache_misses == 0
             {
@@ -92,6 +97,54 @@ impl MetalProfileReport {
                 record.cache_misses,
                 record.name
             ));
+        }
+        #[cfg(feature = "metal-stage-profile")]
+        if let Some(stage_profile) = &self.stage_profile {
+            out.push_str(&stage_profile.render_for_cli());
+        }
+        out
+    }
+}
+
+#[cfg(feature = "metal-stage-profile")]
+#[derive(Debug, Clone)]
+pub struct MetalStageProfileReport {
+    token_positions: Vec<Option<usize>>,
+    stage_names: Vec<&'static str>,
+    values_ns: Vec<Vec<u128>>,
+}
+
+#[cfg(feature = "metal-stage-profile")]
+impl MetalStageProfileReport {
+    fn render_for_cli(&self) -> String {
+        let mut out = String::new();
+        out.push_str("\nmetal token-stage profile:\n");
+        out.push_str("- source: per-batch Metal command-buffer GPU timestamps\n");
+        out.push_str("- layout: profile[token_ring_slot][stage] = nanoseconds\n\n");
+
+        out.push_str("slot   token      ");
+        for name in &self.stage_names {
+            out.push_str(&format!("{name:>14}"));
+        }
+        out.push('\n');
+        out.push_str("-----  ---------  ");
+        for _ in &self.stage_names {
+            out.push_str("--------------");
+        }
+        out.push('\n');
+
+        for (slot, position) in self.token_positions.iter().enumerate() {
+            let Some(position) = position else {
+                continue;
+            };
+            out.push_str(&format!("{slot:>5}  {position:>9}  "));
+            for stage in 0..self.stage_names.len() {
+                out.push_str(&format!(
+                    "{:>14}",
+                    format_duration_ns(self.values_ns[slot][stage])
+                ));
+            }
+            out.push('\n');
         }
         out
     }
@@ -125,6 +178,92 @@ struct ProfileDelta {
 struct ProfileState {
     enabled: bool,
     records: HashMap<String, MetalProfileRecord>,
+    #[cfg(feature = "metal-stage-profile")]
+    stage_profile: Option<StageProfileState>,
+}
+
+#[cfg(feature = "metal-stage-profile")]
+#[derive(Debug, Clone, Copy)]
+enum TokenStage {
+    Token,
+    LmHead,
+}
+
+#[cfg(feature = "metal-stage-profile")]
+impl TokenStage {
+    const ALL: [Self; 2] = [Self::Token, Self::LmHead];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Token => 0,
+            Self::LmHead => 1,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::LmHead => "lm_head",
+        }
+    }
+}
+
+#[cfg(feature = "metal-stage-profile")]
+#[derive(Debug, Clone)]
+struct StageProfileState {
+    token_positions: Vec<Option<usize>>,
+    values_ns: Vec<Vec<u128>>,
+}
+
+#[cfg(feature = "metal-stage-profile")]
+impl StageProfileState {
+    fn new(ring_capacity: usize) -> Self {
+        Self {
+            token_positions: vec![None; ring_capacity],
+            values_ns: vec![vec![0; TokenStage::ALL.len()]; ring_capacity],
+        }
+    }
+
+    fn record(&mut self, token_position: usize, stage: TokenStage, ns: u128) {
+        if self.token_positions.is_empty() {
+            return;
+        }
+        let slot = token_position % self.token_positions.len();
+        if self.token_positions[slot] != Some(token_position) {
+            self.token_positions[slot] = Some(token_position);
+            self.values_ns[slot].fill(0);
+        }
+        self.values_ns[slot][stage.index()] =
+            self.values_ns[slot][stage.index()].saturating_add(ns);
+    }
+
+    fn report(&self) -> MetalStageProfileReport {
+        MetalStageProfileReport {
+            token_positions: self.token_positions.clone(),
+            stage_names: TokenStage::ALL.iter().map(|stage| stage.name()).collect(),
+            values_ns: self.values_ns.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "metal-stage-profile")]
+type StageMarker = Option<(usize, TokenStage)>;
+
+#[cfg(not(feature = "metal-stage-profile"))]
+type StageMarker = ();
+
+macro_rules! stage_marker {
+    ($position:expr, $stage:ident) => {{
+        #[cfg(feature = "metal-stage-profile")]
+        {
+            Some(($position, TokenStage::$stage))
+        }
+        #[cfg(not(feature = "metal-stage-profile"))]
+        {
+            let _ = $position;
+            ()
+        }
+    }};
 }
 
 fn format_duration_ns(ns: u128) -> String {
@@ -213,6 +352,10 @@ impl MetalOracleContext {
         let mut profile = self.profile.lock().unwrap();
         profile.enabled = true;
         profile.records.clear();
+        #[cfg(feature = "metal-stage-profile")]
+        {
+            profile.stage_profile = None;
+        }
     }
 
     pub fn disable_profile(&self) {
@@ -221,15 +364,18 @@ impl MetalOracleContext {
     }
 
     pub fn profile_report(&self) -> MetalProfileReport {
-        let records = self
-            .profile
-            .lock()
-            .unwrap()
-            .records
-            .values()
-            .cloned()
-            .collect();
-        MetalProfileReport { records }
+        let profile = self.profile.lock().unwrap();
+        let records = profile.records.values().cloned().collect();
+        #[cfg(feature = "metal-stage-profile")]
+        let stage_profile = profile
+            .stage_profile
+            .as_ref()
+            .map(StageProfileState::report);
+        MetalProfileReport {
+            records,
+            #[cfg(feature = "metal-stage-profile")]
+            stage_profile,
+        }
     }
 
     fn profile_op<T>(
@@ -274,6 +420,29 @@ impl MetalOracleContext {
         record.readback_bytes += delta.readback_bytes;
         record.cache_hits += delta.cache_hits;
         record.cache_misses += delta.cache_misses;
+    }
+
+    #[cfg(feature = "metal-stage-profile")]
+    fn reset_stage_profile(&self, ring_capacity: usize) {
+        let mut profile = self.profile.lock().unwrap();
+        if profile.enabled {
+            profile.stage_profile = Some(StageProfileState::new(ring_capacity.max(1)));
+        }
+    }
+
+    #[cfg(feature = "metal-stage-profile")]
+    fn record_token_stage(&self, token_position: usize, stage: TokenStage, ns: u128) {
+        if ns == 0 {
+            return;
+        }
+        let mut profile = self.profile.lock().unwrap();
+        if !profile.enabled {
+            return;
+        }
+        let Some(stage_profile) = &mut profile.stage_profile else {
+            return;
+        };
+        stage_profile.record(token_position, stage, ns);
     }
 
     fn rms_norm_profiled(&self, name: &str, x: &[f32], weight: &[f32]) -> Result<Vec<f32>> {
@@ -712,6 +881,167 @@ impl MetalOracleContext {
         self.platform
             .mxfp4_matvec_resident(blocks, scales, rows, input, bias)
     }
+
+    fn bf16_matrix_buffer(
+        &self,
+        report: &SourceModelReport,
+        tensor_name: &str,
+        op_name: &str,
+    ) -> Result<platform::Bf16MatrixBuffer> {
+        let mut cache = self.gpu_bf16_matrices.lock().unwrap();
+        if !cache.contains_key(tensor_name) {
+            let weight = self.bf16_matrix(report, tensor_name)?;
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    upload_bytes: weight.values.len() * size_of::<u16>(),
+                    cache_misses: 1,
+                    ..ProfileDelta::default()
+                },
+            );
+            let weight =
+                self.platform
+                    .upload_bf16_matrix(&weight.values, weight.rows, weight.cols)?;
+            cache.insert(tensor_name.to_string(), weight);
+        } else {
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    cache_hits: 1,
+                    ..ProfileDelta::default()
+                },
+            );
+        }
+        cache
+            .get(tensor_name)
+            .cloned()
+            .ok_or_else(|| eyre!("cached BF16 matrix is missing for {tensor_name}"))
+    }
+
+    fn bf16_vector_buffer(
+        &self,
+        report: &SourceModelReport,
+        tensor_name: &str,
+        op_name: &str,
+    ) -> Result<platform::F32VectorBuffer> {
+        let mut cache = self.gpu_bf16_vectors.lock().unwrap();
+        if !cache.contains_key(tensor_name) {
+            let weight = self.bf16_vector(report, tensor_name)?;
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    upload_bytes: weight.len() * size_of::<f32>(),
+                    cache_misses: 1,
+                    ..ProfileDelta::default()
+                },
+            );
+            let weight = self.platform.upload_f32_vector(&weight)?;
+            cache.insert(tensor_name.to_string(), weight);
+        } else {
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    cache_hits: 1,
+                    ..ProfileDelta::default()
+                },
+            );
+        }
+        cache
+            .get(tensor_name)
+            .cloned()
+            .ok_or_else(|| eyre!("cached BF16 vector is missing for {tensor_name}"))
+    }
+
+    fn u8_slice_buffer(
+        &self,
+        report: &SourceModelReport,
+        tensor_name: &str,
+        element_offset: usize,
+        element_len: usize,
+        op_name: &str,
+    ) -> Result<platform::U8Buffer> {
+        let key = (tensor_name.to_string(), element_offset, element_len);
+        let mut cache = self.gpu_u8_slices.lock().unwrap();
+        if !cache.contains_key(&key) {
+            let value = self.u8_tensor_slice(report, tensor_name, element_offset, element_len)?;
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    upload_bytes: value.len(),
+                    cache_misses: 1,
+                    ..ProfileDelta::default()
+                },
+            );
+            let value = self.platform.upload_u8_buffer(&value)?;
+            cache.insert(key.clone(), value);
+        } else {
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    cache_hits: 1,
+                    ..ProfileDelta::default()
+                },
+            );
+        }
+        cache
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| eyre!("cached u8 slice is missing for {tensor_name}"))
+    }
+
+    fn mxfp4_layer_expert_slabs(
+        &self,
+        report: &SourceModelReport,
+        expert_prefix: &str,
+    ) -> Result<ResidentLayerExpertSlabs> {
+        let gate_up_blocks = self.u8_slice_buffer(
+            report,
+            &format!("{expert_prefix}.gate_up_proj_blocks"),
+            0,
+            mxfp4_slab_blocks_len(GATE_UP_VALUES)?,
+            "op.mxfp4.gate_up",
+        )?;
+        let gate_up_scales = self.u8_slice_buffer(
+            report,
+            &format!("{expert_prefix}.gate_up_proj_scales"),
+            0,
+            mxfp4_slab_scales_len(GATE_UP_VALUES)?,
+            "op.mxfp4.gate_up",
+        )?;
+        let gate_up_bias = self.bf16_matrix_buffer(
+            report,
+            &format!("{expert_prefix}.gate_up_proj_bias"),
+            "op.mxfp4.gate_up",
+        )?;
+        let down_blocks = self.u8_slice_buffer(
+            report,
+            &format!("{expert_prefix}.down_proj_blocks"),
+            0,
+            mxfp4_slab_blocks_len(HIDDEN_SIZE)?,
+            "op.mxfp4.down",
+        )?;
+        let down_scales = self.u8_slice_buffer(
+            report,
+            &format!("{expert_prefix}.down_proj_scales"),
+            0,
+            mxfp4_slab_scales_len(HIDDEN_SIZE)?,
+            "op.mxfp4.down",
+        )?;
+        let down_bias = self.bf16_matrix_buffer(
+            report,
+            &format!("{expert_prefix}.down_proj_bias"),
+            "op.mxfp4.down",
+        )?;
+
+        Ok(ResidentLayerExpertSlabs {
+            gate_up_blocks,
+            gate_up_scales,
+            gate_up_bias,
+            down_blocks,
+            down_scales,
+            down_bias,
+        })
+    }
 }
 
 fn bf16_linear_profile_name(weight_name: &str) -> String {
@@ -734,6 +1064,128 @@ fn mxfp4_profile_name(bias_name: &str) -> String {
     } else {
         "op.mxfp4.matvec".to_string()
     }
+}
+
+fn mxfp4_slab_blocks_len(rows: usize) -> Result<usize> {
+    EXPERTS
+        .checked_mul(rows)
+        .and_then(|value| value.checked_mul(MXFP4_GROUPS))
+        .and_then(|value| value.checked_mul(MXFP4_BYTES_PER_GROUP))
+        .ok_or_else(|| eyre!("MXFP4 expert slab block length overflow"))
+}
+
+fn mxfp4_slab_scales_len(rows: usize) -> Result<usize> {
+    EXPERTS
+        .checked_mul(rows)
+        .and_then(|value| value.checked_mul(MXFP4_GROUPS))
+        .ok_or_else(|| eyre!("MXFP4 expert slab scale length overflow"))
+}
+
+struct ResidentDecodeScratch {
+    hidden_a: platform::F32VectorBuffer,
+    hidden_b: platform::F32VectorBuffer,
+    normed: platform::F32VectorBuffer,
+    q: platform::F32VectorBuffer,
+    q_rope: platform::F32VectorBuffer,
+    k: platform::F32VectorBuffer,
+    k_rope: platform::F32VectorBuffer,
+    v: platform::F32VectorBuffer,
+    attn: platform::F32VectorBuffer,
+    projected: platform::F32VectorBuffer,
+    residual: platform::F32VectorBuffer,
+    router_input: platform::F32VectorBuffer,
+    router_logits: platform::F32VectorBuffer,
+    router_indices: platform::U32Buffer,
+    router_selected_logits: platform::F32VectorBuffer,
+    router_weights: platform::F32VectorBuffer,
+    expert_acts_packed: platform::F32VectorBuffer,
+    final_hidden: platform::F32VectorBuffer,
+    lm_logits: platform::F32VectorBuffer,
+    lm_top1_block_indices: platform::U32Buffer,
+    lm_top1_block_values: platform::F32VectorBuffer,
+    lm_top_indices: platform::U32Buffer,
+    lm_top_values: platform::F32VectorBuffer,
+}
+
+impl ResidentDecodeScratch {
+    fn new(platform: &platform::MetalContext, vocab: usize) -> Result<Self> {
+        let lm_top1_blocks = vocab.div_ceil(LM_HEAD_TOP1_BLOCK_SIZE);
+        Ok(Self {
+            hidden_a: platform.alloc_f32_vector(HIDDEN_SIZE)?,
+            hidden_b: platform.alloc_f32_vector(HIDDEN_SIZE)?,
+            normed: platform.alloc_f32_vector(HIDDEN_SIZE)?,
+            q: platform.alloc_f32_vector(ATTN_VALUES)?,
+            q_rope: platform.alloc_f32_vector(ATTN_VALUES)?,
+            k: platform.alloc_f32_vector(KV_VALUES)?,
+            k_rope: platform.alloc_f32_vector(KV_VALUES)?,
+            v: platform.alloc_f32_vector(KV_VALUES)?,
+            attn: platform.alloc_f32_vector(ATTN_VALUES)?,
+            projected: platform.alloc_f32_vector(HIDDEN_SIZE)?,
+            residual: platform.alloc_f32_vector(HIDDEN_SIZE)?,
+            router_input: platform.alloc_f32_vector(HIDDEN_SIZE)?,
+            router_logits: platform.alloc_f32_vector(32)?,
+            router_indices: platform.alloc_u32_buffer(4)?,
+            router_selected_logits: platform.alloc_f32_vector(4)?,
+            router_weights: platform.alloc_f32_vector(4)?,
+            expert_acts_packed: platform.alloc_f32_vector(4 * HIDDEN_SIZE)?,
+            final_hidden: platform.alloc_f32_vector(HIDDEN_SIZE)?,
+            lm_logits: platform.alloc_f32_vector(vocab)?,
+            lm_top1_block_indices: platform.alloc_u32_buffer(lm_top1_blocks)?,
+            lm_top1_block_values: platform.alloc_f32_vector(lm_top1_blocks)?,
+            lm_top_indices: platform.alloc_u32_buffer(8)?,
+            lm_top_values: platform.alloc_f32_vector(8)?,
+        })
+    }
+}
+
+struct ResidentGpuKvCache {
+    layers: Vec<ResidentGpuLayerKvCache>,
+    capacity: usize,
+}
+
+struct ResidentGpuLayerKvCache {
+    k: platform::F32VectorBuffer,
+    v: platform::F32VectorBuffer,
+}
+
+impl ResidentGpuKvCache {
+    fn new(platform: &platform::MetalContext, layers: usize, capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(eyre!("resident KV cache needs non-zero capacity"));
+        }
+        if capacity > MAX_KV_CACHE_PROBE_TOKENS {
+            return Err(eyre!(
+                "resident KV cache currently supports at most {MAX_KV_CACHE_PROBE_TOKENS} positions, got {capacity}"
+            ));
+        }
+        let mut layer_caches = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            layer_caches.push(ResidentGpuLayerKvCache {
+                k: platform.alloc_f32_vector(capacity * KV_VALUES)?,
+                v: platform.alloc_f32_vector(capacity * KV_VALUES)?,
+            });
+        }
+        Ok(Self {
+            layers: layer_caches,
+            capacity,
+        })
+    }
+
+    fn layer(&self, layer: usize) -> Result<&ResidentGpuLayerKvCache> {
+        self.layers
+            .get(layer)
+            .ok_or_else(|| eyre!("resident KV cache has no layer {layer}"))
+    }
+}
+
+#[derive(Clone)]
+struct ResidentLayerExpertSlabs {
+    gate_up_blocks: platform::U8Buffer,
+    gate_up_scales: platform::U8Buffer,
+    gate_up_bias: platform::Bf16MatrixBuffer,
+    down_blocks: platform::U8Buffer,
+    down_scales: platform::U8Buffer,
+    down_bias: platform::Bf16MatrixBuffer,
 }
 
 #[derive(Default)]
@@ -818,10 +1270,6 @@ pub struct MetalEngine {
 }
 
 impl MetalEngine {
-    pub fn new_scaffold() -> Result<Self> {
-        Self::load_canonical()
-    }
-
     pub fn load_canonical() -> Result<Self> {
         Self::load_canonical_with_layers(LAYERS)
     }
@@ -888,7 +1336,7 @@ impl MetalEngine {
             return Ok(events);
         }
 
-        let generated = probe_sample_decode(
+        let generated = resident_sample_decode(
             &self.ctx,
             &self.report,
             &self.harmony,
@@ -924,6 +1372,455 @@ fn request_prompt_tokens(request: &EngineRequest) -> Result<Vec<u32>> {
         }
     }
     Err(eyre!("MetalEngine request has no prompt tokens"))
+}
+
+fn resident_sample_decode(
+    ctx: &MetalOracleContext,
+    report: &SourceModelReport,
+    harmony: &HarmonyAdapter,
+    prompt_tokens: &[u32],
+    layers: usize,
+    max_new_tokens: usize,
+    sampling: SamplingConfig,
+) -> Result<GreedyDecodeProbeReport> {
+    ctx.profile_op(
+        "phase.resident_sample_decode",
+        ProfileDelta::default(),
+        || {
+            resident_sample_decode_inner(
+                ctx,
+                report,
+                harmony,
+                prompt_tokens,
+                layers,
+                max_new_tokens,
+                sampling,
+            )
+        },
+    )
+}
+
+fn resident_sample_decode_inner(
+    ctx: &MetalOracleContext,
+    report: &SourceModelReport,
+    harmony: &HarmonyAdapter,
+    prompt_tokens: &[u32],
+    layers: usize,
+    max_new_tokens: usize,
+    sampling: SamplingConfig,
+) -> Result<GreedyDecodeProbeReport> {
+    if prompt_tokens.is_empty() {
+        return Err(eyre!("resident decode needs at least one prompt token"));
+    }
+    if layers > LAYERS {
+        return Err(eyre!(
+            "requested {layers} layers, but gpt-oss-20b has {LAYERS}"
+        ));
+    }
+    if max_new_tokens == 0 {
+        return Err(eyre!("resident decode needs at least one new token"));
+    }
+    if sampling.repetition_penalty != 1.0 {
+        return Err(eyre!(
+            "repetition_penalty is not implemented yet; got {}",
+            sampling.repetition_penalty
+        ));
+    }
+
+    let context_tokens = prompt_tokens
+        .len()
+        .checked_add(max_new_tokens)
+        .ok_or_else(|| eyre!("resident decode context length overflow"))?;
+    if context_tokens > MAX_KV_CACHE_PROBE_TOKENS {
+        return Err(eyre!(
+            "resident decode currently supports at most {MAX_KV_CACHE_PROBE_TOKENS} context tokens, got {context_tokens}"
+        ));
+    }
+    #[cfg(feature = "metal-stage-profile")]
+    ctx.reset_stage_profile(context_tokens);
+
+    let Some(lm_head) = &ctx.lm_head else {
+        return Err(eyre!(
+            "Metal lm_head weight is not cached; construct MetalOracleContext::with_lm_head"
+        ));
+    };
+    let mut scratch = ResidentDecodeScratch::new(&ctx.platform, lm_head.rows())?;
+    let mut kv_cache = ResidentGpuKvCache::new(&ctx.platform, layers, context_tokens)?;
+    let embed = ctx.bf16_matrix_buffer(
+        report,
+        "model.embed_tokens.weight",
+        "op.weight.embed_tokens",
+    )?;
+
+    let mut current_is_a = true;
+    for (position, token) in prompt_tokens.iter().copied().enumerate() {
+        current_is_a = resident_decode_token(
+            ctx,
+            report,
+            &mut scratch,
+            &mut kv_cache,
+            &embed,
+            layers,
+            position,
+            token,
+        )?;
+    }
+
+    let stop_tokens = harmony.stop_tokens()?;
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    let mut stop_reason = StopReason::MaxGeneratedTokens;
+    let mut sampler = Sampler::new(sampling.clone());
+
+    for step in 0..max_new_tokens {
+        let output_position = prompt_tokens.len() + step;
+        let current_hidden = resident_current_hidden(&scratch, current_is_a);
+        let candidates = resident_lm_head_topk(
+            ctx,
+            report,
+            harmony,
+            &mut scratch,
+            &current_hidden,
+            sampler.candidate_count(),
+            output_position,
+        )?;
+        let sample_candidates = candidates
+            .iter()
+            .map(|token| SampleCandidate {
+                token: token.token,
+                logit: token.logit,
+                probability: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let sampled = sampler.choose(&sample_candidates)?;
+        let token_id = sampled.token;
+        let text = candidates
+            .iter()
+            .find(|token| token.token == token_id)
+            .map(|token| token.text.clone())
+            .unwrap_or(decode_token_text(harmony, token_id)?);
+        generated.push(GreedyTokenReport {
+            token: token_id,
+            logit: sampled.logit,
+            text,
+        });
+
+        if stop_tokens.contains(&token_id) {
+            stop_reason = StopReason::EndOfGeneration;
+            break;
+        }
+        if step + 1 == max_new_tokens {
+            break;
+        }
+
+        let position = output_position;
+        current_is_a = resident_decode_token(
+            ctx,
+            report,
+            &mut scratch,
+            &mut kv_cache,
+            &embed,
+            layers,
+            position,
+            token_id,
+        )?;
+    }
+
+    let token_ids = generated
+        .iter()
+        .map(|token| token.token)
+        .collect::<Vec<_>>();
+    let text = decode_tokens_text(harmony, &token_ids)?;
+    Ok(GreedyDecodeProbeReport {
+        name: format!(
+            "resident_sample_decode.layers{layers}.prompt{}.new{}",
+            prompt_tokens.len(),
+            max_new_tokens
+        ),
+        backend: "metal-resident".to_string(),
+        scorer: metal_sampler_description(&sampling),
+        layers,
+        prompt_tokens: prompt_tokens.len(),
+        max_new_tokens,
+        stop_reason,
+        generated,
+        text,
+    })
+}
+
+fn resident_hidden_pair(
+    scratch: &ResidentDecodeScratch,
+    current_is_a: bool,
+) -> (platform::F32VectorBuffer, platform::F32VectorBuffer) {
+    if current_is_a {
+        (scratch.hidden_a.clone(), scratch.hidden_b.clone())
+    } else {
+        (scratch.hidden_b.clone(), scratch.hidden_a.clone())
+    }
+}
+
+fn resident_current_hidden(
+    scratch: &ResidentDecodeScratch,
+    current_is_a: bool,
+) -> platform::F32VectorBuffer {
+    if current_is_a {
+        scratch.hidden_a.clone()
+    } else {
+        scratch.hidden_b.clone()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resident_decode_token(
+    ctx: &MetalOracleContext,
+    report: &SourceModelReport,
+    scratch: &mut ResidentDecodeScratch,
+    kv_cache: &mut ResidentGpuKvCache,
+    embed: &platform::Bf16MatrixBuffer,
+    layers: usize,
+    position: usize,
+    token: u32,
+) -> Result<bool> {
+    let batch = ctx.platform.begin_batch();
+    batch.embedding_lookup_bf16_into(embed, token as usize, &scratch.hidden_a)?;
+    let mut current_is_a = true;
+
+    for layer in 0..layers {
+        let (input, output) = resident_hidden_pair(scratch, current_is_a);
+        resident_decode_layer(
+            ctx, report, &batch, scratch, kv_cache, layer, position, &input, &output,
+        )?;
+        current_is_a = !current_is_a;
+    }
+
+    finish_resident_batch(ctx, batch, stage_marker!(position, Token));
+    Ok(current_is_a)
+}
+
+fn resident_lm_head_topk(
+    ctx: &MetalOracleContext,
+    report: &SourceModelReport,
+    harmony: &HarmonyAdapter,
+    scratch: &mut ResidentDecodeScratch,
+    hidden: &platform::F32VectorBuffer,
+    k: usize,
+    output_position: usize,
+) -> Result<Vec<GreedyTokenReport>> {
+    let Some(lm_head) = &ctx.lm_head else {
+        return Err(eyre!(
+            "Metal lm_head weight is not cached; construct MetalOracleContext::with_lm_head"
+        ));
+    };
+    let norm_weight =
+        ctx.bf16_vector_buffer(report, "model.norm.weight", "op.weight.final_norm")?;
+
+    let batch = ctx.platform.begin_batch();
+    batch.rms_norm_into(hidden, &norm_weight, &scratch.final_hidden)?;
+    if k == 1 {
+        batch.bf16_matrix_top1_into(
+            lm_head,
+            &scratch.final_hidden,
+            &scratch.lm_logits,
+            &scratch.lm_top1_block_indices,
+            &scratch.lm_top1_block_values,
+            &scratch.lm_top_indices,
+            &scratch.lm_top_values,
+        )?;
+    } else {
+        batch.bf16_matrix_topk_into(
+            lm_head,
+            &scratch.final_hidden,
+            &scratch.lm_logits,
+            &scratch.lm_top_indices,
+            &scratch.lm_top_values,
+            k,
+        )?;
+    }
+    finish_resident_batch(ctx, batch, stage_marker!(output_position, LmHead));
+
+    let indices = ctx.platform.read_u32_buffer(&scratch.lm_top_indices);
+    let values = ctx.platform.read_f32_vector(&scratch.lm_top_values);
+    indices
+        .into_iter()
+        .zip(values)
+        .take(k)
+        .map(|(token, logit)| {
+            Ok(GreedyTokenReport {
+                token,
+                logit,
+                text: decode_token_text(harmony, token)?,
+            })
+        })
+        .collect()
+}
+
+fn resident_decode_layer(
+    ctx: &MetalOracleContext,
+    report: &SourceModelReport,
+    batch: &platform::MetalBatch<'_>,
+    scratch: &mut ResidentDecodeScratch,
+    kv_cache: &mut ResidentGpuKvCache,
+    layer: usize,
+    position: usize,
+    input: &platform::F32VectorBuffer,
+    output: &platform::F32VectorBuffer,
+) -> Result<()> {
+    if position >= kv_cache.capacity {
+        return Err(eyre!(
+            "resident decode position {position} exceeds KV capacity {}",
+            kv_cache.capacity
+        ));
+    }
+
+    let prefix = format!("model.layers.{layer}");
+    let input_norm_weight = ctx.bf16_vector_buffer(
+        report,
+        &format!("{prefix}.input_layernorm.weight"),
+        "op.weight.input_layernorm",
+    )?;
+    let q_weight = ctx.bf16_matrix_buffer(
+        report,
+        &format!("{prefix}.self_attn.q_proj.weight"),
+        "op.bf16.q_proj",
+    )?;
+    let q_bias = ctx.bf16_vector_buffer(
+        report,
+        &format!("{prefix}.self_attn.q_proj.bias"),
+        "op.bf16.q_proj",
+    )?;
+    let k_weight = ctx.bf16_matrix_buffer(
+        report,
+        &format!("{prefix}.self_attn.k_proj.weight"),
+        "op.bf16.k_proj",
+    )?;
+    let k_bias = ctx.bf16_vector_buffer(
+        report,
+        &format!("{prefix}.self_attn.k_proj.bias"),
+        "op.bf16.k_proj",
+    )?;
+    let v_weight = ctx.bf16_matrix_buffer(
+        report,
+        &format!("{prefix}.self_attn.v_proj.weight"),
+        "op.bf16.v_proj",
+    )?;
+    let v_bias = ctx.bf16_vector_buffer(
+        report,
+        &format!("{prefix}.self_attn.v_proj.bias"),
+        "op.bf16.v_proj",
+    )?;
+    let sinks = ctx.bf16_vector_buffer(
+        report,
+        &format!("{prefix}.self_attn.sinks"),
+        "op.weight.attention_sinks",
+    )?;
+    let o_weight = ctx.bf16_matrix_buffer(
+        report,
+        &format!("{prefix}.self_attn.o_proj.weight"),
+        "op.bf16.o_proj",
+    )?;
+    let o_bias = ctx.bf16_vector_buffer(
+        report,
+        &format!("{prefix}.self_attn.o_proj.bias"),
+        "op.bf16.o_proj",
+    )?;
+    let post_norm_weight = ctx.bf16_vector_buffer(
+        report,
+        &format!("{prefix}.post_attention_layernorm.weight"),
+        "op.weight.post_attention_layernorm",
+    )?;
+    let router_weight = ctx.bf16_matrix_buffer(
+        report,
+        &format!("{prefix}.mlp.router.weight"),
+        "op.bf16.router",
+    )?;
+    let router_bias = ctx.bf16_vector_buffer(
+        report,
+        &format!("{prefix}.mlp.router.bias"),
+        "op.bf16.router",
+    )?;
+
+    let layer_cache = kv_cache.layer(layer)?;
+    batch.rms_norm_into(input, &input_norm_weight, &scratch.normed)?;
+    batch.bf16_matrix_matvec_into(&q_weight, &scratch.normed, &q_bias, &scratch.q)?;
+    batch.bf16_matrix_matvec_into(&k_weight, &scratch.normed, &k_bias, &scratch.k)?;
+    batch.bf16_matrix_matvec_into(&v_weight, &scratch.normed, &v_bias, &scratch.v)?;
+    batch.rope_row_into(&scratch.q, &scratch.q_rope, Q_HEADS, position)?;
+    batch.rope_row_into(&scratch.k, &scratch.k_rope, KV_HEADS, position)?;
+    batch.write_f32_slot_into(&scratch.k_rope, &layer_cache.k, position, KV_VALUES)?;
+    batch.write_f32_slot_into(&scratch.v, &layer_cache.v, position, KV_VALUES)?;
+    batch.kv_cache_decode_attention_into(
+        layer,
+        position,
+        0,
+        position + 1,
+        &scratch.q_rope,
+        &layer_cache.k,
+        &layer_cache.v,
+        &sinks,
+        &scratch.attn,
+    )?;
+    batch.bf16_matrix_matvec_into(&o_weight, &scratch.attn, &o_bias, &scratch.projected)?;
+    batch.vector_add_into(input, &scratch.projected, &scratch.residual)?;
+    batch.rms_norm_into(&scratch.residual, &post_norm_weight, &scratch.router_input)?;
+    batch.bf16_matrix_matvec_into(
+        &router_weight,
+        &scratch.router_input,
+        &router_bias,
+        &scratch.router_logits,
+    )?;
+    batch.top4_softmax_into(
+        &scratch.router_logits,
+        &scratch.router_indices,
+        &scratch.router_selected_logits,
+        &scratch.router_weights,
+    )?;
+
+    let expert_prefix = format!("{prefix}.mlp.experts");
+    let expert_slabs = ctx.mxfp4_layer_expert_slabs(report, &expert_prefix)?;
+
+    batch.mxfp4_top4_gate_swiglu_into(
+        &expert_slabs.gate_up_blocks,
+        &expert_slabs.gate_up_scales,
+        &expert_slabs.gate_up_bias,
+        &scratch.router_input,
+        &scratch.router_indices,
+        &scratch.expert_acts_packed,
+    )?;
+    batch.mxfp4_top4_down_weighted_into(
+        &expert_slabs.down_blocks,
+        &expert_slabs.down_scales,
+        &expert_slabs.down_bias,
+        &scratch.expert_acts_packed,
+        &scratch.router_indices,
+        &scratch.router_weights,
+        &scratch.residual,
+        output,
+    )?;
+
+    Ok(())
+}
+
+fn finish_resident_batch(
+    ctx: &MetalOracleContext,
+    batch: platform::MetalBatch<'_>,
+    stage: StageMarker,
+) {
+    let gpu_ns = batch.finish();
+    #[cfg(not(feature = "metal-stage-profile"))]
+    {
+        let _ = stage;
+        let _ = gpu_ns;
+    }
+    ctx.record_profile(
+        "phase.resident_sample_decode",
+        ProfileDelta {
+            command_buffers: 1,
+            ..ProfileDelta::default()
+        },
+    );
+    #[cfg(feature = "metal-stage-profile")]
+    if let Some((token_position, stage)) = stage {
+        ctx.record_token_stage(token_position, stage, gpu_ns);
+    }
 }
 
 pub fn probe_rms_norm_embedding(
@@ -2160,7 +3057,8 @@ fn selected_logits_metal(
 ) -> Result<Vec<SelectedLogit>> {
     let mut rows = Vec::with_capacity(logit_tokens.len() * final_hidden.len());
     for token in logit_tokens {
-        let row = model_store::read_bf16_matrix_row(report, "lm_head.weight", *token as usize)?;
+        let row =
+            model_store::read_bf16_matrix_row_bits(report, "lm_head.weight", *token as usize)?;
         if row.len() != final_hidden.len() {
             return Err(eyre!(
                 "lm_head row {} has {} values, but final hidden has {} values",
@@ -2169,7 +3067,7 @@ fn selected_logits_metal(
                 final_hidden.len()
             ));
         }
-        rows.extend(row.into_iter().map(f32_to_bf16_bits));
+        rows.extend(row);
     }
 
     let bias = vec![0.0f32; logit_tokens.len()];
@@ -2310,10 +3208,6 @@ fn lm_head_topk_report(
         cpu,
         metal,
     })
-}
-
-fn f32_to_bf16_bits(value: f32) -> u16 {
-    (value.to_bits() >> 16) as u16
 }
 
 fn layer0_projection_cpu(
@@ -2755,7 +3649,11 @@ fn vector_report(
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{ATTN_VALUES, KV_VALUES, MAX_KV_CACHE_PROBE_TOKENS, MAX_PREFILL_PROBE_TOKENS};
+    use super::{
+        ATTN_VALUES, EXPERTS, GATE_UP_VALUES, HIDDEN_SIZE, KV_VALUES, LM_HEAD_TOP1_BLOCK_SIZE,
+        MAX_KV_CACHE_PROBE_TOKENS, MAX_PREFILL_PROBE_TOKENS, MXFP4_BYTES_PER_GROUP, MXFP4_GROUPS,
+        Q_HEADS,
+    };
     use crate::runtime_core::ExpertScore;
     use eyre::{Result, eyre};
     use objc2::ffi::NSUInteger;
@@ -2787,6 +3685,11 @@ mod platform {
     type MetalLibrary = ProtocolObject<dyn MTLLibrary>;
     type MetalBuffer = ProtocolObject<dyn MTLBuffer>;
 
+    pub struct MetalBatch<'a> {
+        context: &'a MetalContext,
+        command_buffer: Retained<MetalCommandBuffer>,
+    }
+
     pub struct MetalContext {
         device: Retained<MetalDevice>,
         queue: Retained<MetalCommandQueue>,
@@ -2794,20 +3697,28 @@ mod platform {
         gpu_time_ns: Mutex<u128>,
         partial_sum_squares: Retained<MetalComputePipelineState>,
         apply_rms_norm: Retained<MetalComputePipelineState>,
+        apply_rms_norm_from_partials: Retained<MetalComputePipelineState>,
         bf16_matvec: Retained<MetalComputePipelineState>,
         bf16_matvec_logits: Retained<MetalComputePipelineState>,
+        top1_logits_blocks: Retained<MetalComputePipelineState>,
+        top1_logits_final: Retained<MetalComputePipelineState>,
         topk_logits: Retained<MetalComputePipelineState>,
+        embedding_lookup_bf16: Retained<MetalComputePipelineState>,
         rope_row: Retained<MetalComputePipelineState>,
         single_token_attention: Retained<MetalComputePipelineState>,
         sequence_attention: Retained<MetalComputePipelineState>,
         kv_cache_decode_attention: Retained<MetalComputePipelineState>,
+        write_f32_slot: Retained<MetalComputePipelineState>,
         vector_add: Retained<MetalComputePipelineState>,
         top4_softmax: Retained<MetalComputePipelineState>,
         mxfp4_matvec: Retained<MetalComputePipelineState>,
+        mxfp4_top4_gate_swiglu: Retained<MetalComputePipelineState>,
+        mxfp4_top4_down_weighted: Retained<MetalComputePipelineState>,
         swiglu: Retained<MetalComputePipelineState>,
         weighted_sum4: Retained<MetalComputePipelineState>,
     }
 
+    #[derive(Clone)]
     pub struct Bf16MatrixBuffer {
         buffer: Retained<MetalBuffer>,
         rows: usize,
@@ -2818,624 +3729,31 @@ mod platform {
         pub fn rows(&self) -> usize {
             self.rows
         }
+
+        pub fn cols(&self) -> usize {
+            self.cols
+        }
     }
 
+    #[derive(Clone)]
     pub struct F32VectorBuffer {
         buffer: Retained<MetalBuffer>,
         len: usize,
     }
 
+    #[derive(Clone)]
     pub struct U8Buffer {
         buffer: Retained<MetalBuffer>,
         len: usize,
     }
 
-    const KERNEL_SOURCE: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-inline float bf16_to_float(ushort value) {
-    uint bits = ((uint)value) << 16;
-    return as_type<float>(bits);
-}
-
-inline float fp4_to_float(uint value) {
-    uint magnitude = value & 7u;
-    float decoded = 0.0f;
-    switch (magnitude) {
-        case 0u: decoded = 0.0f; break;
-        case 1u: decoded = 0.5f; break;
-        case 2u: decoded = 1.0f; break;
-        case 3u: decoded = 1.5f; break;
-        case 4u: decoded = 2.0f; break;
-        case 5u: decoded = 3.0f; break;
-        case 6u: decoded = 4.0f; break;
-        default: decoded = 6.0f; break;
-    }
-    return (value >= 8u) ? -decoded : decoded;
-}
-
-inline float rope_concentration() {
-    return 0.1f * log(32.0f) + 1.0f;
-}
-
-inline float rope_inv_freq(uint dim) {
-    float d_half = 32.0f;
-    float two_pi = 6.2831853071795864769f;
-    float low = d_half * log(4096.0f / (32.0f * two_pi)) / log(150000.0f);
-    float high = d_half * log(4096.0f / (1.0f * two_pi)) / log(150000.0f);
-    float freq = pow(150000.0f, float(dim * 2u) / 64.0f);
-    float interpolation = 1.0f / (32.0f * freq);
-    float extrapolation = 1.0f / freq;
-    float ramp = (float(dim) - low) / (high - low);
-    float mask = 1.0f - clamp(ramp, 0.0f, 1.0f);
-    return interpolation * (1.0f - mask) + extrapolation * mask;
-}
-
-kernel void partial_sum_squares(
-    device const float* x [[buffer(0)]],
-    device float* partial [[buffer(1)]],
-    constant uint& n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint group_id [[threadgroup_position_in_grid]]
-) {
-    threadgroup float scratch[256];
-    float value = 0.0f;
-    if (gid < n) {
-        value = x[gid] * x[gid];
-    }
-    scratch[tid] = value;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    #[derive(Clone)]
+    pub struct U32Buffer {
+        buffer: Retained<MetalBuffer>,
+        len: usize,
     }
 
-    if (tid == 0) {
-        partial[group_id] = scratch[0];
-    }
-}
-
-kernel void apply_rms_norm(
-    device const float* x [[buffer(0)]],
-    device const float* weight [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant float& scale [[buffer(3)]],
-    constant uint& n [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid < n) {
-        out[gid] = x[gid] * scale * weight[gid];
-    }
-}
-
-kernel void bf16_matvec(
-    device const ushort* weight [[buffer(0)]],
-    device const float* input [[buffer(1)]],
-    device const float* bias [[buffer(2)]],
-    device float* out [[buffer(3)]],
-    constant uint& rows [[buffer(4)]],
-    constant uint& cols [[buffer(5)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint row [[threadgroup_position_in_grid]]
-) {
-    threadgroup float scratch[256];
-    float sum = 0.0f;
-    if (row < rows) {
-        uint row_start = row * cols;
-        for (uint col = tid; col < cols; col += 256) {
-            sum += bf16_to_float(weight[row_start + col]) * input[col];
-        }
-    }
-    scratch[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0 && row < rows) {
-        out[row] = scratch[0] + bias[row];
-    }
-}
-
-kernel void bf16_matvec_logits(
-    device const ushort* weight [[buffer(0)]],
-    device const float* input [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant uint& rows [[buffer(3)]],
-    constant uint& cols [[buffer(4)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint row [[threadgroup_position_in_grid]]
-) {
-    threadgroup float scratch[256];
-    float sum = 0.0f;
-    if (row < rows) {
-        uint row_start = row * cols;
-        for (uint col = tid; col < cols; col += 256u) {
-            sum += bf16_to_float(weight[row_start + col]) * input[col];
-        }
-    }
-    scratch[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0u && row < rows) {
-        out[row] = scratch[0];
-    }
-}
-
-kernel void topk_logits(
-    device const float* logits [[buffer(0)]],
-    device uint* out_indices [[buffer(1)]],
-    device float* out_logits [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    constant uint& k [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid != 0u) {
-        return;
-    }
-
-    float top_values[8];
-    uint top_indices[8];
-    for (uint slot = 0u; slot < 8u; slot++) {
-        top_values[slot] = -3.402823466e+38F;
-        top_indices[slot] = 0xffffffffu;
-    }
-
-    uint capped_k = min(k, 8u);
-    for (uint index = 0u; index < n; index++) {
-        float value = logits[index];
-        for (uint slot = 0u; slot < capped_k; slot++) {
-            bool better = value > top_values[slot] ||
-                (value == top_values[slot] && index < top_indices[slot]);
-            if (better) {
-                for (uint move = capped_k - 1u; move > slot; move--) {
-                    top_values[move] = top_values[move - 1u];
-                    top_indices[move] = top_indices[move - 1u];
-                }
-                top_values[slot] = value;
-                top_indices[slot] = index;
-                break;
-            }
-        }
-    }
-
-    for (uint slot = 0u; slot < capped_k; slot++) {
-        out_indices[slot] = top_indices[slot];
-        out_logits[slot] = top_values[slot];
-    }
-}
-
-kernel void rope_row(
-    device const float* input [[buffer(0)]],
-    device float* out [[buffer(1)]],
-    constant uint& heads [[buffer(2)]],
-    constant uint& position [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint total = heads * 64u;
-    if (gid >= total) {
-        return;
-    }
-
-    uint head_offset = (gid / 64u) * 64u;
-    uint dim = gid % 64u;
-    uint pair_dim = dim % 32u;
-    float theta = float(position) * rope_inv_freq(pair_dim);
-    float c = cos(theta) * rope_concentration();
-    float s = sin(theta) * rope_concentration();
-
-    if (dim < 32u) {
-        float x1 = input[head_offset + dim];
-        float x2 = input[head_offset + dim + 32u];
-        out[gid] = x1 * c - x2 * s;
-    } else {
-        float x1 = input[head_offset + dim - 32u];
-        float x2 = input[head_offset + dim];
-        out[gid] = x2 * c + x1 * s;
-    }
-}
-
-kernel void single_token_attention(
-    device const float* q [[buffer(0)]],
-    device const float* k [[buffer(1)]],
-    device const float* v [[buffer(2)]],
-    device const float* sinks [[buffer(3)]],
-    device float* out [[buffer(4)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint head [[threadgroup_position_in_grid]]
-) {
-    threadgroup float scratch[256];
-    uint kv_head = head / 8u;
-    uint q_start = head * 64u;
-    uint kv_start = kv_head * 64u;
-
-    float sum = 0.0f;
-    for (uint dim = tid; dim < 64u; dim += 256u) {
-        sum += q[q_start + dim] * k[kv_start + dim];
-    }
-    scratch[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0) {
-        float score = scratch[0] * 0.125f;
-        float sink = sinks[head];
-        float max_value = max(score, sink);
-        float exp_score = exp(score - max_value);
-        float exp_sink = exp(sink - max_value);
-        float data_weight = exp_score / (exp_score + exp_sink);
-        for (uint dim = 0; dim < 64u; dim++) {
-            out[q_start + dim] = data_weight * v[kv_start + dim];
-        }
-    }
-}
-
-kernel void sequence_attention(
-    device const float* q [[buffer(0)]],
-    device const float* k [[buffer(1)]],
-    device const float* v [[buffer(2)]],
-    device const float* sinks [[buffer(3)]],
-    device float* out [[buffer(4)]],
-    constant uint& seq_len [[buffer(5)]],
-    constant uint& layer [[buffer(6)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint3 group [[threadgroup_position_in_grid]]
-) {
-    threadgroup float scratch[256];
-    threadgroup float scores[256];
-    threadgroup float norm[2];
-
-    uint head = group.x;
-    uint query_position = group.y;
-    if (head >= 64u || query_position >= seq_len) {
-        return;
-    }
-
-    uint key_start = 0u;
-    if ((layer & 1u) == 0u && query_position + 1u > 128u) {
-        key_start = query_position + 1u - 128u;
-    }
-    uint key_count = query_position + 1u - key_start;
-    uint kv_head = head / 8u;
-    uint q_start = query_position * 4096u + head * 64u;
-    uint kv_start = kv_head * 64u;
-
-    for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-        uint key_position = key_start + key_offset;
-        uint k_start = key_position * 512u + kv_start;
-
-        float sum = 0.0f;
-        for (uint dim = tid; dim < 64u; dim += 256u) {
-            sum += q[q_start + dim] * k[k_start + dim];
-        }
-        scratch[tid] = sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-            if (tid < stride) {
-                scratch[tid] += scratch[tid + stride];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        if (tid == 0u) {
-            scores[key_offset] = scratch[0] * 0.125f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0u) {
-        float max_value = sinks[head];
-        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-            max_value = max(max_value, scores[key_offset]);
-        }
-
-        float denom = exp(sinks[head] - max_value);
-        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-            denom += exp(scores[key_offset] - max_value);
-        }
-        norm[0] = max_value;
-        norm[1] = denom;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint dim = tid; dim < 64u; dim += 256u) {
-        float value = 0.0f;
-        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-            uint key_position = key_start + key_offset;
-            uint v_start = key_position * 512u + kv_start;
-            float weight = exp(scores[key_offset] - norm[0]) / norm[1];
-            value += weight * v[v_start + dim];
-        }
-        out[q_start + dim] = value;
-    }
-}
-
-kernel void kv_cache_decode_attention(
-    device const float* q [[buffer(0)]],
-    device const float* k_cache [[buffer(1)]],
-    device const float* v_cache [[buffer(2)]],
-    device const float* sinks [[buffer(3)]],
-    device float* out [[buffer(4)]],
-    constant uint& layer [[buffer(5)]],
-    constant uint& query_position [[buffer(6)]],
-    constant uint& cache_start_position [[buffer(7)]],
-    constant uint& cache_len [[buffer(8)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint head [[threadgroup_position_in_grid]]
-) {
-    threadgroup float scratch[256];
-    threadgroup float scores[128];
-    threadgroup float norm[2];
-
-    if (head >= 64u) {
-        return;
-    }
-
-    uint effective_key_start = cache_start_position;
-    if ((layer & 1u) == 0u && query_position + 1u > 128u) {
-        effective_key_start = max(effective_key_start, query_position + 1u - 128u);
-    }
-    uint key_count = query_position + 1u - effective_key_start;
-    if (key_count > cache_len) {
-        return;
-    }
-
-    uint kv_head = head / 8u;
-    uint q_start = head * 64u;
-    uint kv_start = kv_head * 64u;
-
-    if (key_count > 128u) {
-        if (tid != 0u) {
-            return;
-        }
-
-        float long_scores[256];
-        float max_value = sinks[head];
-        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-            uint key_position = effective_key_start + key_offset;
-            uint cache_offset = key_position - cache_start_position;
-            uint k_start = cache_offset * 512u + kv_start;
-            float sum = 0.0f;
-            for (uint dim = 0u; dim < 64u; dim++) {
-                sum += q[q_start + dim] * k_cache[k_start + dim];
-            }
-            float score = sum * 0.125f;
-            long_scores[key_offset] = score;
-            max_value = max(max_value, score);
-        }
-
-        float denom = exp(sinks[head] - max_value);
-        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-            denom += exp(long_scores[key_offset] - max_value);
-        }
-
-        for (uint dim = 0u; dim < 64u; dim++) {
-            float value = 0.0f;
-            for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-                uint key_position = effective_key_start + key_offset;
-                uint cache_offset = key_position - cache_start_position;
-                uint v_start = cache_offset * 512u + kv_start;
-                float weight = exp(long_scores[key_offset] - max_value) / denom;
-                value += weight * v_cache[v_start + dim];
-            }
-            out[q_start + dim] = value;
-        }
-        return;
-    }
-
-    for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-        uint key_position = effective_key_start + key_offset;
-        uint cache_offset = key_position - cache_start_position;
-        uint k_start = cache_offset * 512u + kv_start;
-
-        float sum = 0.0f;
-        for (uint dim = tid; dim < 64u; dim += 256u) {
-            sum += q[q_start + dim] * k_cache[k_start + dim];
-        }
-        scratch[tid] = sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-            if (tid < stride) {
-                scratch[tid] += scratch[tid + stride];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        if (tid == 0u) {
-            scores[key_offset] = scratch[0] * 0.125f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0u) {
-        float max_value = sinks[head];
-        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-            max_value = max(max_value, scores[key_offset]);
-        }
-
-        float denom = exp(sinks[head] - max_value);
-        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-            denom += exp(scores[key_offset] - max_value);
-        }
-        norm[0] = max_value;
-        norm[1] = denom;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint dim = tid; dim < 64u; dim += 256u) {
-        float value = 0.0f;
-        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-            uint key_position = effective_key_start + key_offset;
-            uint cache_offset = key_position - cache_start_position;
-            uint v_start = cache_offset * 512u + kv_start;
-            float weight = exp(scores[key_offset] - norm[0]) / norm[1];
-            value += weight * v_cache[v_start + dim];
-        }
-        out[q_start + dim] = value;
-    }
-}
-
-kernel void vector_add(
-    device const float* left [[buffer(0)]],
-    device const float* right [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid < n) {
-        out[gid] = left[gid] + right[gid];
-    }
-}
-
-kernel void top4_softmax(
-    device const float* logits [[buffer(0)]],
-    device uint* out_indices [[buffer(1)]],
-    device float* out_logits [[buffer(2)]],
-    device float* out_weights [[buffer(3)]],
-    constant uint& n [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid != 0u) {
-        return;
-    }
-
-    float best_logits[4] = {
-        -INFINITY,
-        -INFINITY,
-        -INFINITY,
-        -INFINITY,
-    };
-    uint best_indices[4] = { 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu };
-
-    for (uint i = 0; i < n; i++) {
-        float value = logits[i];
-        for (uint rank = 0; rank < 4u; rank++) {
-            bool better = value > best_logits[rank]
-                || (value == best_logits[rank] && i < best_indices[rank]);
-            if (!better) {
-                continue;
-            }
-            for (uint move = 3u; move > rank; move--) {
-                best_logits[move] = best_logits[move - 1u];
-                best_indices[move] = best_indices[move - 1u];
-            }
-            best_logits[rank] = value;
-            best_indices[rank] = i;
-            break;
-        }
-    }
-
-    float max_value = best_logits[0];
-    float denom = 0.0f;
-    for (uint rank = 0; rank < 4u; rank++) {
-        denom += exp(best_logits[rank] - max_value);
-    }
-
-    for (uint rank = 0; rank < 4u; rank++) {
-        out_indices[rank] = best_indices[rank];
-        out_logits[rank] = best_logits[rank];
-        out_weights[rank] = exp(best_logits[rank] - max_value) / denom;
-    }
-}
-
-kernel void mxfp4_matvec(
-    device const uchar* blocks [[buffer(0)]],
-    device const uchar* scales [[buffer(1)]],
-    device const float* input [[buffer(2)]],
-    device const float* bias [[buffer(3)]],
-    device float* out [[buffer(4)]],
-    constant uint& rows [[buffer(5)]],
-    constant uint& groups [[buffer(6)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint row [[threadgroup_position_in_grid]]
-) {
-    threadgroup float scratch[256];
-    float sum = 0.0f;
-    uint values_per_row = groups * 16u;
-
-    if (row < rows) {
-        uint row_scale_start = row * groups;
-        uint row_block_start = row * values_per_row;
-        for (uint packed_index = tid; packed_index < values_per_row; packed_index += 256u) {
-            uint group = packed_index / 16u;
-            uint byte_in_group = packed_index - group * 16u;
-            uchar packed = blocks[row_block_start + packed_index];
-            float scale = exp2(float(scales[row_scale_start + group]) - 127.0f);
-            uint input_start = group * 32u + byte_in_group * 2u;
-            sum += fp4_to_float(uint(packed & 0x0fu)) * scale * input[input_start];
-            sum += fp4_to_float(uint(packed >> 4)) * scale * input[input_start + 1u];
-        }
-    }
-
-    scratch[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (tid == 0 && row < rows) {
-        out[row] = scratch[0] + bias[row];
-    }
-}
-
-kernel void swiglu(
-    device const float* input [[buffer(0)]],
-    device float* out [[buffer(1)]],
-    constant uint& n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid < n) {
-        float x_glu = min(input[gid * 2u], 7.0f);
-        float x_linear = clamp(input[gid * 2u + 1u], -7.0f, 7.0f);
-        float out_glu = x_glu / (1.0f + exp(-1.702f * x_glu));
-        out[gid] = out_glu * (x_linear + 1.0f);
-    }
-}
-
-kernel void weighted_sum4(
-    device const float* vectors [[buffer(0)]],
-    device const float* weights [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid < n) {
-        out[gid] =
-            vectors[gid] * weights[0] +
-            vectors[n + gid] * weights[1] +
-            vectors[n * 2u + gid] * weights[2] +
-            vectors[n * 3u + gid] * weights[3];
-    }
-}
-"#;
+    const KERNEL_SOURCE: &str = include_str!("kernels.metal");
 
     impl MetalContext {
         pub fn new() -> Result<Self> {
@@ -3453,9 +3771,17 @@ kernel void weighted_sum4(
                 gpu_time_ns: Mutex::new(0),
                 partial_sum_squares: pipeline(&device, &library, "partial_sum_squares")?,
                 apply_rms_norm: pipeline(&device, &library, "apply_rms_norm")?,
+                apply_rms_norm_from_partials: pipeline(
+                    &device,
+                    &library,
+                    "apply_rms_norm_from_partials",
+                )?,
                 bf16_matvec: pipeline(&device, &library, "bf16_matvec")?,
                 bf16_matvec_logits: pipeline(&device, &library, "bf16_matvec_logits")?,
+                top1_logits_blocks: pipeline(&device, &library, "top1_logits_blocks")?,
+                top1_logits_final: pipeline(&device, &library, "top1_logits_final")?,
                 topk_logits: pipeline(&device, &library, "topk_logits")?,
+                embedding_lookup_bf16: pipeline(&device, &library, "embedding_lookup_bf16")?,
                 rope_row: pipeline(&device, &library, "rope_row")?,
                 single_token_attention: pipeline(&device, &library, "single_token_attention")?,
                 sequence_attention: pipeline(&device, &library, "sequence_attention")?,
@@ -3464,9 +3790,12 @@ kernel void weighted_sum4(
                     &library,
                     "kv_cache_decode_attention",
                 )?,
+                write_f32_slot: pipeline(&device, &library, "write_f32_slot")?,
                 vector_add: pipeline(&device, &library, "vector_add")?,
                 top4_softmax: pipeline(&device, &library, "top4_softmax")?,
                 mxfp4_matvec: pipeline(&device, &library, "mxfp4_matvec")?,
+                mxfp4_top4_gate_swiglu: pipeline(&device, &library, "mxfp4_top4_gate_swiglu")?,
+                mxfp4_top4_down_weighted: pipeline(&device, &library, "mxfp4_top4_down_weighted")?,
                 swiglu: pipeline(&device, &library, "swiglu")?,
                 weighted_sum4: pipeline(&device, &library, "weighted_sum4")?,
                 device,
@@ -3485,16 +3814,52 @@ kernel void weighted_sum4(
             self.profile_enabled.store(enabled, Ordering::Relaxed);
         }
 
-        fn finish_command_buffer(&self, command_buffer: &MetalCommandBuffer) {
+        fn finish_command_buffer(&self, command_buffer: &MetalCommandBuffer) -> u128 {
             command_buffer.commit();
             command_buffer.wait_until_completed();
             if !self.profile_enabled.load(Ordering::Relaxed) {
-                return;
+                return 0;
             }
             let gpu_time_ns = command_buffer_gpu_time_ns(command_buffer);
             if gpu_time_ns > 0 {
                 *self.gpu_time_ns.lock().unwrap() += gpu_time_ns;
             }
+            gpu_time_ns
+        }
+
+        pub fn begin_batch(&self) -> MetalBatch<'_> {
+            MetalBatch {
+                context: self,
+                command_buffer: self.queue.new_command_buffer(),
+            }
+        }
+
+        pub fn alloc_f32_vector(&self, len: usize) -> Result<F32VectorBuffer> {
+            Ok(F32VectorBuffer {
+                buffer: self.device.new_buffer(
+                    (len * std::mem::size_of::<f32>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+                len,
+            })
+        }
+
+        pub fn alloc_u32_buffer(&self, len: usize) -> Result<U32Buffer> {
+            Ok(U32Buffer {
+                buffer: self.device.new_buffer(
+                    (len * std::mem::size_of::<u32>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+                len,
+            })
+        }
+
+        pub fn read_f32_vector(&self, buffer: &F32VectorBuffer) -> Vec<f32> {
+            read_buffer::<f32>(&buffer.buffer, buffer.len)
+        }
+
+        pub fn read_u32_buffer(&self, buffer: &U32Buffer) -> Vec<u32> {
+            read_buffer::<u32>(&buffer.buffer, buffer.len)
         }
 
         pub fn rms_norm(&self, x: &[f32], weight: &[f32]) -> Result<Vec<f32>> {
@@ -3630,7 +3995,7 @@ kernel void weighted_sum4(
             bias: &F32VectorBuffer,
         ) -> Result<Vec<f32>> {
             let rows = weight.rows;
-            let cols = weight.cols;
+            let cols = weight.cols();
             if input.len() != cols {
                 return Err(eyre!(
                     "BF16 resident matvec input has {} values, expected {cols}",
@@ -4387,6 +4752,638 @@ kernel void weighted_sum4(
         }
     }
 
+    impl<'a> MetalBatch<'a> {
+        pub fn finish(self) -> u128 {
+            self.context.finish_command_buffer(&self.command_buffer)
+        }
+
+        pub fn embedding_lookup_bf16_into(
+            &self,
+            weight: &Bf16MatrixBuffer,
+            token: usize,
+            out: &F32VectorBuffer,
+        ) -> Result<()> {
+            if token >= weight.rows {
+                return Err(eyre!(
+                    "embedding token {token} exceeds embedding rows {}",
+                    weight.rows
+                ));
+            }
+            if out.len != weight.cols {
+                return Err(eyre!(
+                    "embedding output has {} values, expected {}",
+                    out.len,
+                    weight.cols
+                ));
+            }
+
+            let token = token as u32;
+            let cols = weight.cols as u32;
+            let token_buffer = buffer_with_data(&self.context.device, &[token]);
+            let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.embedding_lookup_bf16);
+            encoder.set_buffer(0, Some(&weight.buffer), 0);
+            encoder.set_buffer(1, Some(&out.buffer), 0);
+            encoder.set_buffer(2, Some(&token_buffer), 0);
+            encoder.set_buffer(3, Some(&cols_buffer), 0);
+            encoder.dispatch_threads(
+                mtl_size(weight.cols as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn rms_norm_into(
+            &self,
+            input: &F32VectorBuffer,
+            weight: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+        ) -> Result<()> {
+            if input.len != weight.len || input.len != out.len {
+                return Err(eyre!(
+                    "RMSNorm buffer length mismatch: input {}, weight {}, out {}",
+                    input.len,
+                    weight.len,
+                    out.len
+                ));
+            }
+            if input.len == 0 {
+                return Ok(());
+            }
+
+            let n = input.len as u32;
+            let groups = (input.len as u64).div_ceil(THREADS_PER_GROUP);
+            let partial_buffer = self.context.device.new_buffer(
+                groups * std::mem::size_of::<f32>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let n_buffer = buffer_with_data(&self.context.device, &[n]);
+            let groups_buffer = buffer_with_data(&self.context.device, &[groups as u32]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.partial_sum_squares);
+            encoder.set_buffer(0, Some(&input.buffer), 0);
+            encoder.set_buffer(1, Some(&partial_buffer), 0);
+            encoder.set_buffer(2, Some(&n_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(groups as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.apply_rms_norm_from_partials);
+            encoder.set_buffer(0, Some(&input.buffer), 0);
+            encoder.set_buffer(1, Some(&weight.buffer), 0);
+            encoder.set_buffer(2, Some(&partial_buffer), 0);
+            encoder.set_buffer(3, Some(&out.buffer), 0);
+            encoder.set_buffer(4, Some(&n_buffer), 0);
+            encoder.set_buffer(5, Some(&groups_buffer), 0);
+            encoder.dispatch_threads(
+                mtl_size(input.len as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn bf16_matrix_matvec_into(
+            &self,
+            weight: &Bf16MatrixBuffer,
+            input: &F32VectorBuffer,
+            bias: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+        ) -> Result<()> {
+            if input.len != weight.cols {
+                return Err(eyre!(
+                    "BF16 resident matvec input has {} values, expected {}",
+                    input.len,
+                    weight.cols
+                ));
+            }
+            if bias.len != weight.rows || out.len != weight.rows {
+                return Err(eyre!(
+                    "BF16 resident matvec row mismatch: bias {}, out {}, rows {}",
+                    bias.len,
+                    out.len,
+                    weight.rows
+                ));
+            }
+
+            let rows = weight.rows as u32;
+            let cols = weight.cols as u32;
+            let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
+            let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.bf16_matvec);
+            encoder.set_buffer(0, Some(&weight.buffer), 0);
+            encoder.set_buffer(1, Some(&input.buffer), 0);
+            encoder.set_buffer(2, Some(&bias.buffer), 0);
+            encoder.set_buffer(3, Some(&out.buffer), 0);
+            encoder.set_buffer(4, Some(&rows_buffer), 0);
+            encoder.set_buffer(5, Some(&cols_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn bf16_matrix_topk_into(
+            &self,
+            weight: &Bf16MatrixBuffer,
+            input: &F32VectorBuffer,
+            logits: &F32VectorBuffer,
+            indices: &U32Buffer,
+            values: &F32VectorBuffer,
+            k: usize,
+        ) -> Result<()> {
+            if input.len != weight.cols {
+                return Err(eyre!(
+                    "BF16 top-k input has {} values, expected {}",
+                    input.len,
+                    weight.cols
+                ));
+            }
+            if logits.len != weight.rows {
+                return Err(eyre!(
+                    "BF16 top-k logits scratch has {} values, expected {}",
+                    logits.len,
+                    weight.rows
+                ));
+            }
+            if k == 0 || k > 8 || indices.len < k || values.len < k {
+                return Err(eyre!(
+                    "BF16 top-k needs k in 1..=8 with output room, got {k}"
+                ));
+            }
+
+            let rows = weight.rows as u32;
+            let cols = weight.cols as u32;
+            let k = k as u32;
+            let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
+            let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
+            let k_buffer = buffer_with_data(&self.context.device, &[k]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.bf16_matvec_logits);
+            encoder.set_buffer(0, Some(&weight.buffer), 0);
+            encoder.set_buffer(1, Some(&input.buffer), 0);
+            encoder.set_buffer(2, Some(&logits.buffer), 0);
+            encoder.set_buffer(3, Some(&rows_buffer), 0);
+            encoder.set_buffer(4, Some(&cols_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.topk_logits);
+            encoder.set_buffer(0, Some(&logits.buffer), 0);
+            encoder.set_buffer(1, Some(&indices.buffer), 0);
+            encoder.set_buffer(2, Some(&values.buffer), 0);
+            encoder.set_buffer(3, Some(&rows_buffer), 0);
+            encoder.set_buffer(4, Some(&k_buffer), 0);
+            encoder.dispatch_threads(mtl_size(1, 1, 1), mtl_size(1, 1, 1));
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn bf16_matrix_top1_into(
+            &self,
+            weight: &Bf16MatrixBuffer,
+            input: &F32VectorBuffer,
+            logits: &F32VectorBuffer,
+            block_indices: &U32Buffer,
+            block_values: &F32VectorBuffer,
+            out_index: &U32Buffer,
+            out_value: &F32VectorBuffer,
+        ) -> Result<()> {
+            if input.len != weight.cols {
+                return Err(eyre!(
+                    "BF16 top-1 input has {} values, expected {}",
+                    input.len,
+                    weight.cols
+                ));
+            }
+            if logits.len != weight.rows {
+                return Err(eyre!(
+                    "BF16 top-1 logits scratch has {} values, expected {}",
+                    logits.len,
+                    weight.rows
+                ));
+            }
+            let blocks = weight.rows.div_ceil(LM_HEAD_TOP1_BLOCK_SIZE);
+            if block_indices.len < blocks || block_values.len < blocks {
+                return Err(eyre!(
+                    "BF16 top-1 block scratch has indices {}/values {}, expected at least {blocks}",
+                    block_indices.len,
+                    block_values.len
+                ));
+            }
+            if out_index.len < 1 || out_value.len < 1 {
+                return Err(eyre!("BF16 top-1 output buffers need one slot"));
+            }
+
+            let rows = weight.rows as u32;
+            let cols = weight.cols as u32;
+            let blocks = blocks as u32;
+            let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
+            let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
+            let blocks_buffer = buffer_with_data(&self.context.device, &[blocks]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.bf16_matvec_logits);
+            encoder.set_buffer(0, Some(&weight.buffer), 0);
+            encoder.set_buffer(1, Some(&input.buffer), 0);
+            encoder.set_buffer(2, Some(&logits.buffer), 0);
+            encoder.set_buffer(3, Some(&rows_buffer), 0);
+            encoder.set_buffer(4, Some(&cols_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.top1_logits_blocks);
+            encoder.set_buffer(0, Some(&logits.buffer), 0);
+            encoder.set_buffer(1, Some(&block_indices.buffer), 0);
+            encoder.set_buffer(2, Some(&block_values.buffer), 0);
+            encoder.set_buffer(3, Some(&rows_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(blocks as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.top1_logits_final);
+            encoder.set_buffer(0, Some(&block_indices.buffer), 0);
+            encoder.set_buffer(1, Some(&block_values.buffer), 0);
+            encoder.set_buffer(2, Some(&out_index.buffer), 0);
+            encoder.set_buffer(3, Some(&out_value.buffer), 0);
+            encoder.set_buffer(4, Some(&blocks_buffer), 0);
+            encoder.dispatch_threads(
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn rope_row_into(
+            &self,
+            input: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+            heads: usize,
+            position: usize,
+        ) -> Result<()> {
+            let expected = heads
+                .checked_mul(64)
+                .ok_or_else(|| eyre!("RoPE row expected length overflow"))?;
+            if input.len != expected || out.len != expected {
+                return Err(eyre!(
+                    "RoPE length mismatch: input {}, out {}, expected {expected}",
+                    input.len,
+                    out.len
+                ));
+            }
+
+            let heads = heads as u32;
+            let position = position as u32;
+            let heads_buffer = buffer_with_data(&self.context.device, &[heads]);
+            let position_buffer = buffer_with_data(&self.context.device, &[position]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.rope_row);
+            encoder.set_buffer(0, Some(&input.buffer), 0);
+            encoder.set_buffer(1, Some(&out.buffer), 0);
+            encoder.set_buffer(2, Some(&heads_buffer), 0);
+            encoder.set_buffer(3, Some(&position_buffer), 0);
+            encoder.dispatch_threads(
+                mtl_size(expected as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn write_f32_slot_into(
+            &self,
+            input: &F32VectorBuffer,
+            output: &F32VectorBuffer,
+            slot: usize,
+            width: usize,
+        ) -> Result<()> {
+            if input.len != width {
+                return Err(eyre!(
+                    "slot write input has {} values, expected {width}",
+                    input.len
+                ));
+            }
+            let required = slot
+                .checked_add(1)
+                .and_then(|slots| slots.checked_mul(width))
+                .ok_or_else(|| eyre!("slot write length overflow"))?;
+            if output.len < required {
+                return Err(eyre!(
+                    "slot write output has {} values, needs at least {required}",
+                    output.len
+                ));
+            }
+
+            let slot = slot as u32;
+            let width = width as u32;
+            let slot_buffer = buffer_with_data(&self.context.device, &[slot]);
+            let width_buffer = buffer_with_data(&self.context.device, &[width]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.write_f32_slot);
+            encoder.set_buffer(0, Some(&input.buffer), 0);
+            encoder.set_buffer(1, Some(&output.buffer), 0);
+            encoder.set_buffer(2, Some(&slot_buffer), 0);
+            encoder.set_buffer(3, Some(&width_buffer), 0);
+            encoder.dispatch_threads(
+                mtl_size(width as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn kv_cache_decode_attention_into(
+            &self,
+            layer: usize,
+            query_position: usize,
+            cache_start_position: usize,
+            cache_len: usize,
+            q: &F32VectorBuffer,
+            k_cache: &F32VectorBuffer,
+            v_cache: &F32VectorBuffer,
+            sinks: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+        ) -> Result<()> {
+            if q.len != ATTN_VALUES || out.len != ATTN_VALUES {
+                return Err(eyre!(
+                    "KV-cache decode q/out length mismatch: q {}, out {}, expected {ATTN_VALUES}",
+                    q.len,
+                    out.len
+                ));
+            }
+            if k_cache.len != v_cache.len || k_cache.len < cache_len * KV_VALUES {
+                return Err(eyre!(
+                    "KV-cache resident K/V length mismatch: k {}, v {}, cache_len {cache_len}",
+                    k_cache.len,
+                    v_cache.len
+                ));
+            }
+            if sinks.len != Q_HEADS {
+                return Err(eyre!(
+                    "KV-cache decode sinks has {} values, expected {Q_HEADS}",
+                    sinks.len
+                ));
+            }
+            if cache_start_position > query_position {
+                return Err(eyre!(
+                    "KV-cache start position {cache_start_position} exceeds query position {query_position}"
+                ));
+            }
+            let effective_key_start =
+                if layer % 2 == 0 && query_position + 1 > MAX_PREFILL_PROBE_TOKENS {
+                    cache_start_position.max(query_position + 1 - MAX_PREFILL_PROBE_TOKENS)
+                } else {
+                    cache_start_position
+                };
+            let key_count = query_position + 1 - effective_key_start;
+            if key_count > MAX_KV_CACHE_PROBE_TOKENS {
+                return Err(eyre!(
+                    "resident KV decode currently supports at most {MAX_KV_CACHE_PROBE_TOKENS} keys, got {key_count}"
+                ));
+            }
+
+            let layer = layer as u32;
+            let query_position = query_position as u32;
+            let cache_start_position = cache_start_position as u32;
+            let cache_len = cache_len as u32;
+            let layer_buffer = buffer_with_data(&self.context.device, &[layer]);
+            let query_position_buffer = buffer_with_data(&self.context.device, &[query_position]);
+            let cache_start_position_buffer =
+                buffer_with_data(&self.context.device, &[cache_start_position]);
+            let cache_len_buffer = buffer_with_data(&self.context.device, &[cache_len]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.kv_cache_decode_attention);
+            encoder.set_buffer(0, Some(&q.buffer), 0);
+            encoder.set_buffer(1, Some(&k_cache.buffer), 0);
+            encoder.set_buffer(2, Some(&v_cache.buffer), 0);
+            encoder.set_buffer(3, Some(&sinks.buffer), 0);
+            encoder.set_buffer(4, Some(&out.buffer), 0);
+            encoder.set_buffer(5, Some(&layer_buffer), 0);
+            encoder.set_buffer(6, Some(&query_position_buffer), 0);
+            encoder.set_buffer(7, Some(&cache_start_position_buffer), 0);
+            encoder.set_buffer(8, Some(&cache_len_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(Q_HEADS as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn vector_add_into(
+            &self,
+            left: &F32VectorBuffer,
+            right: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+        ) -> Result<()> {
+            if left.len != right.len || left.len != out.len {
+                return Err(eyre!(
+                    "vector add length mismatch: left {}, right {}, out {}",
+                    left.len,
+                    right.len,
+                    out.len
+                ));
+            }
+
+            let n = left.len as u32;
+            let n_buffer = buffer_with_data(&self.context.device, &[n]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.vector_add);
+            encoder.set_buffer(0, Some(&left.buffer), 0);
+            encoder.set_buffer(1, Some(&right.buffer), 0);
+            encoder.set_buffer(2, Some(&out.buffer), 0);
+            encoder.set_buffer(3, Some(&n_buffer), 0);
+            encoder.dispatch_threads(
+                mtl_size(left.len as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn top4_softmax_into(
+            &self,
+            logits: &F32VectorBuffer,
+            indices: &U32Buffer,
+            selected_logits: &F32VectorBuffer,
+            weights: &F32VectorBuffer,
+        ) -> Result<()> {
+            if logits.len < 4 || indices.len < 4 || selected_logits.len < 4 || weights.len < 4 {
+                return Err(eyre!(
+                    "top4_softmax needs logits>=4 and output room for 4 values"
+                ));
+            }
+
+            let n = logits.len as u32;
+            let n_buffer = buffer_with_data(&self.context.device, &[n]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.top4_softmax);
+            encoder.set_buffer(0, Some(&logits.buffer), 0);
+            encoder.set_buffer(1, Some(&indices.buffer), 0);
+            encoder.set_buffer(2, Some(&selected_logits.buffer), 0);
+            encoder.set_buffer(3, Some(&weights.buffer), 0);
+            encoder.set_buffer(4, Some(&n_buffer), 0);
+            encoder.dispatch_threads(mtl_size(1, 1, 1), mtl_size(1, 1, 1));
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        pub fn mxfp4_top4_gate_swiglu_into(
+            &self,
+            blocks: &U8Buffer,
+            scales: &U8Buffer,
+            bias: &Bf16MatrixBuffer,
+            input: &F32VectorBuffer,
+            top_indices: &U32Buffer,
+            out: &F32VectorBuffer,
+        ) -> Result<()> {
+            let expected_blocks = EXPERTS
+                .checked_mul(GATE_UP_VALUES)
+                .and_then(|value| value.checked_mul(MXFP4_GROUPS))
+                .and_then(|value| value.checked_mul(MXFP4_BYTES_PER_GROUP))
+                .ok_or_else(|| eyre!("MXFP4 gate-up slab block length overflow"))?;
+            let expected_scales = EXPERTS
+                .checked_mul(GATE_UP_VALUES)
+                .and_then(|value| value.checked_mul(MXFP4_GROUPS))
+                .ok_or_else(|| eyre!("MXFP4 gate-up slab scale length overflow"))?;
+            if blocks.len != expected_blocks || scales.len != expected_scales {
+                return Err(eyre!(
+                    "MXFP4 gate-up slab length mismatch: blocks {}, scales {}, expected {expected_blocks}/{expected_scales}",
+                    blocks.len,
+                    scales.len
+                ));
+            }
+            if bias.rows != EXPERTS || bias.cols != GATE_UP_VALUES {
+                return Err(eyre!(
+                    "MXFP4 gate-up bias shape is {}x{}, expected {EXPERTS}x{GATE_UP_VALUES}",
+                    bias.rows,
+                    bias.cols
+                ));
+            }
+            if input.len != HIDDEN_SIZE || top_indices.len < 4 || out.len != 4 * HIDDEN_SIZE {
+                return Err(eyre!(
+                    "MXFP4 gate-up fused shape mismatch: input {}, top_indices {}, out {}",
+                    input.len,
+                    top_indices.len,
+                    out.len
+                ));
+            }
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.mxfp4_top4_gate_swiglu);
+            encoder.set_buffer(0, Some(&blocks.buffer), 0);
+            encoder.set_buffer(1, Some(&scales.buffer), 0);
+            encoder.set_buffer(2, Some(&bias.buffer), 0);
+            encoder.set_buffer(3, Some(&input.buffer), 0);
+            encoder.set_buffer(4, Some(&top_indices.buffer), 0);
+            encoder.set_buffer(5, Some(&out.buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(HIDDEN_SIZE as NSUInteger, 4, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn mxfp4_top4_down_weighted_into(
+            &self,
+            blocks: &U8Buffer,
+            scales: &U8Buffer,
+            bias: &Bf16MatrixBuffer,
+            expert_acts: &F32VectorBuffer,
+            top_indices: &U32Buffer,
+            top_weights: &F32VectorBuffer,
+            residual: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+        ) -> Result<()> {
+            let expected_blocks = EXPERTS
+                .checked_mul(HIDDEN_SIZE)
+                .and_then(|value| value.checked_mul(MXFP4_GROUPS))
+                .and_then(|value| value.checked_mul(MXFP4_BYTES_PER_GROUP))
+                .ok_or_else(|| eyre!("MXFP4 down slab block length overflow"))?;
+            let expected_scales = EXPERTS
+                .checked_mul(HIDDEN_SIZE)
+                .and_then(|value| value.checked_mul(MXFP4_GROUPS))
+                .ok_or_else(|| eyre!("MXFP4 down slab scale length overflow"))?;
+            if blocks.len != expected_blocks || scales.len != expected_scales {
+                return Err(eyre!(
+                    "MXFP4 down slab length mismatch: blocks {}, scales {}, expected {expected_blocks}/{expected_scales}",
+                    blocks.len,
+                    scales.len
+                ));
+            }
+            if bias.rows != EXPERTS || bias.cols != HIDDEN_SIZE {
+                return Err(eyre!(
+                    "MXFP4 down bias shape is {}x{}, expected {EXPERTS}x{HIDDEN_SIZE}",
+                    bias.rows,
+                    bias.cols
+                ));
+            }
+            if expert_acts.len != 4 * HIDDEN_SIZE
+                || top_indices.len < 4
+                || top_weights.len < 4
+                || residual.len != HIDDEN_SIZE
+                || out.len != HIDDEN_SIZE
+            {
+                return Err(eyre!(
+                    "MXFP4 down fused shape mismatch: acts {}, top_indices {}, top_weights {}, residual {}, out {}",
+                    expert_acts.len,
+                    top_indices.len,
+                    top_weights.len,
+                    residual.len,
+                    out.len
+                ));
+            }
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.mxfp4_top4_down_weighted);
+            encoder.set_buffer(0, Some(&blocks.buffer), 0);
+            encoder.set_buffer(1, Some(&scales.buffer), 0);
+            encoder.set_buffer(2, Some(&bias.buffer), 0);
+            encoder.set_buffer(3, Some(&expert_acts.buffer), 0);
+            encoder.set_buffer(4, Some(&top_indices.buffer), 0);
+            encoder.set_buffer(5, Some(&top_weights.buffer), 0);
+            encoder.set_buffer(6, Some(&residual.buffer), 0);
+            encoder.set_buffer(7, Some(&out.buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(HIDDEN_SIZE as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+    }
+
     trait MetalDeviceExt {
         fn new_command_queue(&self) -> Retained<MetalCommandQueue>;
         fn new_buffer(&self, length: u64, options: MTLResourceOptions) -> Retained<MetalBuffer>;
@@ -4551,14 +5548,27 @@ kernel void weighted_sum4(
 mod platform {
     use crate::runtime_core::ExpertScore;
     use eyre::{Result, eyre};
+    use std::marker::PhantomData;
 
+    pub struct MetalBatch<'a> {
+        _marker: PhantomData<&'a ()>,
+    }
     pub struct MetalContext;
+    #[derive(Clone)]
     pub struct Bf16MatrixBuffer;
+    #[derive(Clone)]
     pub struct F32VectorBuffer;
+    #[derive(Clone)]
     pub struct U8Buffer;
+    #[derive(Clone)]
+    pub struct U32Buffer;
 
     impl Bf16MatrixBuffer {
         pub fn rows(&self) -> usize {
+            0
+        }
+
+        pub fn cols(&self) -> usize {
             0
         }
     }
@@ -4573,6 +5583,28 @@ mod platform {
         }
 
         pub fn set_profile_enabled(&self, _enabled: bool) {}
+
+        pub fn begin_batch(&self) -> MetalBatch<'_> {
+            MetalBatch {
+                _marker: PhantomData,
+            }
+        }
+
+        pub fn alloc_f32_vector(&self, _len: usize) -> Result<F32VectorBuffer> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn alloc_u32_buffer(&self, _len: usize) -> Result<U32Buffer> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn read_f32_vector(&self, _buffer: &F32VectorBuffer) -> Vec<f32> {
+            Vec::new()
+        }
+
+        pub fn read_u32_buffer(&self, _buffer: &U32Buffer) -> Vec<u32> {
+            Vec::new()
+        }
 
         pub fn rms_norm(&self, _x: &[f32], _weight: &[f32]) -> Result<Vec<f32>> {
             Err(eyre!("Metal backend is only available on macOS"))
@@ -4698,6 +5730,148 @@ mod platform {
         }
 
         pub fn weighted_sum4(&self, _vectors: [&[f32]; 4], _weights: [f32; 4]) -> Result<Vec<f32>> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+    }
+
+    impl<'a> MetalBatch<'a> {
+        pub fn finish(self) -> u128 {
+            0
+        }
+
+        pub fn embedding_lookup_bf16_into(
+            &self,
+            _weight: &Bf16MatrixBuffer,
+            _token: usize,
+            _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn rms_norm_into(
+            &self,
+            _input: &F32VectorBuffer,
+            _weight: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn bf16_matrix_matvec_into(
+            &self,
+            _weight: &Bf16MatrixBuffer,
+            _input: &F32VectorBuffer,
+            _bias: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn bf16_matrix_topk_into(
+            &self,
+            _weight: &Bf16MatrixBuffer,
+            _input: &F32VectorBuffer,
+            _logits: &F32VectorBuffer,
+            _indices: &U32Buffer,
+            _values: &F32VectorBuffer,
+            _k: usize,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn bf16_matrix_top1_into(
+            &self,
+            _weight: &Bf16MatrixBuffer,
+            _input: &F32VectorBuffer,
+            _logits: &F32VectorBuffer,
+            _block_indices: &U32Buffer,
+            _block_values: &F32VectorBuffer,
+            _out_index: &U32Buffer,
+            _out_value: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn rope_row_into(
+            &self,
+            _input: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+            _heads: usize,
+            _position: usize,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn write_f32_slot_into(
+            &self,
+            _input: &F32VectorBuffer,
+            _output: &F32VectorBuffer,
+            _slot: usize,
+            _width: usize,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn kv_cache_decode_attention_into(
+            &self,
+            _layer: usize,
+            _query_position: usize,
+            _cache_start_position: usize,
+            _cache_len: usize,
+            _q: &F32VectorBuffer,
+            _k_cache: &F32VectorBuffer,
+            _v_cache: &F32VectorBuffer,
+            _sinks: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn vector_add_into(
+            &self,
+            _left: &F32VectorBuffer,
+            _right: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn top4_softmax_into(
+            &self,
+            _logits: &F32VectorBuffer,
+            _indices: &U32Buffer,
+            _selected_logits: &F32VectorBuffer,
+            _weights: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn mxfp4_top4_gate_swiglu_into(
+            &self,
+            _blocks: &U8Buffer,
+            _scales: &U8Buffer,
+            _bias: &Bf16MatrixBuffer,
+            _input: &F32VectorBuffer,
+            _top_indices: &U32Buffer,
+            _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn mxfp4_top4_down_weighted_into(
+            &self,
+            _blocks: &U8Buffer,
+            _scales: &U8Buffer,
+            _bias: &Bf16MatrixBuffer,
+            _expert_acts: &F32VectorBuffer,
+            _top_indices: &U32Buffer,
+            _top_weights: &F32VectorBuffer,
+            _residual: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+        ) -> Result<()> {
             Err(eyre!("Metal backend is only available on macOS"))
         }
     }

@@ -3,6 +3,13 @@ name = "inference-engine"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+metal-stage-profile = [
+    "objc2-metal/MTLBlitCommandEncoder",
+    "objc2-metal/MTLCounters",
+]
+
 [dependencies]
 eyre = "0.6"
 openai-harmony = "0.0.8"
