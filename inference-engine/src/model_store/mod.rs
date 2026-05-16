@@ -1,9 +1,10 @@
 use eyre::{Result, eyre};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+#[cfg(unix)]
+use std::ptr::NonNull;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelLocation {
@@ -105,8 +106,25 @@ pub struct SafeTensorMap {
 }
 
 struct SafeTensorMappedShard {
-    file: Mutex<fs::File>,
+    bytes: MappedShardBytes,
 }
+
+#[cfg(unix)]
+struct MappedShardBytes {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+#[cfg(not(unix))]
+struct MappedShardBytes {
+    bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+unsafe impl Send for MappedShardBytes {}
+
+#[cfg(unix)]
+unsafe impl Sync for MappedShardBytes {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorView {
@@ -116,6 +134,12 @@ pub struct TensorView {
     pub shape: Vec<u64>,
     pub absolute_offset: u64,
     pub len_bytes: usize,
+}
+
+pub struct Bf16MatrixBytes<'a> {
+    pub rows: usize,
+    pub cols: usize,
+    pub bytes: &'a [u8],
 }
 
 impl SafeTensorMap {
@@ -130,15 +154,13 @@ impl SafeTensorMap {
         let mut shards = Vec::with_capacity(report.shards.len());
         let mut tensors = BTreeMap::new();
         for (shard_index, shard) in report.shards.iter().enumerate() {
-            let file = fs::File::open(&shard.path).map_err(|error| {
+            let bytes = MappedShardBytes::open(&shard.path).map_err(|error| {
                 eyre!(
-                    "could not open SafeTensors shard {} for indexed reads: {error}",
+                    "could not mmap SafeTensors shard {} for indexed reads: {error}",
                     shard.path.display()
                 )
             })?;
-            shards.push(SafeTensorMappedShard {
-                file: Mutex::new(file),
-            });
+            shards.push(SafeTensorMappedShard { bytes });
 
             for tensor in &shard.tensors {
                 let len_bytes = tensor
@@ -183,11 +205,38 @@ impl SafeTensorMap {
             .ok_or_else(|| eyre!("tensor {tensor_name} was not found"))
     }
 
+    pub fn tensor_bytes(&self, tensor_name: &str) -> Result<&[u8]> {
+        let tensor = self.tensor(tensor_name)?;
+        self.tensor_bytes_view(tensor)
+    }
+
+    pub fn bf16_matrix_bytes(&self, tensor_name: &str) -> Result<Bf16MatrixBytes<'_>> {
+        let tensor = self.tensor(tensor_name)?;
+        expect_dtype(tensor, "BF16")?;
+        expect_rank(tensor, 2)?;
+
+        let rows = tensor.shape[0] as usize;
+        let cols = tensor.shape[1] as usize;
+        let bytes = self.tensor_bytes_view(tensor)?;
+        let expected_len = rows
+            .checked_mul(cols)
+            .and_then(|values| values.checked_mul(2))
+            .ok_or_else(|| eyre!("tensor {tensor_name} byte size overflow"))?;
+        if bytes.len() != expected_len {
+            return Err(eyre!(
+                "tensor {tensor_name} has {} bytes, expected {expected_len}",
+                bytes.len()
+            ));
+        }
+
+        Ok(Bf16MatrixBytes { rows, cols, bytes })
+    }
+
     pub fn read_bf16_vector(&self, tensor_name: &str) -> Result<Vec<f32>> {
         let tensor = self.tensor(tensor_name)?;
         expect_dtype(tensor, "BF16")?;
         expect_rank(tensor, 1)?;
-        let bytes = self.read_tensor_bytes(tensor)?;
+        let bytes = self.tensor_bytes_view(tensor)?;
         Ok(bf16_bytes_to_f32(&bytes))
     }
 
@@ -198,7 +247,7 @@ impl SafeTensorMap {
 
         let rows = tensor.shape[0] as usize;
         let cols = tensor.shape[1] as usize;
-        let bytes = self.read_tensor_bytes(tensor)?;
+        let bytes = self.tensor_bytes_view(tensor)?;
         let expected_len = rows
             .checked_mul(cols)
             .and_then(|values| values.checked_mul(2))
@@ -243,6 +292,17 @@ impl SafeTensorMap {
         element_offset: usize,
         element_len: usize,
     ) -> Result<Vec<u8>> {
+        Ok(self
+            .u8_tensor_slice_bytes(tensor_name, element_offset, element_len)?
+            .to_vec())
+    }
+
+    pub fn u8_tensor_slice_bytes(
+        &self,
+        tensor_name: &str,
+        element_offset: usize,
+        element_len: usize,
+    ) -> Result<&[u8]> {
         let tensor = self.tensor(tensor_name)?;
         expect_dtype(tensor, "U8")?;
         let end = element_offset
@@ -254,7 +314,7 @@ impl SafeTensorMap {
                 tensor.len_bytes
             ));
         }
-        self.read_tensor_range(tensor, element_offset, element_len)
+        self.tensor_range_view(tensor, element_offset, element_len)
     }
 
     fn read_bf16_matrix_row_bytes(&self, tensor_name: &str, row_index: usize) -> Result<Vec<u8>> {
@@ -282,19 +342,21 @@ impl SafeTensorMap {
             ));
         }
 
-        self.read_tensor_range(tensor, row_offset, row_bytes)
+        Ok(self
+            .tensor_range_view(tensor, row_offset, row_bytes)?
+            .to_vec())
     }
 
-    fn read_tensor_bytes(&self, tensor: &TensorView) -> Result<Vec<u8>> {
-        self.read_tensor_range(tensor, 0, tensor.len_bytes)
+    fn tensor_bytes_view(&self, tensor: &TensorView) -> Result<&[u8]> {
+        self.tensor_range_view(tensor, 0, tensor.len_bytes)
     }
 
-    fn read_tensor_range(
+    fn tensor_range_view(
         &self,
         tensor: &TensorView,
         byte_offset: usize,
         byte_len: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<&[u8]> {
         let end = byte_offset
             .checked_add(byte_len)
             .ok_or_else(|| eyre!("range overflow for tensor {}", tensor.name))?;
@@ -313,11 +375,88 @@ impl SafeTensorMap {
             .shards
             .get(tensor.shard_index)
             .ok_or_else(|| eyre!("tensor {} references missing shard", tensor.name))?;
-        let mut bytes = vec![0u8; byte_len];
-        let mut file = shard.file.lock().unwrap();
-        read_file_exact_at(&mut file, offset, &mut bytes)
-            .map_err(|error| eyre!("could not read tensor {}: {error}", tensor.name))?;
-        Ok(bytes)
+        shard.bytes.range(offset, byte_len).map_err(|error| {
+            eyre!(
+                "could not read mmap range for tensor {}: {error}",
+                tensor.name
+            )
+        })
+    }
+}
+
+#[cfg(unix)]
+impl MappedShardBytes {
+    fn open(path: &Path) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let file = fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let len = usize::try_from(len)
+            .map_err(|_| eyre!("SafeTensors shard {} is too large to mmap", path.display()))?;
+        if len == 0 {
+            return Err(eyre!("SafeTensors shard {} is empty", path.display()));
+        }
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let ptr = NonNull::new(ptr.cast::<u8>())
+            .ok_or_else(|| eyre!("mmap returned a null pointer for {}", path.display()))?;
+        Ok(Self { ptr, len })
+    }
+
+    fn range(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        let offset = usize::try_from(offset).map_err(|_| eyre!("mmap offset too large"))?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| eyre!("mmap range overflow"))?;
+        if end > self.len {
+            return Err(eyre!(
+                "mmap range {offset}..{end} exceeds shard length {}",
+                self.len
+            ));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MappedShardBytes {
+    fn drop(&mut self) {
+        let result = unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
+        debug_assert_eq!(result, 0);
+    }
+}
+
+#[cfg(not(unix))]
+impl MappedShardBytes {
+    fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            bytes: fs::read(path)?,
+        })
+    }
+
+    fn range(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        let offset = usize::try_from(offset).map_err(|_| eyre!("mapped offset too large"))?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| eyre!("mapped range overflow"))?;
+        self.bytes.get(offset..end).ok_or_else(|| {
+            eyre!(
+                "mapped range {offset}..{end} exceeds shard length {}",
+                self.bytes.len()
+            )
+        })
     }
 }
 
@@ -518,35 +657,6 @@ fn expect_rank(tensor: &TensorView, rank: usize) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn read_file_exact_at(
-    file: &mut fs::File,
-    mut offset: u64,
-    mut bytes: &mut [u8],
-) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-
-    while !bytes.is_empty() {
-        let read = FileExt::read_at(file, bytes, offset)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "short positional read",
-            ));
-        }
-        offset = offset.saturating_add(read as u64);
-        let (_, rest) = bytes.split_at_mut(read);
-        bytes = rest;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn read_file_exact_at(file: &mut fs::File, offset: u64, bytes: &mut [u8]) -> io::Result<()> {
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(bytes)
 }
 
 pub fn read_bf16_vector(report: &SourceModelReport, tensor_name: &str) -> Result<Vec<f32>> {

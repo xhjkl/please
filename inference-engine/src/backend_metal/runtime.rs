@@ -470,6 +470,31 @@ pub(crate) mod platform {
             })
         }
 
+        pub fn upload_bf16_matrix_bytes(
+            &self,
+            weight: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<Bf16MatrixBuffer> {
+            let expected = rows
+                .checked_mul(cols)
+                .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+                .ok_or_else(|| eyre!("BF16 matrix byte shape overflow"))?;
+            if expected != weight.len() {
+                return Err(eyre!(
+                    "BF16 matrix has {} bytes, expected rows * cols * 2 = {} * {} * 2",
+                    weight.len(),
+                    rows,
+                    cols
+                ));
+            }
+            Ok(Bf16MatrixBuffer {
+                buffer: buffer_with_data(&self.device, weight),
+                rows,
+                cols,
+            })
+        }
+
         pub fn bf16_matrix_topk(
             &self,
             weight: &Bf16MatrixBuffer,
@@ -2624,6 +2649,15 @@ pub(crate) mod platform {
         pub fn upload_bf16_matrix(
             &self,
             _weight: &[u16],
+            _rows: usize,
+            _cols: usize,
+        ) -> Result<Bf16MatrixBuffer> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn upload_bf16_matrix_bytes(
+            &self,
+            _weight: &[u8],
             _rows: usize,
             _cols: usize,
         ) -> Result<Bf16MatrixBuffer> {

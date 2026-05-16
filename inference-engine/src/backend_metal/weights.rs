@@ -231,22 +231,6 @@ impl ResidentWeights {
         Ok(value)
     }
 
-    pub(crate) fn bf16_matrix_from_map(
-        &self,
-        source: &SafeTensorMap,
-        tensor_name: &str,
-    ) -> Result<Arc<model_store::Bf16Matrix>> {
-        if let Some(value) = self.bf16_matrices.lock().unwrap().get(tensor_name).cloned() {
-            return Ok(value);
-        }
-        let value = Arc::new(source.read_bf16_matrix(tensor_name)?);
-        self.bf16_matrices
-            .lock()
-            .unwrap()
-            .insert(tensor_name.to_string(), value.clone());
-        Ok(value)
-    }
-
     pub(crate) fn bf16_vector(
         &self,
         report: &SourceModelReport,
@@ -311,23 +295,6 @@ impl ResidentWeights {
             element_offset,
             element_len,
         )?);
-        self.u8_slices.lock().unwrap().insert(key, value.clone());
-        Ok(value)
-    }
-
-    pub(crate) fn u8_tensor_slice_from_map(
-        &self,
-        source: &SafeTensorMap,
-        tensor_name: &str,
-        element_offset: usize,
-        element_len: usize,
-    ) -> Result<Arc<Vec<u8>>> {
-        let key = (tensor_name.to_string(), element_offset, element_len);
-        if let Some(value) = self.u8_slices.lock().unwrap().get(&key).cloned() {
-            return Ok(value);
-        }
-        let value =
-            Arc::new(source.read_u8_tensor_slice(tensor_name, element_offset, element_len)?);
         self.u8_slices.lock().unwrap().insert(key, value.clone());
         Ok(value)
     }

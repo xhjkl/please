@@ -87,8 +87,8 @@ impl MetalOracleContext {
 
     pub fn with_lm_head_map(source: &SafeTensorMap) -> Result<Self> {
         let platform = platform::MetalContext::new()?;
-        let weight = source.read_bf16_matrix("lm_head.weight")?;
-        let lm_head = platform.upload_bf16_matrix(&weight.values, weight.rows, weight.cols)?;
+        let weight = source.bf16_matrix_bytes("lm_head.weight")?;
+        let lm_head = platform.upload_bf16_matrix_bytes(weight.bytes, weight.rows, weight.cols)?;
         Ok(Self {
             platform,
             lm_head: Some(lm_head),
@@ -353,17 +353,6 @@ impl MetalOracleContext {
         weights.bf16_matrix(report, tensor_name)
     }
 
-    fn bf16_matrix_from_map(
-        &self,
-        source: &SafeTensorMap,
-        tensor_name: &str,
-    ) -> Result<Arc<model_store::Bf16Matrix>> {
-        let Some(weights) = &self.weights else {
-            return Ok(Arc::new(source.read_bf16_matrix(tensor_name)?));
-        };
-        weights.bf16_matrix_from_map(source, tensor_name)
-    }
-
     fn bf16_vector(&self, report: &SourceModelReport, tensor_name: &str) -> Result<Arc<Vec<f32>>> {
         let Some(weights) = &self.weights else {
             return Ok(Arc::new(model_store::read_bf16_vector(
@@ -417,23 +406,6 @@ impl MetalOracleContext {
             )?));
         };
         weights.u8_tensor_slice(report, tensor_name, element_offset, element_len)
-    }
-
-    fn u8_tensor_slice_from_map(
-        &self,
-        source: &SafeTensorMap,
-        tensor_name: &str,
-        element_offset: usize,
-        element_len: usize,
-    ) -> Result<Arc<Vec<u8>>> {
-        let Some(weights) = &self.weights else {
-            return Ok(Arc::new(source.read_u8_tensor_slice(
-                tensor_name,
-                element_offset,
-                element_len,
-            )?));
-        };
-        weights.u8_tensor_slice_from_map(source, tensor_name, element_offset, element_len)
     }
 
     fn bf16_linear_matvec(
@@ -721,18 +693,18 @@ impl MetalOracleContext {
     ) -> Result<platform::Bf16MatrixBuffer> {
         let mut cache = self.gpu_bf16_matrices.lock().unwrap();
         if !cache.contains_key(tensor_name) {
-            let weight = self.bf16_matrix_from_map(source, tensor_name)?;
+            let weight = source.bf16_matrix_bytes(tensor_name)?;
             self.record_profile(
                 op_name,
                 ProfileDelta {
-                    upload_bytes: weight.values.len() * size_of::<u16>(),
+                    upload_bytes: weight.bytes.len(),
                     cache_misses: 1,
                     ..ProfileDelta::default()
                 },
             );
             let weight =
                 self.platform
-                    .upload_bf16_matrix(&weight.values, weight.rows, weight.cols)?;
+                    .upload_bf16_matrix_bytes(weight.bytes, weight.rows, weight.cols)?;
             cache.insert(tensor_name.to_string(), weight);
         } else {
             self.record_profile(
@@ -794,8 +766,7 @@ impl MetalOracleContext {
         let key = (tensor_name.to_string(), element_offset, element_len);
         let mut cache = self.gpu_u8_slices.lock().unwrap();
         if !cache.contains_key(&key) {
-            let value =
-                self.u8_tensor_slice_from_map(source, tensor_name, element_offset, element_len)?;
+            let value = source.u8_tensor_slice_bytes(tensor_name, element_offset, element_len)?;
             self.record_profile(
                 op_name,
                 ProfileDelta {
@@ -804,7 +775,7 @@ impl MetalOracleContext {
                     ..ProfileDelta::default()
                 },
             );
-            let value = self.platform.upload_u8_buffer(&value)?;
+            let value = self.platform.upload_u8_buffer(value)?;
             cache.insert(key.clone(), value);
         } else {
             self.record_profile(
