@@ -1,13 +1,16 @@
+#[cfg(feature = "profile")]
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[cfg(feature = "profile")]
 #[derive(Debug, Clone)]
 pub struct MetalProfileReport {
     pub records: Vec<MetalProfileRecord>,
-    #[cfg(feature = "metal-stage-profile")]
+    #[cfg(feature = "profile")]
     pub stage_profile: Option<MetalStageProfileReport>,
 }
 
+#[cfg(feature = "profile")]
 impl MetalProfileReport {
     pub fn render_for_cli(&self) -> String {
         let mut records = self.records.clone();
@@ -42,19 +45,37 @@ impl MetalProfileReport {
             .unwrap_or_else(|| "n/a; generate at least 2 tokens".to_string())
         ));
         out.push_str(&format!(
-            "- expert slab page-spill time: {}\n",
+            "- hot token GPU: {}\n",
+            render_average_gpu_metric(
+                records
+                    .iter()
+                    .find(|record| record.name == "metric.hot_token")
+            )
+            .unwrap_or_else(|| "n/a; generate at least 2 tokens".to_string())
+        ));
+        out.push_str(&format!(
+            "- hot token wall/GPU gap: {}\n",
+            render_average_metric(
+                records
+                    .iter()
+                    .find(|record| record.name == "metric.hot_token_gap")
+            )
+            .unwrap_or_else(|| "n/a; generate at least 2 tokens".to_string())
+        ));
+        out.push_str(&format!(
+            "- experts carousel page-spill time: {}\n",
             render_spill_time(
                 records
                     .iter()
-                    .find(|record| record.name == "metric.expert_slab_page")
+                    .find(|record| record.name == "metric.experts_carousel_page")
             )
         ));
         out.push_str(&format!(
-            "- expert slab page-spills: {}\n",
+            "- experts carousel page-spills: {}\n",
             render_spill_count(
                 records
                     .iter()
-                    .find(|record| record.name == "metric.expert_slab_page")
+                    .find(|record| record.name == "metric.experts_carousel_page")
             )
         ));
         out.push_str(&format!(
@@ -102,7 +123,7 @@ impl MetalProfileReport {
                 record.name
             ));
         }
-        #[cfg(feature = "metal-stage-profile")]
+        #[cfg(feature = "profile")]
         if let Some(stage_profile) = &self.stage_profile {
             out.push_str(&stage_profile.render_hot_token_breakdown());
             out.push_str(&stage_profile.render_for_cli());
@@ -111,7 +132,7 @@ impl MetalProfileReport {
     }
 }
 
-#[cfg(feature = "metal-stage-profile")]
+#[cfg(feature = "profile")]
 #[derive(Debug, Clone)]
 pub struct MetalStageProfileReport {
     token_positions: Vec<Option<usize>>,
@@ -119,7 +140,7 @@ pub struct MetalStageProfileReport {
     values_ns: Vec<Vec<u128>>,
 }
 
-#[cfg(feature = "metal-stage-profile")]
+#[cfg(feature = "profile")]
 impl MetalStageProfileReport {
     fn render_hot_token_breakdown(&self) -> String {
         let mut positions = self
@@ -130,30 +151,47 @@ impl MetalStageProfileReport {
             .collect::<Vec<_>>();
         positions.sort_unstable();
 
-        let mut rows = Vec::new();
+        let mut combined_rows = Vec::new();
+        let mut stitched_rows = Vec::new();
         for position in positions {
-            if position == 0 {
+            let hot_token_gpu = self.value_at(position, TokenStage::HotToken);
+            if hot_token_gpu != 0 {
+                combined_rows.push((position, hot_token_gpu));
                 continue;
             }
-            let decode_gpu = self.value_at(position - 1, TokenStage::Token);
-            let lm_head_gpu = self.value_at(position, TokenStage::LmHead);
-            if decode_gpu == 0 || lm_head_gpu == 0 {
-                continue;
+            if position != 0 {
+                let decode_gpu = self.value_at(position - 1, TokenStage::Token);
+                let lm_head_gpu = self.value_at(position, TokenStage::LmHead);
+                if decode_gpu != 0 && lm_head_gpu != 0 {
+                    stitched_rows.push((position, decode_gpu, lm_head_gpu));
+                }
             }
-            rows.push((position, decode_gpu, lm_head_gpu));
         }
 
         let mut out = String::new();
         out.push_str("\nhot token stage breakdown:\n");
+        if !combined_rows.is_empty() {
+            out.push_str("- source: one command buffer per hot generated token\n\n");
+            out.push_str("token      hot_token_gpu\n");
+            out.push_str("---------  -------------\n");
+            for (position, hot_token_gpu) in combined_rows {
+                out.push_str(&format!(
+                    "{position:>9}  {:>13}\n",
+                    format_duration_ns(hot_token_gpu)
+                ));
+            }
+            return out;
+        }
+
         out.push_str("- source: GPU timestamps stitched as decode(previous token) + lm_head(current token)\n\n");
-        if rows.is_empty() {
+        if stitched_rows.is_empty() {
             out.push_str("(no full hot-token stage sample; generate at least 2 tokens)\n");
             return out;
         }
 
         out.push_str("token      decode_gpu     lm_head_gpu     gpu_total\n");
         out.push_str("---------  -------------  --------------  -------------\n");
-        for (position, decode_gpu, lm_head_gpu) in rows {
+        for (position, decode_gpu, lm_head_gpu) in stitched_rows {
             out.push_str(&format!(
                 "{position:>9}  {:>13}  {:>14}  {:>13}\n",
                 format_duration_ns(decode_gpu),
@@ -209,6 +247,7 @@ impl MetalStageProfileReport {
     }
 }
 
+#[cfg(feature = "profile")]
 #[derive(Debug, Clone, Default)]
 pub struct MetalProfileRecord {
     pub name: String,
@@ -223,6 +262,7 @@ pub struct MetalProfileRecord {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
 pub(crate) struct ProfileDelta {
     pub(crate) wall: Duration,
     pub(crate) gpu_ns: u128,
@@ -233,11 +273,10 @@ pub(crate) struct ProfileDelta {
     pub(crate) cache_misses: usize,
 }
 
+#[cfg(feature = "profile")]
 #[derive(Default)]
 pub(crate) struct ProfileState {
-    pub(crate) enabled: bool,
     pub(crate) records: HashMap<String, MetalProfileRecord>,
-    #[cfg(feature = "metal-stage-profile")]
     pub(crate) stage_profile: Option<StageProfileState>,
 }
 
@@ -245,37 +284,40 @@ pub(crate) struct ProfileState {
 pub(crate) enum TokenStage {
     Token,
     LmHead,
+    HotToken,
 }
 
 impl TokenStage {
-    #[cfg(feature = "metal-stage-profile")]
-    const ALL: [Self; 2] = [Self::Token, Self::LmHead];
+    #[cfg(feature = "profile")]
+    const ALL: [Self; 3] = [Self::Token, Self::LmHead, Self::HotToken];
 
-    #[cfg(feature = "metal-stage-profile")]
+    #[cfg(feature = "profile")]
     fn index(self) -> usize {
         match self {
             Self::Token => 0,
             Self::LmHead => 1,
+            Self::HotToken => 2,
         }
     }
 
-    #[cfg(feature = "metal-stage-profile")]
+    #[cfg(feature = "profile")]
     fn name(self) -> &'static str {
         match self {
             Self::Token => "token",
             Self::LmHead => "lm_head",
+            Self::HotToken => "hot_token",
         }
     }
 }
 
-#[cfg(feature = "metal-stage-profile")]
+#[cfg(feature = "profile")]
 #[derive(Debug, Clone)]
 pub(crate) struct StageProfileState {
     token_positions: Vec<Option<usize>>,
     values_ns: Vec<Vec<u128>>,
 }
 
-#[cfg(feature = "metal-stage-profile")]
+#[cfg(feature = "profile")]
 impl StageProfileState {
     pub(crate) fn new(ring_capacity: usize) -> Self {
         Self {
@@ -306,22 +348,23 @@ impl StageProfileState {
     }
 }
 
-#[cfg(feature = "metal-stage-profile")]
+#[cfg(feature = "profile")]
 pub(crate) type StageMarker = Option<(usize, TokenStage)>;
 
-#[cfg(not(feature = "metal-stage-profile"))]
+#[cfg(not(feature = "profile"))]
 pub(crate) type StageMarker = ();
 
-#[cfg(feature = "metal-stage-profile")]
+#[cfg(feature = "profile")]
 pub(crate) fn stage_marker(position: usize, stage: TokenStage) -> StageMarker {
     Some((position, stage))
 }
 
-#[cfg(not(feature = "metal-stage-profile"))]
+#[cfg(not(feature = "profile"))]
 pub(crate) fn stage_marker(position: usize, stage: TokenStage) -> StageMarker {
     let _ = (position, stage);
 }
 
+#[cfg(feature = "profile")]
 fn format_duration_ns(ns: u128) -> String {
     if ns >= 1_000_000_000 {
         format!("{:.2}s", ns as f64 / 1_000_000_000.0)
@@ -334,6 +377,7 @@ fn format_duration_ns(ns: u128) -> String {
     }
 }
 
+#[cfg(feature = "profile")]
 fn format_bytes(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1}MiB", bytes as f64 / (1024.0 * 1024.0))
@@ -344,11 +388,13 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+#[cfg(feature = "profile")]
 fn render_single_metric(record: Option<&MetalProfileRecord>) -> Option<String> {
     let record = record?;
     Some(format_duration_ns(record.wall_ns))
 }
 
+#[cfg(feature = "profile")]
 fn render_average_metric(record: Option<&MetalProfileRecord>) -> Option<String> {
     let record = record?;
     if record.calls == 0 {
@@ -363,6 +409,22 @@ fn render_average_metric(record: Option<&MetalProfileRecord>) -> Option<String> 
     ))
 }
 
+#[cfg(feature = "profile")]
+fn render_average_gpu_metric(record: Option<&MetalProfileRecord>) -> Option<String> {
+    let record = record?;
+    if record.calls == 0 {
+        return None;
+    }
+    let avg = record.gpu_ns / record.calls as u128;
+    Some(format!(
+        "{} avg over {} token{}",
+        format_duration_ns(avg),
+        record.calls,
+        plural_suffix(record.calls)
+    ))
+}
+
+#[cfg(feature = "profile")]
 fn render_spill_time(record: Option<&MetalProfileRecord>) -> String {
     let Some(record) = record else {
         return "n/a; 0 reloads".to_string();
@@ -379,14 +441,17 @@ fn render_spill_time(record: Option<&MetalProfileRecord>) -> String {
     )
 }
 
+#[cfg(feature = "profile")]
 fn render_spill_count(record: Option<&MetalProfileRecord>) -> usize {
     record.map(spill_count).unwrap_or(0)
 }
 
+#[cfg(feature = "profile")]
 fn spill_count(record: &MetalProfileRecord) -> usize {
     record.cache_misses.max(record.calls)
 }
 
+#[cfg(feature = "profile")]
 fn plural_suffix(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }

@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-metal-stage-profile = [
+profile = [
     "objc2-metal/MTLBlitCommandEncoder",
     "objc2-metal/MTLCounters",
 ]

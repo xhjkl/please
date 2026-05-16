@@ -43,7 +43,10 @@ pub(crate) fn mxfp4_slab_scales_len(rows: usize) -> Result<usize> {
 }
 
 #[derive(Clone)]
-pub(crate) struct ResidentLayerExpertSlabs {
+// The resident path currently keeps a full per-layer experts carousel on GPU.
+// Later pageable mode can replace these all-expert slabs with carousel slots
+// addressed through a GPU expert_slot[layer][expert] table.
+pub(crate) struct ResidentExpertsCarouselSlabs {
     pub(crate) gate_up_blocks: platform::U8Buffer,
     pub(crate) gate_up_scales: platform::U8Buffer,
     pub(crate) gate_up_bias: platform::Bf16MatrixBuffer,
@@ -76,7 +79,7 @@ pub(crate) struct AttentionWeights {
 
 pub(crate) struct SparseMlpWeights {
     pub(crate) router: Bf16Linear,
-    pub(crate) experts: ResidentLayerExpertSlabs,
+    pub(crate) experts_carousel: ResidentExpertsCarouselSlabs,
 }
 
 pub(crate) struct Bf16Linear {
@@ -179,8 +182,8 @@ impl GptOssLayerWeights {
                 &format!("{prefix}.mlp.router.bias"),
                 "op.bf16.router",
             )?,
-            experts: ctx
-                .mxfp4_layer_expert_slabs_from_map(source, &format!("{prefix}.mlp.experts"))?,
+            experts_carousel: ctx
+                .mxfp4_experts_carousel_slabs_from_map(source, &format!("{prefix}.mlp.experts"))?,
         };
         Ok(Self {
             input_norm,

@@ -5,6 +5,7 @@ use crate::runtime_core::ExpertScore;
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "profile")]
 use std::time::{Duration, Instant};
 
 const LAYERS: usize = 24;
@@ -34,13 +35,14 @@ pub use generation::MetalEngine;
 pub use probes::*;
 pub(crate) use probes::{decode_token_text, decode_tokens_text, metal_sampler_description};
 use probes::{read_mxfp4_expert_blocks_metal, read_mxfp4_expert_scales_metal};
-#[cfg(feature = "metal-stage-profile")]
-use profile::StageProfileState;
+#[cfg(feature = "profile")]
 pub use profile::{MetalProfileRecord, MetalProfileReport};
-use profile::{ProfileDelta, ProfileState, StageMarker, TokenStage, stage_marker};
+use profile::{ProfileDelta, StageMarker, TokenStage, stage_marker};
+#[cfg(feature = "profile")]
+use profile::{ProfileState, StageProfileState};
 pub(crate) use runtime::platform;
 use weights::{
-    ResidentLayerExpertSlabs, ResidentWeights, bf16_linear_profile_name, mxfp4_profile_name,
+    ResidentExpertsCarouselSlabs, ResidentWeights, bf16_linear_profile_name, mxfp4_profile_name,
     mxfp4_slab_blocks_len, mxfp4_slab_scales_len,
 };
 
@@ -48,6 +50,7 @@ pub struct MetalOracleContext {
     platform: platform::MetalContext,
     lm_head: Option<platform::Bf16MatrixBuffer>,
     weights: Option<Arc<ResidentWeights>>,
+    #[cfg(feature = "profile")]
     profile: Arc<Mutex<ProfileState>>,
     gpu_bf16_matrices: Mutex<HashMap<String, platform::Bf16MatrixBuffer>>,
     gpu_bf16_vectors: Mutex<HashMap<String, platform::F32VectorBuffer>>,
@@ -61,6 +64,7 @@ impl MetalOracleContext {
             platform: platform::MetalContext::new()?,
             lm_head: None,
             weights: None,
+            #[cfg(feature = "profile")]
             profile: Arc::new(Mutex::new(ProfileState::default())),
             gpu_bf16_matrices: Mutex::new(HashMap::new()),
             gpu_bf16_vectors: Mutex::new(HashMap::new()),
@@ -77,6 +81,7 @@ impl MetalOracleContext {
             platform,
             lm_head: Some(lm_head),
             weights: Some(Arc::new(ResidentWeights::default())),
+            #[cfg(feature = "profile")]
             profile: Arc::new(Mutex::new(ProfileState::default())),
             gpu_bf16_matrices: Mutex::new(HashMap::new()),
             gpu_bf16_vectors: Mutex::new(HashMap::new()),
@@ -93,6 +98,7 @@ impl MetalOracleContext {
             platform,
             lm_head: Some(lm_head),
             weights: Some(Arc::new(ResidentWeights::default())),
+            #[cfg(feature = "profile")]
             profile: Arc::new(Mutex::new(ProfileState::default())),
             gpu_bf16_matrices: Mutex::new(HashMap::new()),
             gpu_bf16_vectors: Mutex::new(HashMap::new()),
@@ -118,48 +124,35 @@ impl MetalOracleContext {
         })
     }
 
-    pub fn enable_profile(&self) {
-        self.platform.set_profile_enabled(true);
+    #[cfg(feature = "profile")]
+    fn reset_profile(&self) {
         let _ = self.platform.take_gpu_time_ns();
         let mut profile = self.profile.lock().unwrap();
-        profile.enabled = true;
         profile.records.clear();
-        #[cfg(feature = "metal-stage-profile")]
-        {
-            profile.stage_profile = None;
-        }
+        profile.stage_profile = None;
     }
 
-    pub fn disable_profile(&self) {
-        self.profile.lock().unwrap().enabled = false;
-        self.platform.set_profile_enabled(false);
-    }
-
+    #[cfg(feature = "profile")]
     pub fn profile_report(&self) -> MetalProfileReport {
         let profile = self.profile.lock().unwrap();
         let records = profile.records.values().cloned().collect();
-        #[cfg(feature = "metal-stage-profile")]
         let stage_profile = profile
             .stage_profile
             .as_ref()
             .map(StageProfileState::report);
         MetalProfileReport {
             records,
-            #[cfg(feature = "metal-stage-profile")]
             stage_profile,
         }
     }
 
+    #[cfg(feature = "profile")]
     fn profile_op<T>(
         &self,
         name: &str,
         stats: ProfileDelta,
         run: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        if !self.profile.lock().unwrap().enabled {
-            return run();
-        }
-
         let _ = self.platform.take_gpu_time_ns();
         let started = Instant::now();
         let result = run();
@@ -170,12 +163,19 @@ impl MetalOracleContext {
         result
     }
 
+    #[cfg(not(feature = "profile"))]
+    fn profile_op<T>(
+        &self,
+        _name: &str,
+        _stats: ProfileDelta,
+        run: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        run()
+    }
+
+    #[cfg(feature = "profile")]
     fn record_profile(&self, name: &str, delta: ProfileDelta) {
         let mut profile = self.profile.lock().unwrap();
-        if !profile.enabled {
-            return;
-        }
-
         let record =
             profile
                 .records
@@ -194,23 +194,22 @@ impl MetalOracleContext {
         record.cache_misses += delta.cache_misses;
     }
 
-    #[cfg(feature = "metal-stage-profile")]
+    #[cfg(not(feature = "profile"))]
+    #[inline(always)]
+    fn record_profile(&self, _name: &str, _delta: ProfileDelta) {}
+
+    #[cfg(feature = "profile")]
     fn reset_stage_profile(&self, ring_capacity: usize) {
         let mut profile = self.profile.lock().unwrap();
-        if profile.enabled {
-            profile.stage_profile = Some(StageProfileState::new(ring_capacity.max(1)));
-        }
+        profile.stage_profile = Some(StageProfileState::new(ring_capacity.max(1)));
     }
 
-    #[cfg(feature = "metal-stage-profile")]
+    #[cfg(feature = "profile")]
     fn record_token_stage(&self, token_position: usize, stage: TokenStage, ns: u128) {
         if ns == 0 {
             return;
         }
         let mut profile = self.profile.lock().unwrap();
-        if !profile.enabled {
-            return;
-        }
         let Some(stage_profile) = &mut profile.stage_profile else {
             return;
         };
@@ -550,6 +549,8 @@ impl MetalOracleContext {
                 .platform
                 .mxfp4_matvec(&blocks, &scales, rows, input, &bias);
         }
+        #[cfg(not(feature = "profile"))]
+        let _ = op_name;
 
         let blocks_per_expert = rows
             .checked_mul(MXFP4_GROUPS)
@@ -567,26 +568,33 @@ impl MetalOracleContext {
 
         let blocks_key = (blocks_name.to_string(), blocks_offset, blocks_per_expert);
         let scales_key = (scales_name.to_string(), scales_offset, scales_per_expert);
+        #[cfg(feature = "profile")]
         let page_started = Instant::now();
+        #[cfg(feature = "profile")]
         let mut page_upload_bytes = 0usize;
+        #[cfg(feature = "profile")]
         let mut page_missed = false;
         let mut u8_cache = self.gpu_u8_slices.lock().unwrap();
         if !u8_cache.contains_key(&blocks_key) {
             let blocks =
                 self.u8_tensor_slice(report, blocks_name, blocks_offset, blocks_per_expert)?;
-            page_upload_bytes = page_upload_bytes.saturating_add(blocks.len());
-            page_missed = true;
-            self.record_profile(
-                op_name,
-                ProfileDelta {
-                    upload_bytes: blocks.len(),
-                    cache_misses: 1,
-                    ..ProfileDelta::default()
-                },
-            );
+            #[cfg(feature = "profile")]
+            {
+                page_upload_bytes = page_upload_bytes.saturating_add(blocks.len());
+                page_missed = true;
+                self.record_profile(
+                    op_name,
+                    ProfileDelta {
+                        upload_bytes: blocks.len(),
+                        cache_misses: 1,
+                        ..ProfileDelta::default()
+                    },
+                );
+            }
             let blocks = self.platform.upload_u8_buffer(&blocks)?;
             u8_cache.insert(blocks_key.clone(), blocks);
         } else {
+            #[cfg(feature = "profile")]
             self.record_profile(
                 op_name,
                 ProfileDelta {
@@ -598,19 +606,23 @@ impl MetalOracleContext {
         if !u8_cache.contains_key(&scales_key) {
             let scales =
                 self.u8_tensor_slice(report, scales_name, scales_offset, scales_per_expert)?;
-            page_upload_bytes = page_upload_bytes.saturating_add(scales.len());
-            page_missed = true;
-            self.record_profile(
-                op_name,
-                ProfileDelta {
-                    upload_bytes: scales.len(),
-                    cache_misses: 1,
-                    ..ProfileDelta::default()
-                },
-            );
+            #[cfg(feature = "profile")]
+            {
+                page_upload_bytes = page_upload_bytes.saturating_add(scales.len());
+                page_missed = true;
+                self.record_profile(
+                    op_name,
+                    ProfileDelta {
+                        upload_bytes: scales.len(),
+                        cache_misses: 1,
+                        ..ProfileDelta::default()
+                    },
+                );
+            }
             let scales = self.platform.upload_u8_buffer(&scales)?;
             u8_cache.insert(scales_key.clone(), scales);
         } else {
+            #[cfg(feature = "profile")]
             self.record_profile(
                 op_name,
                 ProfileDelta {
@@ -634,19 +646,23 @@ impl MetalOracleContext {
         let mut row_cache = self.gpu_bf16_rows.lock().unwrap();
         if !row_cache.contains_key(&bias_key) {
             let bias = self.bf16_matrix_row(report, bias_name, expert)?;
-            page_upload_bytes = page_upload_bytes.saturating_add(bias.len() * size_of::<f32>());
-            page_missed = true;
-            self.record_profile(
-                op_name,
-                ProfileDelta {
-                    upload_bytes: bias.len() * size_of::<f32>(),
-                    cache_misses: 1,
-                    ..ProfileDelta::default()
-                },
-            );
+            #[cfg(feature = "profile")]
+            {
+                page_upload_bytes = page_upload_bytes.saturating_add(bias.len() * size_of::<f32>());
+                page_missed = true;
+                self.record_profile(
+                    op_name,
+                    ProfileDelta {
+                        upload_bytes: bias.len() * size_of::<f32>(),
+                        cache_misses: 1,
+                        ..ProfileDelta::default()
+                    },
+                );
+            }
             let bias = self.platform.upload_f32_vector(&bias)?;
             row_cache.insert(bias_key.clone(), bias);
         } else {
+            #[cfg(feature = "profile")]
             self.record_profile(
                 op_name,
                 ProfileDelta {
@@ -660,9 +676,13 @@ impl MetalOracleContext {
                 "cached MXFP4 bias row is missing for {bias_name} expert {expert}"
             ));
         };
+        #[cfg(feature = "profile")]
         if page_missed {
+            // Experts carousel slow path: the production resident path should
+            // normally have the selected expert slabs already warm. A miss here
+            // is tracked as carousel page-spill work, not regular decode work.
             self.record_profile(
-                "metric.expert_slab_page",
+                "metric.experts_carousel_page",
                 ProfileDelta {
                     wall: page_started.elapsed(),
                     upload_bytes: page_upload_bytes,
@@ -672,6 +692,7 @@ impl MetalOracleContext {
             );
         }
 
+        #[cfg(feature = "profile")]
         self.record_profile(
             op_name,
             ProfileDelta {
@@ -799,11 +820,11 @@ impl MetalOracleContext {
             .ok_or_else(|| eyre!("cached u8 slice is missing for {tensor_name}"))
     }
 
-    fn mxfp4_layer_expert_slabs_from_map(
+    fn mxfp4_experts_carousel_slabs_from_map(
         &self,
         source: &SafeTensorMap,
         expert_prefix: &str,
-    ) -> Result<ResidentLayerExpertSlabs> {
+    ) -> Result<ResidentExpertsCarouselSlabs> {
         let gate_up_blocks = self.u8_slice_buffer_from_map(
             source,
             &format!("{expert_prefix}.gate_up_proj_blocks"),
@@ -843,7 +864,7 @@ impl MetalOracleContext {
             "op.mxfp4.down",
         )?;
 
-        Ok(ResidentLayerExpertSlabs {
+        Ok(ResidentExpertsCarouselSlabs {
             gate_up_blocks,
             gate_up_scales,
             gate_up_bias,

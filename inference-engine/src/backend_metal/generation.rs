@@ -2,11 +2,12 @@ use eyre::{Result, eyre};
 
 use super::{
     ATTN_VALUES, HIDDEN_SIZE, KV_HEADS, KV_VALUES, LAYERS, LM_HEAD_TOP1_BLOCK_SIZE,
-    MAX_RESIDENT_CONTEXT_TOKENS, MetalOracleContext, MetalProfileReport, ProfileDelta, Q_HEADS,
-    StageMarker, TokenStage, decode_token_text, decode_tokens_text, metal_sampler_description,
-    platform, stage_marker,
+    MAX_RESIDENT_CONTEXT_TOKENS, MetalOracleContext, Q_HEADS, StageMarker, TokenStage,
+    decode_token_text, decode_tokens_text, metal_sampler_description, platform, stage_marker,
     weights::{GptOssLayerWeights, GptOssWeights},
 };
+#[cfg(feature = "profile")]
+use super::{MetalProfileReport, ProfileDelta};
 use crate::gptoss_spec::weights as spec_weights;
 use crate::harmony_adapter::HarmonyAdapter;
 use crate::model_store;
@@ -15,15 +16,18 @@ use crate::runtime_core::{
     EngineRequest, GenerationEvent, GreedyDecodeProbeReport, GreedyTokenReport, RuntimeNotice,
     SamplingConfig, StopReason,
 };
+#[cfg(feature = "profile")]
 use std::mem::size_of;
 use std::sync::Mutex;
-use std::time::Instant;
+#[cfg(feature = "profile")]
+use std::time::{Duration, Instant};
 
 const PREFILL_MOE_CHUNK_TOKENS: usize = 16;
+const PREFILL_SUFFIX_DECODE_THRESHOLD: usize = 4;
 
 struct ResidentDecodeScratch {
-    hidden_a: platform::F32VectorBuffer,
-    hidden_b: platform::F32VectorBuffer,
+    hidden_ping: platform::F32VectorBuffer,
+    hidden_pong: platform::F32VectorBuffer,
     normed: platform::F32VectorBuffer,
     q: platform::F32VectorBuffer,
     q_rope: platform::F32VectorBuffer,
@@ -39,8 +43,8 @@ struct ResidentDecodeScratch {
     router_selected_logits: platform::F32VectorBuffer,
     router_weights: platform::F32VectorBuffer,
     expert_acts_packed: platform::F32VectorBuffer,
-    prefill_hidden: platform::F32VectorBuffer,
-    prefill_hidden_b: platform::F32VectorBuffer,
+    prefill_hidden_ping: platform::F32VectorBuffer,
+    prefill_hidden_pong: platform::F32VectorBuffer,
     prefill_normed: platform::F32VectorBuffer,
     prefill_q: platform::F32VectorBuffer,
     prefill_q_rope: platform::F32VectorBuffer,
@@ -87,8 +91,8 @@ impl ResidentDecodeScratch {
             .and_then(|values| values.checked_mul(HIDDEN_SIZE))
             .ok_or_else(|| eyre!("prefill expert activation buffer length overflow"))?;
         Ok(Self {
-            hidden_a: platform.alloc_f32_vector(HIDDEN_SIZE)?,
-            hidden_b: platform.alloc_f32_vector(HIDDEN_SIZE)?,
+            hidden_ping: platform.alloc_f32_vector(HIDDEN_SIZE)?,
+            hidden_pong: platform.alloc_f32_vector(HIDDEN_SIZE)?,
             normed: platform.alloc_f32_vector(HIDDEN_SIZE)?,
             q: platform.alloc_f32_vector(ATTN_VALUES)?,
             q_rope: platform.alloc_f32_vector(ATTN_VALUES)?,
@@ -104,8 +108,8 @@ impl ResidentDecodeScratch {
             router_selected_logits: platform.alloc_f32_vector(4)?,
             router_weights: platform.alloc_f32_vector(4)?,
             expert_acts_packed: platform.alloc_f32_vector(4 * HIDDEN_SIZE)?,
-            prefill_hidden: platform.alloc_f32_vector(prefill_values)?,
-            prefill_hidden_b: platform.alloc_f32_vector(prefill_values)?,
+            prefill_hidden_ping: platform.alloc_f32_vector(prefill_values)?,
+            prefill_hidden_pong: platform.alloc_f32_vector(prefill_values)?,
             prefill_normed: platform.alloc_f32_vector(prefill_values)?,
             prefill_q: platform.alloc_f32_vector(prefill_attn_values)?,
             prefill_q_rope: platform.alloc_f32_vector(prefill_attn_values)?,
@@ -174,12 +178,62 @@ impl ResidentGpuKvCache {
     }
 }
 
+// Prefix K/V is stored in the session working KV cache. This metadata is
+// invalidated before that buffer is reused for any different prompt shape.
 struct ResidentPrefixCache {
     tokens: Vec<u32>,
     layers: usize,
     capacity: usize,
-    kv_cache: ResidentGpuKvCache,
     final_hidden: platform::F32VectorBuffer,
+}
+
+struct ResidentSession {
+    scratch: ResidentDecodeScratch,
+    kv_cache: ResidentGpuKvCache,
+    prefix_cache: Option<ResidentPrefixCache>,
+    context_capacity: usize,
+    layers: usize,
+    vocab: usize,
+}
+
+impl ResidentSession {
+    fn new(
+        platform: &platform::MetalContext,
+        vocab: usize,
+        layers: usize,
+        context_capacity: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            scratch: ResidentDecodeScratch::new(platform, vocab, context_capacity)?,
+            kv_cache: ResidentGpuKvCache::new(platform, layers, context_capacity)?,
+            prefix_cache: None,
+            context_capacity,
+            layers,
+            vocab,
+        })
+    }
+
+    fn ensure<'a>(
+        session: &'a mut Option<Self>,
+        platform: &platform::MetalContext,
+        vocab: usize,
+        layers: usize,
+        context_capacity: usize,
+    ) -> Result<&'a mut Self> {
+        let needs_rebuild = session.as_ref().is_none_or(|session| {
+            session.vocab != vocab
+                || session.layers != layers
+                || session.context_capacity < context_capacity
+        });
+        if needs_rebuild {
+            *session = Some(Self::new(platform, vocab, layers, context_capacity)?);
+        }
+
+        let Some(session) = session.as_mut() else {
+            return Err(eyre!("resident session allocation failed"));
+        };
+        Ok(session)
+    }
 }
 
 pub struct MetalEngine {
@@ -187,7 +241,7 @@ pub struct MetalEngine {
     ctx: MetalOracleContext,
     weights: GptOssWeights,
     layers: usize,
-    prefix_cache: Mutex<Option<ResidentPrefixCache>>,
+    session: Mutex<Option<ResidentSession>>,
 }
 
 impl MetalEngine {
@@ -219,7 +273,7 @@ impl MetalEngine {
             ctx,
             weights,
             layers,
-            prefix_cache: Mutex::new(None),
+            session: Mutex::new(None),
         })
     }
 
@@ -227,11 +281,12 @@ impl MetalEngine {
         self.generate_inner(request)
     }
 
+    #[cfg(feature = "profile")]
     pub fn generate_profiled(
         &self,
         request: EngineRequest,
     ) -> Result<(Vec<GenerationEvent>, MetalProfileReport)> {
-        self.ctx.enable_profile();
+        self.ctx.reset_profile();
         let started = Instant::now();
         let result = self.generate_inner(request);
         self.ctx.record_profile(
@@ -242,7 +297,6 @@ impl MetalEngine {
             },
         );
         let report = self.ctx.profile_report();
-        self.ctx.disable_profile();
         result.map(|events| (events, report))
     }
 
@@ -260,7 +314,7 @@ impl MetalEngine {
             return Ok(events);
         }
 
-        let mut prefix_cache = self.prefix_cache.lock().unwrap();
+        let mut session = self.session.lock().unwrap();
         let generated = resident_sample_decode(
             &self.ctx,
             &self.weights,
@@ -271,7 +325,7 @@ impl MetalEngine {
             request.prompt.context_capacity,
             request.prompt.pinned_prefix_len,
             request.sampling,
-            &mut prefix_cache,
+            &mut session,
         )?;
 
         let mut output_bytes = 0usize;
@@ -312,26 +366,44 @@ fn resident_sample_decode(
     context_capacity: usize,
     pinned_prefix_len: usize,
     sampling: SamplingConfig,
-    prefix_cache: &mut Option<ResidentPrefixCache>,
+    session: &mut Option<ResidentSession>,
 ) -> Result<GreedyDecodeProbeReport> {
-    ctx.profile_op(
-        "phase.resident_sample_decode",
-        ProfileDelta::default(),
-        || {
-            resident_sample_decode_inner(
-                ctx,
-                weights,
-                harmony,
-                prompt_tokens,
-                layers,
-                max_new_tokens,
-                context_capacity,
-                pinned_prefix_len,
-                sampling,
-                prefix_cache,
-            )
-        },
-    )
+    #[cfg(feature = "profile")]
+    {
+        ctx.profile_op(
+            "phase.resident_sample_decode",
+            ProfileDelta::default(),
+            || {
+                resident_sample_decode_inner(
+                    ctx,
+                    weights,
+                    harmony,
+                    prompt_tokens,
+                    layers,
+                    max_new_tokens,
+                    context_capacity,
+                    pinned_prefix_len,
+                    sampling,
+                    session,
+                )
+            },
+        )
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        resident_sample_decode_inner(
+            ctx,
+            weights,
+            harmony,
+            prompt_tokens,
+            layers,
+            max_new_tokens,
+            context_capacity,
+            pinned_prefix_len,
+            sampling,
+            session,
+        )
+    }
 }
 
 fn resident_sample_decode_inner(
@@ -344,8 +416,9 @@ fn resident_sample_decode_inner(
     context_capacity: usize,
     pinned_prefix_len: usize,
     sampling: SamplingConfig,
-    prefix_cache: &mut Option<ResidentPrefixCache>,
+    session: &mut Option<ResidentSession>,
 ) -> Result<GreedyDecodeProbeReport> {
+    #[cfg(feature = "profile")]
     let infer_started = Instant::now();
     if prompt_tokens.is_empty() {
         return Err(eyre!("resident decode needs at least one prompt token"));
@@ -381,16 +454,20 @@ fn resident_sample_decode_inner(
             "resident decode currently supports at most {MAX_RESIDENT_CONTEXT_TOKENS} context tokens, got {context_tokens}"
         ));
     }
-    #[cfg(feature = "metal-stage-profile")]
+    #[cfg(feature = "profile")]
     ctx.reset_stage_profile(context_tokens);
 
-    let mut scratch =
-        ResidentDecodeScratch::new(&ctx.platform, weights.lm_head.rows(), context_tokens)?;
-    let (mut kv_cache, mut current_is_a) = resident_prepare_prompt_state(
+    let session = ResidentSession::ensure(
+        session,
+        &ctx.platform,
+        weights.lm_head.rows(),
+        layers,
+        context_tokens,
+    )?;
+    let current_is_ping = resident_prepare_prompt_state(
         ctx,
         weights,
-        &mut scratch,
-        prefix_cache,
+        session,
         layers,
         prompt_tokens,
         context_tokens,
@@ -401,94 +478,63 @@ fn resident_sample_decode_inner(
     let mut generated = Vec::with_capacity(max_new_tokens);
     let mut stop_reason = StopReason::MaxGeneratedTokens;
     let mut sampler = Sampler::new(sampling.clone());
-    let mut hot_token_started: Option<Instant> = None;
-    let mut recorded_first_token = false;
 
-    for step in 0..max_new_tokens {
-        let output_position = prompt_tokens.len() + step;
-        let current_hidden = resident_current_hidden(&scratch, current_is_a);
-        let sampled = if sampler.needs_full_vocab() {
-            resident_lm_head_full_vocab_sample(
-                ctx,
-                harmony,
-                weights,
-                &mut scratch,
-                &current_hidden,
-                &mut sampler,
-                output_position,
-            )?
-        } else {
-            let candidates = resident_lm_head_topk(
-                ctx,
-                harmony,
-                weights,
-                &mut scratch,
-                &current_hidden,
-                sampler.candidate_count(),
-                output_position,
-            )?;
-            let sample_candidates = candidates
-                .iter()
-                .map(|token| SampleCandidate {
-                    token: token.token,
-                    logit: token.logit,
-                    probability: 0.0,
-                })
-                .collect::<Vec<_>>();
-            let sampled = sampler.choose(&sample_candidates)?;
-            let text = candidates
-                .iter()
-                .find(|token| token.token == sampled.token)
-                .map(|token| token.text.clone())
-                .unwrap_or(decode_token_text(harmony, sampled.token)?);
-            GreedyTokenReport {
-                token: sampled.token,
-                logit: sampled.logit,
-                text,
-            }
-        };
-        let token_id = sampled.token;
-        generated.push(sampled);
-        if !recorded_first_token {
-            ctx.record_profile(
-                "metric.cold_start_to_first_token",
-                ProfileDelta {
-                    wall: infer_started.elapsed(),
-                    ..ProfileDelta::default()
-                },
-            );
-            recorded_first_token = true;
-        }
-        if let Some(started) = hot_token_started.take() {
-            ctx.record_profile(
-                "metric.hot_token",
-                ProfileDelta {
-                    wall: started.elapsed(),
-                    ..ProfileDelta::default()
-                },
-            );
-        }
+    let first_output_position = prompt_tokens.len();
+    let current_hidden = resident_current_hidden(&session.scratch, current_is_ping);
+    let mut sampled = resident_sample_from_hidden(
+        ctx,
+        harmony,
+        weights,
+        &mut session.scratch,
+        &current_hidden,
+        &mut sampler,
+        first_output_position,
+    )?;
+    generated.push(sampled.clone());
+    #[cfg(feature = "profile")]
+    {
+        ctx.record_profile(
+            "metric.cold_start_to_first_token",
+            ProfileDelta {
+                wall: infer_started.elapsed(),
+                ..ProfileDelta::default()
+            },
+        );
+    }
 
-        if stop_tokens.contains(&token_id) {
+    let mut decode_position = first_output_position;
+    while generated.len() < max_new_tokens {
+        if stop_tokens.contains(&sampled.token) {
             stop_reason = StopReason::EndOfGeneration;
             break;
         }
-        if step + 1 == max_new_tokens {
-            break;
+
+        #[cfg(feature = "profile")]
+        let started = Instant::now();
+        let scored = resident_decode_and_score_next_token(
+            ctx,
+            harmony,
+            weights,
+            &mut session.scratch,
+            &mut session.kv_cache,
+            layers,
+            decode_position,
+            sampled.token,
+            &mut sampler,
+        )?;
+        #[cfg(feature = "profile")]
+        {
+            let wall = started.elapsed();
+            record_hot_token_metric(ctx, wall, scored.gpu_ns);
         }
 
-        let position = output_position;
-        let started = Instant::now();
-        current_is_a = resident_decode_token(
-            ctx,
-            weights,
-            &mut scratch,
-            &mut kv_cache,
-            layers,
-            position,
-            token_id,
-        )?;
-        hot_token_started = Some(started);
+        sampled = scored.token;
+        generated.push(sampled.clone());
+        decode_position += 1;
+    }
+
+    if stop_tokens.contains(&sampled.token) {
+        stop_reason = StopReason::EndOfGeneration;
     }
 
     let token_ids = generated
@@ -515,74 +561,80 @@ fn resident_sample_decode_inner(
 
 fn resident_hidden_pair(
     scratch: &ResidentDecodeScratch,
-    current_is_a: bool,
+    current_is_ping: bool,
 ) -> (platform::F32VectorBuffer, platform::F32VectorBuffer) {
-    if current_is_a {
-        (scratch.hidden_a.clone(), scratch.hidden_b.clone())
+    if current_is_ping {
+        (scratch.hidden_ping.clone(), scratch.hidden_pong.clone())
     } else {
-        (scratch.hidden_b.clone(), scratch.hidden_a.clone())
+        (scratch.hidden_pong.clone(), scratch.hidden_ping.clone())
     }
 }
 
 fn resident_prefill_hidden_pair(
     scratch: &ResidentDecodeScratch,
-    current_is_a: bool,
+    current_is_ping: bool,
 ) -> (platform::F32VectorBuffer, platform::F32VectorBuffer) {
-    if current_is_a {
+    if current_is_ping {
         (
-            scratch.prefill_hidden.clone(),
-            scratch.prefill_hidden_b.clone(),
+            scratch.prefill_hidden_ping.clone(),
+            scratch.prefill_hidden_pong.clone(),
         )
     } else {
         (
-            scratch.prefill_hidden_b.clone(),
-            scratch.prefill_hidden.clone(),
+            scratch.prefill_hidden_pong.clone(),
+            scratch.prefill_hidden_ping.clone(),
         )
     }
 }
 
 fn resident_current_hidden(
     scratch: &ResidentDecodeScratch,
-    current_is_a: bool,
+    current_is_ping: bool,
 ) -> platform::F32VectorBuffer {
-    if current_is_a {
-        scratch.hidden_a.clone()
+    if current_is_ping {
+        scratch.hidden_ping.clone()
     } else {
-        scratch.hidden_b.clone()
+        scratch.hidden_pong.clone()
     }
+}
+
+struct ResidentScoredToken {
+    token: GreedyTokenReport,
+    #[cfg(feature = "profile")]
+    gpu_ns: u128,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn resident_prepare_prompt_state(
     ctx: &MetalOracleContext,
     weights: &GptOssWeights,
-    scratch: &mut ResidentDecodeScratch,
-    prefix_cache: &mut Option<ResidentPrefixCache>,
+    session: &mut ResidentSession,
     layers: usize,
     prompt_tokens: &[u32],
     context_tokens: usize,
     pinned_prefix_len: usize,
-) -> Result<(ResidentGpuKvCache, bool)> {
+) -> Result<bool> {
     if pinned_prefix_len == 0 {
-        let mut kv_cache = ResidentGpuKvCache::new(&ctx.platform, layers, context_tokens)?;
-        resident_prefill_embeddings(ctx, weights, scratch, prompt_tokens)?;
-        let current_is_a = resident_prefill_layers(
+        session.prefix_cache = None;
+        resident_prefill_embeddings(ctx, weights, &session.scratch, prompt_tokens)?;
+        let current_is_ping = resident_prefill_layers(
             ctx,
             weights,
-            scratch,
-            &mut kv_cache,
+            &session.scratch,
+            &mut session.kv_cache,
             layers,
+            0,
             prompt_tokens.len(),
         )?;
-        return Ok((kv_cache, current_is_a));
+        return Ok(current_is_ping);
     }
 
     let prefix_tokens = &prompt_tokens[..pinned_prefix_len];
-    if let Some(cache) = prefix_cache.as_ref()
-        && cache.layers == layers
-        && cache.capacity >= context_tokens
-        && cache.tokens == prefix_tokens
-    {
+    let prefix_hit = session.prefix_cache.as_ref().is_some_and(|cache| {
+        cache.layers == layers && cache.capacity >= context_tokens && cache.tokens == prefix_tokens
+    });
+    if prefix_hit {
+        #[cfg(feature = "profile")]
         ctx.record_profile(
             "op.prefix_cache",
             ProfileDelta {
@@ -590,27 +642,30 @@ fn resident_prepare_prompt_state(
                 ..ProfileDelta::default()
             },
         );
-        let mut kv_cache = cache.kv_cache.clone();
         if prompt_tokens.len() == pinned_prefix_len {
-            resident_copy_hidden(ctx, &cache.final_hidden, &scratch.hidden_a)?;
-            return Ok((kv_cache, true));
+            let final_hidden = session
+                .prefix_cache
+                .as_ref()
+                .ok_or_else(|| eyre!("resident prefix cache disappeared after hit"))?
+                .final_hidden
+                .clone();
+            resident_copy_hidden(ctx, &final_hidden, &session.scratch.hidden_ping)?;
+            return Ok(true);
         }
 
-        let mut current_is_a = true;
-        for position in pinned_prefix_len..prompt_tokens.len() {
-            current_is_a = resident_decode_token(
-                ctx,
-                weights,
-                scratch,
-                &mut kv_cache,
-                layers,
-                position,
-                prompt_tokens[position],
-            )?;
-        }
-        return Ok((kv_cache, current_is_a));
+        let current_is_ping = resident_prefill_suffix(
+            ctx,
+            weights,
+            &mut session.scratch,
+            &mut session.kv_cache,
+            layers,
+            pinned_prefix_len,
+            &prompt_tokens[pinned_prefix_len..],
+        )?;
+        return Ok(current_is_ping);
     }
 
+    #[cfg(feature = "profile")]
     ctx.record_profile(
         "op.prefix_cache",
         ProfileDelta {
@@ -618,45 +673,42 @@ fn resident_prepare_prompt_state(
             ..ProfileDelta::default()
         },
     );
-    let mut kv_cache = ResidentGpuKvCache::new(&ctx.platform, layers, context_tokens)?;
-    resident_prefill_embeddings(ctx, weights, scratch, prefix_tokens)?;
-    let current_is_a = resident_prefill_layers(
+    session.prefix_cache = None;
+    resident_prefill_embeddings(ctx, weights, &session.scratch, prefix_tokens)?;
+    let current_is_ping = resident_prefill_layers(
         ctx,
         weights,
-        scratch,
-        &mut kv_cache,
+        &session.scratch,
+        &mut session.kv_cache,
         layers,
+        0,
         pinned_prefix_len,
     )?;
     let final_hidden = ctx.platform.alloc_f32_vector(HIDDEN_SIZE)?;
-    let current_hidden = resident_current_hidden(scratch, current_is_a);
+    let current_hidden = resident_current_hidden(&session.scratch, current_is_ping);
     resident_copy_hidden(ctx, &current_hidden, &final_hidden)?;
 
-    *prefix_cache = Some(ResidentPrefixCache {
+    session.prefix_cache = Some(ResidentPrefixCache {
         tokens: prefix_tokens.to_vec(),
         layers,
         capacity: context_tokens,
-        kv_cache: kv_cache.clone(),
         final_hidden,
     });
 
     if prompt_tokens.len() == pinned_prefix_len {
-        return Ok((kv_cache, current_is_a));
+        return Ok(current_is_ping);
     }
 
-    let mut current_is_a = current_is_a;
-    for position in pinned_prefix_len..prompt_tokens.len() {
-        current_is_a = resident_decode_token(
-            ctx,
-            weights,
-            scratch,
-            &mut kv_cache,
-            layers,
-            position,
-            prompt_tokens[position],
-        )?;
-    }
-    Ok((kv_cache, current_is_a))
+    let current_is_ping = resident_prefill_suffix(
+        ctx,
+        weights,
+        &mut session.scratch,
+        &mut session.kv_cache,
+        layers,
+        pinned_prefix_len,
+        &prompt_tokens[pinned_prefix_len..],
+    )?;
+    Ok(current_is_ping)
 }
 
 fn resident_copy_hidden(
@@ -681,11 +733,11 @@ fn resident_decode_token(
     token: u32,
 ) -> Result<bool> {
     let batch = ctx.platform.begin_batch();
-    batch.embedding_lookup_bf16_into(&weights.embed, token as usize, &scratch.hidden_a)?;
-    let mut current_is_a = true;
+    batch.embedding_lookup_bf16_into(&weights.embed, token as usize, &scratch.hidden_ping)?;
+    let mut current_is_ping = true;
 
     for layer in 0..layers {
-        let (input, output) = resident_hidden_pair(scratch, current_is_a);
+        let (input, output) = resident_hidden_pair(scratch, current_is_ping);
         let layer_weights = weights.layer(layer)?;
         resident_decode_layer(
             &batch,
@@ -697,11 +749,172 @@ fn resident_decode_token(
             &input,
             &output,
         )?;
-        current_is_a = !current_is_a;
+        current_is_ping = !current_is_ping;
     }
 
     finish_resident_batch(ctx, batch, stage_marker(position, TokenStage::Token));
-    Ok(current_is_a)
+    Ok(current_is_ping)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resident_prefill_suffix(
+    ctx: &MetalOracleContext,
+    weights: &GptOssWeights,
+    scratch: &mut ResidentDecodeScratch,
+    kv_cache: &mut ResidentGpuKvCache,
+    layers: usize,
+    start_position: usize,
+    suffix_tokens: &[u32],
+) -> Result<bool> {
+    if suffix_tokens.is_empty() {
+        return Err(eyre!("resident suffix prefill needs at least one token"));
+    }
+    let end_position = start_position
+        .checked_add(suffix_tokens.len())
+        .ok_or_else(|| eyre!("resident suffix prefill position overflow"))?;
+    if end_position > kv_cache.capacity {
+        return Err(eyre!(
+            "resident suffix prefill end position {end_position} exceeds KV capacity {}",
+            kv_cache.capacity
+        ));
+    }
+
+    if suffix_tokens.len() <= PREFILL_SUFFIX_DECODE_THRESHOLD {
+        let mut current_is_ping = true;
+        for (offset, token) in suffix_tokens.iter().enumerate() {
+            current_is_ping = resident_decode_token(
+                ctx,
+                weights,
+                scratch,
+                kv_cache,
+                layers,
+                start_position + offset,
+                *token,
+            )?;
+        }
+        return Ok(current_is_ping);
+    }
+
+    resident_prefill_embeddings(ctx, weights, scratch, suffix_tokens)?;
+    resident_prefill_layers(
+        ctx,
+        weights,
+        scratch,
+        kv_cache,
+        layers,
+        start_position,
+        suffix_tokens.len(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resident_decode_and_score_next_token(
+    ctx: &MetalOracleContext,
+    harmony: &HarmonyAdapter,
+    weights: &GptOssWeights,
+    scratch: &mut ResidentDecodeScratch,
+    kv_cache: &mut ResidentGpuKvCache,
+    layers: usize,
+    position: usize,
+    token: u32,
+    sampler: &mut Sampler,
+) -> Result<ResidentScoredToken> {
+    let output_position = position + 1;
+    let batch = ctx.platform.begin_batch();
+    batch.embedding_lookup_bf16_into(&weights.embed, token as usize, &scratch.hidden_ping)?;
+    let mut current_is_ping = true;
+
+    for layer in 0..layers {
+        let (input, output) = resident_hidden_pair(scratch, current_is_ping);
+        let layer_weights = weights.layer(layer)?;
+        resident_decode_layer(
+            &batch,
+            scratch,
+            kv_cache,
+            layer_weights,
+            layer,
+            position,
+            &input,
+            &output,
+        )?;
+        current_is_ping = !current_is_ping;
+    }
+
+    let hidden = resident_current_hidden(scratch, current_is_ping);
+    batch.rms_norm_into(&hidden, &weights.final_norm, &scratch.final_hidden)?;
+    if sampler.needs_full_vocab() {
+        batch.bf16_matrix_logits_into(
+            &weights.lm_head,
+            &scratch.final_hidden,
+            &scratch.lm_logits,
+        )?;
+    } else {
+        let k = sampler.candidate_count();
+        if k == 1 {
+            batch.bf16_matrix_top1_into(
+                &weights.lm_head,
+                &scratch.final_hidden,
+                &scratch.lm_logits,
+                &scratch.lm_top1_block_indices,
+                &scratch.lm_top1_block_values,
+                &scratch.lm_top_indices,
+                &scratch.lm_top_values,
+            )?;
+        } else {
+            batch.bf16_matrix_topk_into(
+                &weights.lm_head,
+                &scratch.final_hidden,
+                &scratch.lm_logits,
+                &scratch.lm_top_indices,
+                &scratch.lm_top_values,
+                k,
+            )?;
+        }
+    }
+    #[cfg(feature = "profile")]
+    let gpu_ns = finish_resident_batch(
+        ctx,
+        batch,
+        stage_marker(output_position, TokenStage::HotToken),
+    );
+    #[cfg(not(feature = "profile"))]
+    finish_resident_batch(
+        ctx,
+        batch,
+        stage_marker(output_position, TokenStage::HotToken),
+    );
+
+    let token = if sampler.needs_full_vocab() {
+        #[cfg(feature = "profile")]
+        ctx.record_profile(
+            "op.lm_head.full_vocab_readback",
+            ProfileDelta {
+                readback_bytes: weights.lm_head.rows() * size_of::<f32>(),
+                ..ProfileDelta::default()
+            },
+        );
+        let logits = ctx.platform.read_f32_vector(&scratch.lm_logits);
+        let sampled = sampler.choose_from_logits(&logits)?;
+        GreedyTokenReport {
+            token: sampled.token,
+            logit: sampled.logit,
+            text: decode_token_text(harmony, sampled.token)?,
+        }
+    } else {
+        resident_sample_from_topk_buffers(
+            ctx,
+            harmony,
+            scratch,
+            sampler.candidate_count(),
+            sampler,
+        )?
+    };
+
+    Ok(ResidentScoredToken {
+        token,
+        #[cfg(feature = "profile")]
+        gpu_ns,
+    })
 }
 
 fn resident_prefill_embeddings(
@@ -721,6 +934,7 @@ fn resident_prefill_embeddings(
     }
 
     let tokens = ctx.platform.upload_u32_buffer(prompt_tokens)?;
+    #[cfg(feature = "profile")]
     ctx.record_profile(
         "op.input.prompt_tokens",
         ProfileDelta {
@@ -734,7 +948,7 @@ fn resident_prefill_embeddings(
         &weights.embed,
         &tokens,
         prompt_tokens.len(),
-        &scratch.prefill_hidden,
+        &scratch.prefill_hidden_ping,
     )?;
     finish_resident_batch(ctx, batch, no_stage_marker());
     Ok(())
@@ -746,12 +960,13 @@ fn resident_prefill_layers(
     scratch: &ResidentDecodeScratch,
     kv_cache: &mut ResidentGpuKvCache,
     layers: usize,
-    prompt_len: usize,
+    start_position: usize,
+    token_count: usize,
 ) -> Result<bool> {
-    let mut current_is_a = true;
+    let mut current_is_ping = true;
 
     for layer in 0..layers {
-        let (input, output) = resident_prefill_hidden_pair(scratch, current_is_a);
+        let (input, output) = resident_prefill_hidden_pair(scratch, current_is_ping);
         let layer_weights = weights.layer(layer)?;
         resident_prefill_layer(
             ctx,
@@ -759,24 +974,25 @@ fn resident_prefill_layers(
             kv_cache,
             layer_weights,
             layer,
-            prompt_len,
+            start_position,
+            token_count,
             &input,
             &output,
         )?;
-        current_is_a = !current_is_a;
+        current_is_ping = !current_is_ping;
     }
 
-    let final_prompt_hidden = if current_is_a {
-        scratch.prefill_hidden.clone()
+    let final_prompt_hidden = if current_is_ping {
+        scratch.prefill_hidden_ping.clone()
     } else {
-        scratch.prefill_hidden_b.clone()
+        scratch.prefill_hidden_pong.clone()
     };
     let batch = ctx.platform.begin_batch();
     batch.read_f32_slot_into(
         &final_prompt_hidden,
-        prompt_len - 1,
+        token_count - 1,
         HIDDEN_SIZE,
-        &scratch.hidden_a,
+        &scratch.hidden_ping,
     )?;
     finish_resident_batch(ctx, batch, no_stage_marker());
     Ok(true)
@@ -788,13 +1004,17 @@ fn resident_prefill_layer(
     kv_cache: &mut ResidentGpuKvCache,
     weights: &GptOssLayerWeights,
     layer: usize,
-    prompt_len: usize,
+    start_position: usize,
+    token_count: usize,
     input: &platform::F32VectorBuffer,
     output: &platform::F32VectorBuffer,
 ) -> Result<()> {
-    if prompt_len > kv_cache.capacity {
+    let end_position = start_position
+        .checked_add(token_count)
+        .ok_or_else(|| eyre!("resident prefill position overflow"))?;
+    if end_position > kv_cache.capacity {
         return Err(eyre!(
-            "resident prefill prompt length {prompt_len} exceeds KV capacity {}",
+            "resident prefill end position {end_position} exceeds KV capacity {}",
             kv_cache.capacity
         ));
     }
@@ -805,7 +1025,7 @@ fn resident_prefill_layer(
         input,
         &weights.input_norm,
         &scratch.prefill_normed,
-        prompt_len,
+        token_count,
         HIDDEN_SIZE,
     )?;
     batch.bf16_matrix_matvec_batch_into(
@@ -813,72 +1033,85 @@ fn resident_prefill_layer(
         &scratch.prefill_normed,
         &weights.attn.q.bias,
         &scratch.prefill_q,
-        prompt_len,
+        token_count,
     )?;
     batch.bf16_matrix_matvec_batch_into(
         &weights.attn.k.weight,
         &scratch.prefill_normed,
         &weights.attn.k.bias,
         &scratch.prefill_k,
-        prompt_len,
+        token_count,
     )?;
     batch.bf16_matrix_matvec_batch_into(
         &weights.attn.v.weight,
         &scratch.prefill_normed,
         &weights.attn.v.bias,
         &scratch.prefill_v,
-        prompt_len,
+        token_count,
     )?;
     batch.rope_batch_into(
         &scratch.prefill_q,
         &scratch.prefill_q_rope,
         Q_HEADS,
-        0,
-        prompt_len,
+        start_position,
+        token_count,
     )?;
     batch.rope_batch_into(
         &scratch.prefill_k,
         &scratch.prefill_k_rope,
         KV_HEADS,
-        0,
-        prompt_len,
+        start_position,
+        token_count,
     )?;
     batch.write_f32_slots_batch_into(
         &scratch.prefill_k_rope,
         &layer_cache.k,
-        0,
-        prompt_len,
+        start_position,
+        token_count,
         KV_VALUES,
     )?;
     batch.write_f32_slots_batch_into(
         &scratch.prefill_v,
         &layer_cache.v,
-        0,
-        prompt_len,
+        start_position,
+        token_count,
         KV_VALUES,
     )?;
-    batch.sequence_attention_into(
-        layer,
-        &scratch.prefill_q_rope,
-        &scratch.prefill_k_rope,
-        &scratch.prefill_v,
-        &weights.attn.sinks,
-        &scratch.prefill_attn,
-        prompt_len,
-    )?;
+    if start_position == 0 {
+        batch.sequence_attention_into(
+            layer,
+            &scratch.prefill_q_rope,
+            &scratch.prefill_k_rope,
+            &scratch.prefill_v,
+            &weights.attn.sinks,
+            &scratch.prefill_attn,
+            token_count,
+        )?;
+    } else {
+        batch.suffix_sequence_attention_into(
+            layer,
+            start_position,
+            token_count,
+            &scratch.prefill_q_rope,
+            &layer_cache.k,
+            &layer_cache.v,
+            &weights.attn.sinks,
+            &scratch.prefill_attn,
+        )?;
+    }
     batch.bf16_matrix_matvec_batch_into(
         &weights.attn.o.weight,
         &scratch.prefill_attn,
         &weights.attn.o.bias,
         &scratch.prefill_projected,
-        prompt_len,
+        token_count,
     )?;
     batch.vector_add_into(input, &scratch.prefill_projected, &scratch.prefill_residual)?;
     batch.rms_norm_batch_into(
         &scratch.prefill_residual,
         &weights.post_attn_norm,
         &scratch.prefill_router_input,
-        prompt_len,
+        token_count,
         HIDDEN_SIZE,
     )?;
     batch.bf16_matrix_matvec_batch_into(
@@ -886,23 +1119,23 @@ fn resident_prefill_layer(
         &scratch.prefill_router_input,
         &weights.sparse_mlp.router.bias,
         &scratch.prefill_router_logits,
-        prompt_len,
+        token_count,
     )?;
     batch.top4_softmax_batch_into(
         &scratch.prefill_router_logits,
         &scratch.prefill_router_indices,
         &scratch.prefill_router_selected_logits,
         &scratch.prefill_router_weights,
-        prompt_len,
+        token_count,
         32,
     )?;
 
-    for row_offset in (0..prompt_len).step_by(PREFILL_MOE_CHUNK_TOKENS) {
-        let rows = (prompt_len - row_offset).min(PREFILL_MOE_CHUNK_TOKENS);
+    for row_offset in (0..token_count).step_by(PREFILL_MOE_CHUNK_TOKENS) {
+        let rows = (token_count - row_offset).min(PREFILL_MOE_CHUNK_TOKENS);
         batch.mxfp4_top4_gate_swiglu_batch_into(
-            &weights.sparse_mlp.experts.gate_up_blocks,
-            &weights.sparse_mlp.experts.gate_up_scales,
-            &weights.sparse_mlp.experts.gate_up_bias,
+            &weights.sparse_mlp.experts_carousel.gate_up_blocks,
+            &weights.sparse_mlp.experts_carousel.gate_up_scales,
+            &weights.sparse_mlp.experts_carousel.gate_up_bias,
             &scratch.prefill_router_input,
             &scratch.prefill_router_indices,
             &scratch.prefill_expert_acts_packed,
@@ -910,9 +1143,9 @@ fn resident_prefill_layer(
             rows,
         )?;
         batch.mxfp4_top4_down_weighted_batch_into(
-            &weights.sparse_mlp.experts.down_blocks,
-            &weights.sparse_mlp.experts.down_scales,
-            &weights.sparse_mlp.experts.down_bias,
+            &weights.sparse_mlp.experts_carousel.down_blocks,
+            &weights.sparse_mlp.experts_carousel.down_scales,
+            &weights.sparse_mlp.experts_carousel.down_bias,
             &scratch.prefill_expert_acts_packed,
             &scratch.prefill_router_indices,
             &scratch.prefill_router_weights,
@@ -925,6 +1158,89 @@ fn resident_prefill_layer(
 
     finish_resident_batch(ctx, batch, no_stage_marker());
     Ok(())
+}
+
+fn resident_sample_from_hidden(
+    ctx: &MetalOracleContext,
+    harmony: &HarmonyAdapter,
+    weights: &GptOssWeights,
+    scratch: &mut ResidentDecodeScratch,
+    hidden: &platform::F32VectorBuffer,
+    sampler: &mut Sampler,
+    output_position: usize,
+) -> Result<GreedyTokenReport> {
+    if sampler.needs_full_vocab() {
+        resident_lm_head_full_vocab_sample(
+            ctx,
+            harmony,
+            weights,
+            scratch,
+            hidden,
+            sampler,
+            output_position,
+        )
+    } else {
+        let candidates = resident_lm_head_topk(
+            ctx,
+            harmony,
+            weights,
+            scratch,
+            hidden,
+            sampler.candidate_count(),
+            output_position,
+        )?;
+        resident_sample_from_candidates(harmony, &candidates, sampler)
+    }
+}
+
+fn resident_sample_from_topk_buffers(
+    ctx: &MetalOracleContext,
+    harmony: &HarmonyAdapter,
+    scratch: &ResidentDecodeScratch,
+    k: usize,
+    sampler: &mut Sampler,
+) -> Result<GreedyTokenReport> {
+    let indices = ctx.platform.read_u32_buffer(&scratch.lm_top_indices);
+    let values = ctx.platform.read_f32_vector(&scratch.lm_top_values);
+    let candidates = indices
+        .into_iter()
+        .zip(values)
+        .take(k)
+        .map(|(token, logit)| {
+            Ok(GreedyTokenReport {
+                token,
+                logit,
+                text: decode_token_text(harmony, token)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    resident_sample_from_candidates(harmony, &candidates, sampler)
+}
+
+fn resident_sample_from_candidates(
+    harmony: &HarmonyAdapter,
+    candidates: &[GreedyTokenReport],
+    sampler: &mut Sampler,
+) -> Result<GreedyTokenReport> {
+    let sample_candidates = candidates
+        .iter()
+        .map(|token| SampleCandidate {
+            token: token.token,
+            logit: token.logit,
+            probability: 0.0,
+        })
+        .collect::<Vec<_>>();
+    let sampled = sampler.choose(&sample_candidates)?;
+    let text = candidates
+        .iter()
+        .find(|token| token.token == sampled.token)
+        .map(|token| token.text.clone())
+        .unwrap_or(decode_token_text(harmony, sampled.token)?);
+    Ok(GreedyTokenReport {
+        token: sampled.token,
+        logit: sampled.logit,
+        text,
+    })
 }
 
 fn resident_lm_head_topk(
@@ -998,6 +1314,7 @@ fn resident_lm_head_full_vocab_sample(
         stage_marker(output_position, TokenStage::LmHead),
     );
 
+    #[cfg(feature = "profile")]
     ctx.record_profile(
         "op.lm_head.full_vocab_readback",
         ProfileDelta {
@@ -1033,22 +1350,16 @@ fn resident_decode_layer(
 
     let layer_cache = kv_cache.layer(layer)?;
     batch.rms_norm_into(input, &weights.input_norm, &scratch.normed)?;
-    batch.bf16_matrix_matvec_into(
+    batch.bf16_qkv_matvec_into(
         &weights.attn.q.weight,
-        &scratch.normed,
-        &weights.attn.q.bias,
-        &scratch.q,
-    )?;
-    batch.bf16_matrix_matvec_into(
         &weights.attn.k.weight,
-        &scratch.normed,
-        &weights.attn.k.bias,
-        &scratch.k,
-    )?;
-    batch.bf16_matrix_matvec_into(
         &weights.attn.v.weight,
         &scratch.normed,
+        &weights.attn.q.bias,
+        &weights.attn.k.bias,
         &weights.attn.v.bias,
+        &scratch.q,
+        &scratch.k,
         &scratch.v,
     )?;
     batch.rope_row_into(&scratch.q, &scratch.q_rope, Q_HEADS, position)?;
@@ -1092,17 +1403,17 @@ fn resident_decode_layer(
     )?;
 
     batch.mxfp4_top4_gate_swiglu_into(
-        &weights.sparse_mlp.experts.gate_up_blocks,
-        &weights.sparse_mlp.experts.gate_up_scales,
-        &weights.sparse_mlp.experts.gate_up_bias,
+        &weights.sparse_mlp.experts_carousel.gate_up_blocks,
+        &weights.sparse_mlp.experts_carousel.gate_up_scales,
+        &weights.sparse_mlp.experts_carousel.gate_up_bias,
         &scratch.router_input,
         &scratch.router_indices,
         &scratch.expert_acts_packed,
     )?;
     batch.mxfp4_top4_down_weighted_into(
-        &weights.sparse_mlp.experts.down_blocks,
-        &weights.sparse_mlp.experts.down_scales,
-        &weights.sparse_mlp.experts.down_bias,
+        &weights.sparse_mlp.experts_carousel.down_blocks,
+        &weights.sparse_mlp.experts_carousel.down_scales,
+        &weights.sparse_mlp.experts_carousel.down_bias,
         &scratch.expert_acts_packed,
         &scratch.router_indices,
         &scratch.router_weights,
@@ -1117,13 +1428,14 @@ fn finish_resident_batch(
     ctx: &MetalOracleContext,
     batch: platform::MetalBatch<'_>,
     stage: StageMarker,
-) {
+) -> u128 {
     let gpu_ns = batch.finish();
-    #[cfg(not(feature = "metal-stage-profile"))]
+    #[cfg(not(feature = "profile"))]
     {
+        let _ = ctx;
         let _ = stage;
-        let _ = gpu_ns;
     }
+    #[cfg(feature = "profile")]
     ctx.record_profile(
         "phase.resident_sample_decode",
         ProfileDelta {
@@ -1131,17 +1443,43 @@ fn finish_resident_batch(
             ..ProfileDelta::default()
         },
     );
-    #[cfg(feature = "metal-stage-profile")]
+    #[cfg(feature = "profile")]
     if let Some((token_position, stage)) = stage {
         ctx.record_token_stage(token_position, stage, gpu_ns);
     }
+    gpu_ns
 }
 
 fn no_stage_marker() -> StageMarker {
-    #[cfg(feature = "metal-stage-profile")]
+    #[cfg(feature = "profile")]
     {
         None
     }
-    #[cfg(not(feature = "metal-stage-profile"))]
+    #[cfg(not(feature = "profile"))]
     {}
+}
+
+#[cfg(feature = "profile")]
+fn record_hot_token_metric(ctx: &MetalOracleContext, wall: Duration, gpu_ns: u128) {
+    ctx.record_profile(
+        "metric.hot_token",
+        ProfileDelta {
+            wall,
+            gpu_ns,
+            ..ProfileDelta::default()
+        },
+    );
+    let gap_ns = wall.as_nanos().saturating_sub(gpu_ns);
+    ctx.record_profile(
+        "metric.hot_token_gap",
+        ProfileDelta {
+            wall: duration_from_ns(gap_ns),
+            ..ProfileDelta::default()
+        },
+    );
+}
+
+#[cfg(feature = "profile")]
+fn duration_from_ns(ns: u128) -> Duration {
+    Duration::from_nanos(ns.min(u64::MAX as u128) as u64)
 }

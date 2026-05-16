@@ -4,16 +4,21 @@ use inference_engine::harmony_adapter::{HarmonyAdapter, Message, Role};
 use inference_engine::{
     EngineRequest, GenerationEvent, GenerationLimits, PromptPlan, SamplingConfig, StopReason,
 };
+#[cfg(feature = "profile")]
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
     let args = Args::parse()?;
+    #[cfg(feature = "profile")]
     let started = Instant::now();
     let harmony = HarmonyAdapter::gpt_oss()?;
+    #[cfg(feature = "profile")]
     let harmony_load = started.elapsed();
+    #[cfg(feature = "profile")]
     let started = Instant::now();
     let messages = [Message::from((Role::User, args.prompt.clone()))];
     let tokens = harmony.render_completion_tokens(&messages)?;
+    #[cfg(feature = "profile")]
     let tokenize = started.elapsed();
     let context_capacity = tokens
         .len()
@@ -26,8 +31,10 @@ fn main() -> Result<()> {
             tokens.len()
         ));
     }
+    #[cfg(feature = "profile")]
     let started = Instant::now();
     let engine = MetalEngine::load_canonical_with_layers(args.layers)?;
+    #[cfg(feature = "profile")]
     let load = started.elapsed();
     let request = EngineRequest {
         prompt: PromptPlan {
@@ -45,14 +52,20 @@ fn main() -> Result<()> {
     };
 
     let mut events = Vec::new();
+    #[cfg(feature = "profile")]
     let mut profile = None;
     for iteration in 0..args.repeat {
         let is_final = iteration + 1 == args.repeat;
-        if args.profile && is_final {
+        #[cfg(feature = "profile")]
+        if is_final {
             let (next_events, next_profile) = engine.generate_profiled(request.clone())?;
             events = next_events;
             profile = Some(next_profile);
-        } else {
+            continue;
+        }
+
+        let _ = is_final;
+        {
             events = engine.generate(request.clone())?;
         }
     }
@@ -76,12 +89,15 @@ fn main() -> Result<()> {
         stop_reason.unwrap_or(StopReason::Cancelled)
     );
     println!("\n{text}");
-    if let Some(profile) = profile {
-        println!("\nsetup profile:");
-        println!("- harmony load: {}", format_duration(harmony_load));
-        println!("- tokenize/render: {}", format_duration(tokenize));
-        println!("- engine load: {}", format_duration(load));
-        print!("{}", profile.render_for_cli());
+    #[cfg(feature = "profile")]
+    {
+        if let Some(profile) = profile {
+            println!("\nsetup profile:");
+            println!("- harmony load: {}", format_duration(harmony_load));
+            println!("- tokenize/render: {}", format_duration(tokenize));
+            println!("- engine load: {}", format_duration(load));
+            print!("{}", profile.render_for_cli());
+        }
     }
     Ok(())
 }
@@ -92,7 +108,6 @@ struct Args {
     max_new_tokens: usize,
     max_output_bytes: usize,
     sampling: SamplingConfig,
-    profile: bool,
     pinned_prefix_len: usize,
     repeat: usize,
 }
@@ -107,7 +122,6 @@ impl Args {
             temperature: 0.0,
             ..SamplingConfig::default()
         };
-        let mut profile = false;
         let mut pinned_prefix_len = 0usize;
         let mut repeat = 1usize;
 
@@ -173,7 +187,6 @@ impl Args {
                         .ok_or_else(|| eyre!("--repeat requires a value"))?;
                     repeat = value.parse()?;
                 }
-                "--profile" => profile = true,
                 _ => return Err(eyre!("unknown argument {arg}")),
             }
         }
@@ -200,13 +213,13 @@ impl Args {
             max_new_tokens,
             max_output_bytes,
             sampling,
-            profile,
             pinned_prefix_len,
             repeat,
         })
     }
 }
 
+#[cfg(feature = "profile")]
 fn format_duration(duration: Duration) -> String {
     let ns = duration.as_nanos();
     if ns >= 1_000_000_000 {

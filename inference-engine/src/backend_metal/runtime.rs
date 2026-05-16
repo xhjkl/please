@@ -25,8 +25,8 @@ pub(crate) mod platform {
     use std::ffi::c_void;
     use std::mem::size_of_val;
     use std::ptr::NonNull;
+    #[cfg(feature = "profile")]
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     const THREADS_PER_GROUP: u64 = 256;
 
@@ -50,7 +50,7 @@ pub(crate) mod platform {
     pub struct MetalContext {
         device: Retained<MetalDevice>,
         queue: Retained<MetalCommandQueue>,
-        profile_enabled: AtomicBool,
+        #[cfg(feature = "profile")]
         gpu_time_ns: Mutex<u128>,
         partial_sum_squares: Retained<MetalComputePipelineState>,
         apply_rms_norm: Retained<MetalComputePipelineState>,
@@ -58,6 +58,7 @@ pub(crate) mod platform {
         rms_norm_batch: Retained<MetalComputePipelineState>,
         bf16_matvec: Retained<MetalComputePipelineState>,
         bf16_matvec_tiled4: Retained<MetalComputePipelineState>,
+        bf16_qkv_matvec_tiled4: Retained<MetalComputePipelineState>,
         bf16_matvec_batch: Retained<MetalComputePipelineState>,
         bf16_matvec_batch_tiled4: Retained<MetalComputePipelineState>,
         bf16_matvec_logits: Retained<MetalComputePipelineState>,
@@ -70,6 +71,7 @@ pub(crate) mod platform {
         rope_batch: Retained<MetalComputePipelineState>,
         single_token_attention: Retained<MetalComputePipelineState>,
         sequence_attention: Retained<MetalComputePipelineState>,
+        suffix_sequence_attention: Retained<MetalComputePipelineState>,
         kv_cache_decode_attention: Retained<MetalComputePipelineState>,
         write_f32_slot: Retained<MetalComputePipelineState>,
         write_f32_slots_batch: Retained<MetalComputePipelineState>,
@@ -136,7 +138,7 @@ pub(crate) mod platform {
                 .map_err(|error| eyre!("compile Metal kernels: {error:?}"))?;
 
             Ok(Self {
-                profile_enabled: AtomicBool::new(false),
+                #[cfg(feature = "profile")]
                 gpu_time_ns: Mutex::new(0),
                 partial_sum_squares: pipeline(&device, &library, "partial_sum_squares")?,
                 apply_rms_norm: pipeline(&device, &library, "apply_rms_norm")?,
@@ -148,6 +150,7 @@ pub(crate) mod platform {
                 rms_norm_batch: pipeline(&device, &library, "rms_norm_batch")?,
                 bf16_matvec: pipeline(&device, &library, "bf16_matvec")?,
                 bf16_matvec_tiled4: pipeline(&device, &library, "bf16_matvec_tiled4")?,
+                bf16_qkv_matvec_tiled4: pipeline(&device, &library, "bf16_qkv_matvec_tiled4")?,
                 bf16_matvec_batch: pipeline(&device, &library, "bf16_matvec_batch")?,
                 bf16_matvec_batch_tiled4: pipeline(&device, &library, "bf16_matvec_batch_tiled4")?,
                 bf16_matvec_logits: pipeline(&device, &library, "bf16_matvec_logits")?,
@@ -164,6 +167,11 @@ pub(crate) mod platform {
                 rope_batch: pipeline(&device, &library, "rope_batch")?,
                 single_token_attention: pipeline(&device, &library, "single_token_attention")?,
                 sequence_attention: pipeline(&device, &library, "sequence_attention")?,
+                suffix_sequence_attention: pipeline(
+                    &device,
+                    &library,
+                    "suffix_sequence_attention",
+                )?,
                 kv_cache_decode_attention: pipeline(
                     &device,
                     &library,
@@ -195,6 +203,7 @@ pub(crate) mod platform {
             })
         }
 
+        #[cfg(feature = "profile")]
         pub fn take_gpu_time_ns(&self) -> u128 {
             let mut gpu_time_ns = self.gpu_time_ns.lock().unwrap();
             let value = *gpu_time_ns;
@@ -202,21 +211,21 @@ pub(crate) mod platform {
             value
         }
 
-        pub fn set_profile_enabled(&self, enabled: bool) {
-            self.profile_enabled.store(enabled, Ordering::Relaxed);
-        }
-
         fn finish_command_buffer(&self, command_buffer: &MetalCommandBuffer) -> u128 {
             command_buffer.commit();
             command_buffer.wait_until_completed();
-            if !self.profile_enabled.load(Ordering::Relaxed) {
-                return 0;
+            #[cfg(feature = "profile")]
+            {
+                let gpu_time_ns = command_buffer_gpu_time_ns(command_buffer);
+                if gpu_time_ns > 0 {
+                    *self.gpu_time_ns.lock().unwrap() += gpu_time_ns;
+                }
+                return gpu_time_ns;
             }
-            let gpu_time_ns = command_buffer_gpu_time_ns(command_buffer);
-            if gpu_time_ns > 0 {
-                *self.gpu_time_ns.lock().unwrap() += gpu_time_ns;
+            #[cfg(not(feature = "profile"))]
+            {
+                0
             }
-            gpu_time_ns
         }
 
         pub fn begin_batch(&self) -> MetalBatch<'_> {
@@ -1435,6 +1444,105 @@ pub(crate) mod platform {
             Ok(())
         }
 
+        #[allow(clippy::too_many_arguments)]
+        pub fn bf16_qkv_matvec_into(
+            &self,
+            q_weight: &Bf16MatrixBuffer,
+            k_weight: &Bf16MatrixBuffer,
+            v_weight: &Bf16MatrixBuffer,
+            input: &F32VectorBuffer,
+            q_bias: &F32VectorBuffer,
+            k_bias: &F32VectorBuffer,
+            v_bias: &F32VectorBuffer,
+            q_out: &F32VectorBuffer,
+            k_out: &F32VectorBuffer,
+            v_out: &F32VectorBuffer,
+        ) -> Result<()> {
+            if q_weight.row_tile != 4 || k_weight.row_tile != 4 || v_weight.row_tile != 4 {
+                return Err(eyre!(
+                    "fused QKV matvec currently expects tiled4 BF16 weights"
+                ));
+            }
+            if q_weight.cols != input.len
+                || k_weight.cols != input.len
+                || v_weight.cols != input.len
+            {
+                return Err(eyre!(
+                    "fused QKV input length mismatch: input {}, q cols {}, k cols {}, v cols {}",
+                    input.len,
+                    q_weight.cols,
+                    k_weight.cols,
+                    v_weight.cols
+                ));
+            }
+            if k_weight.rows != v_weight.rows {
+                return Err(eyre!(
+                    "fused QKV expects matching K/V rows, got {} and {}",
+                    k_weight.rows,
+                    v_weight.rows
+                ));
+            }
+            if q_weight.rows % 4 != 0 || k_weight.rows % 4 != 0 {
+                return Err(eyre!(
+                    "fused QKV tiled weights need row counts divisible by 4"
+                ));
+            }
+            if q_bias.len != q_weight.rows || q_out.len != q_weight.rows {
+                return Err(eyre!(
+                    "fused QKV q row mismatch: bias {}, out {}, rows {}",
+                    q_bias.len,
+                    q_out.len,
+                    q_weight.rows
+                ));
+            }
+            if k_bias.len != k_weight.rows || k_out.len != k_weight.rows {
+                return Err(eyre!(
+                    "fused QKV k row mismatch: bias {}, out {}, rows {}",
+                    k_bias.len,
+                    k_out.len,
+                    k_weight.rows
+                ));
+            }
+            if v_bias.len != v_weight.rows || v_out.len != v_weight.rows {
+                return Err(eyre!(
+                    "fused QKV v row mismatch: bias {}, out {}, rows {}",
+                    v_bias.len,
+                    v_out.len,
+                    v_weight.rows
+                ));
+            }
+
+            let q_tiles = (q_weight.rows / 4) as u32;
+            let kv_tiles = (k_weight.rows / 4) as u32;
+            let cols = input.len as u32;
+            let total_tiles = q_tiles + kv_tiles + kv_tiles;
+            let q_tiles_buffer = buffer_with_data(&self.context.device, &[q_tiles]);
+            let kv_tiles_buffer = buffer_with_data(&self.context.device, &[kv_tiles]);
+            let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.bf16_qkv_matvec_tiled4);
+            encoder.set_buffer(0, Some(&q_weight.buffer), 0);
+            encoder.set_buffer(1, Some(&k_weight.buffer), 0);
+            encoder.set_buffer(2, Some(&v_weight.buffer), 0);
+            encoder.set_buffer(3, Some(&input.buffer), 0);
+            encoder.set_buffer(4, Some(&q_bias.buffer), 0);
+            encoder.set_buffer(5, Some(&k_bias.buffer), 0);
+            encoder.set_buffer(6, Some(&v_bias.buffer), 0);
+            encoder.set_buffer(7, Some(&q_out.buffer), 0);
+            encoder.set_buffer(8, Some(&k_out.buffer), 0);
+            encoder.set_buffer(9, Some(&v_out.buffer), 0);
+            encoder.set_buffer(10, Some(&q_tiles_buffer), 0);
+            encoder.set_buffer(11, Some(&kv_tiles_buffer), 0);
+            encoder.set_buffer(12, Some(&cols_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(total_tiles as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
         pub fn bf16_matrix_matvec_batch_into(
             &self,
             weight: &Bf16MatrixBuffer,
@@ -1962,6 +2070,74 @@ pub(crate) mod platform {
             encoder.set_buffer(6, Some(&layer_buffer), 0);
             encoder.dispatch_thread_groups(
                 mtl_size(Q_HEADS as NSUInteger, seq_len as NSUInteger, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn suffix_sequence_attention_into(
+            &self,
+            layer: usize,
+            start_position: usize,
+            suffix_len: usize,
+            q: &F32VectorBuffer,
+            k_cache: &F32VectorBuffer,
+            v_cache: &F32VectorBuffer,
+            sinks: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+        ) -> Result<()> {
+            if suffix_len == 0 {
+                return Ok(());
+            }
+            let q_len = suffix_len
+                .checked_mul(ATTN_VALUES)
+                .ok_or_else(|| eyre!("resident suffix attention q length overflow"))?;
+            let kv_len = start_position
+                .checked_add(suffix_len)
+                .and_then(|len| len.checked_mul(KV_VALUES))
+                .ok_or_else(|| eyre!("resident suffix attention KV length overflow"))?;
+            if q.len < q_len || out.len < q_len {
+                return Err(eyre!(
+                    "resident suffix attention q/out length mismatch: q {}, out {}, expected at least {q_len}",
+                    q.len,
+                    out.len
+                ));
+            }
+            if k_cache.len < kv_len || v_cache.len < kv_len {
+                return Err(eyre!(
+                    "resident suffix attention K/V length mismatch: k {}, v {}, expected at least {kv_len}",
+                    k_cache.len,
+                    v_cache.len
+                ));
+            }
+            if sinks.len != Q_HEADS {
+                return Err(eyre!(
+                    "resident suffix attention sinks has {} values, expected {Q_HEADS}",
+                    sinks.len
+                ));
+            }
+
+            let layer = layer as u32;
+            let start_position = start_position as u32;
+            let suffix_len = suffix_len as u32;
+            let layer_buffer = buffer_with_data(&self.context.device, &[layer]);
+            let start_position_buffer = buffer_with_data(&self.context.device, &[start_position]);
+            let suffix_len_buffer = buffer_with_data(&self.context.device, &[suffix_len]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.suffix_sequence_attention);
+            encoder.set_buffer(0, Some(&q.buffer), 0);
+            encoder.set_buffer(1, Some(&k_cache.buffer), 0);
+            encoder.set_buffer(2, Some(&v_cache.buffer), 0);
+            encoder.set_buffer(3, Some(&sinks.buffer), 0);
+            encoder.set_buffer(4, Some(&out.buffer), 0);
+            encoder.set_buffer(5, Some(&start_position_buffer), 0);
+            encoder.set_buffer(6, Some(&suffix_len_buffer), 0);
+            encoder.set_buffer(7, Some(&layer_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(Q_HEADS as NSUInteger, suffix_len as NSUInteger, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
@@ -2647,6 +2823,7 @@ pub(crate) mod platform {
         }
     }
 
+    #[cfg(feature = "profile")]
     fn command_buffer_gpu_time_ns(command_buffer: &MetalCommandBuffer) -> u128 {
         let start = command_buffer.GPUStartTime();
         let end = command_buffer.GPUEndTime();
@@ -2694,8 +2871,6 @@ pub(crate) mod platform {
         pub fn take_gpu_time_ns(&self) -> u128 {
             0
         }
-
-        pub fn set_profile_enabled(&self, _enabled: bool) {}
 
         pub fn begin_batch(&self) -> MetalBatch<'_> {
             MetalBatch {
@@ -2923,6 +3098,23 @@ pub(crate) mod platform {
             Err(eyre!("Metal backend is only available on macOS"))
         }
 
+        #[allow(clippy::too_many_arguments)]
+        pub fn bf16_qkv_matvec_into(
+            &self,
+            _q_weight: &Bf16MatrixBuffer,
+            _k_weight: &Bf16MatrixBuffer,
+            _v_weight: &Bf16MatrixBuffer,
+            _input: &F32VectorBuffer,
+            _q_bias: &F32VectorBuffer,
+            _k_bias: &F32VectorBuffer,
+            _v_bias: &F32VectorBuffer,
+            _q_out: &F32VectorBuffer,
+            _k_out: &F32VectorBuffer,
+            _v_out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
         pub fn bf16_matrix_matvec_batch_into(
             &self,
             _weight: &Bf16MatrixBuffer,
@@ -3031,6 +3223,21 @@ pub(crate) mod platform {
             _sinks: &F32VectorBuffer,
             _out: &F32VectorBuffer,
             _seq_len: usize,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn suffix_sequence_attention_into(
+            &self,
+            _layer: usize,
+            _start_position: usize,
+            _suffix_len: usize,
+            _q: &F32VectorBuffer,
+            _k_cache: &F32VectorBuffer,
+            _v_cache: &F32VectorBuffer,
+            _sinks: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
         ) -> Result<()> {
             Err(eyre!("Metal backend is only available on macOS"))
         }
