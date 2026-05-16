@@ -702,9 +702,16 @@ impl MetalOracleContext {
                     ..ProfileDelta::default()
                 },
             );
-            let weight =
+            let weight = if uses_tiled4_bf16_linear(op_name) {
+                self.platform.upload_bf16_matrix_tiled4_bytes(
+                    weight.bytes,
+                    weight.rows,
+                    weight.cols,
+                )?
+            } else {
                 self.platform
-                    .upload_bf16_matrix_bytes(weight.bytes, weight.rows, weight.cols)?;
+                    .upload_bf16_matrix_bytes(weight.bytes, weight.rows, weight.cols)?
+            };
             cache.insert(tensor_name.to_string(), weight);
         } else {
             self.record_profile(
@@ -845,4 +852,15 @@ impl MetalOracleContext {
             down_bias,
         })
     }
+}
+
+fn uses_tiled4_bf16_linear(op_name: &str) -> bool {
+    matches!(
+        op_name,
+        "op.bf16.q_proj"
+            | "op.bf16.k_proj"
+            | "op.bf16.v_proj"
+            | "op.bf16.o_proj"
+            | "op.bf16.router"
+    )
 }

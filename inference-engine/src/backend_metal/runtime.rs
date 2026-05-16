@@ -57,7 +57,9 @@ pub(crate) mod platform {
         apply_rms_norm_from_partials: Retained<MetalComputePipelineState>,
         rms_norm_batch: Retained<MetalComputePipelineState>,
         bf16_matvec: Retained<MetalComputePipelineState>,
+        bf16_matvec_tiled4: Retained<MetalComputePipelineState>,
         bf16_matvec_batch: Retained<MetalComputePipelineState>,
+        bf16_matvec_batch_tiled4: Retained<MetalComputePipelineState>,
         bf16_matvec_logits: Retained<MetalComputePipelineState>,
         top1_logits_blocks: Retained<MetalComputePipelineState>,
         top1_logits_final: Retained<MetalComputePipelineState>,
@@ -89,6 +91,7 @@ pub(crate) mod platform {
         buffer: Retained<MetalBuffer>,
         rows: usize,
         cols: usize,
+        row_tile: usize,
     }
 
     impl Bf16MatrixBuffer {
@@ -144,7 +147,9 @@ pub(crate) mod platform {
                 )?,
                 rms_norm_batch: pipeline(&device, &library, "rms_norm_batch")?,
                 bf16_matvec: pipeline(&device, &library, "bf16_matvec")?,
+                bf16_matvec_tiled4: pipeline(&device, &library, "bf16_matvec_tiled4")?,
                 bf16_matvec_batch: pipeline(&device, &library, "bf16_matvec_batch")?,
+                bf16_matvec_batch_tiled4: pipeline(&device, &library, "bf16_matvec_batch_tiled4")?,
                 bf16_matvec_logits: pipeline(&device, &library, "bf16_matvec_logits")?,
                 top1_logits_blocks: pipeline(&device, &library, "top1_logits_blocks")?,
                 top1_logits_final: pipeline(&device, &library, "top1_logits_final")?,
@@ -467,6 +472,7 @@ pub(crate) mod platform {
                 buffer: buffer_with_data(&self.device, weight),
                 rows,
                 cols,
+                row_tile: 1,
             })
         }
 
@@ -492,6 +498,22 @@ pub(crate) mod platform {
                 buffer: buffer_with_data(&self.device, weight),
                 rows,
                 cols,
+                row_tile: 1,
+            })
+        }
+
+        pub fn upload_bf16_matrix_tiled4_bytes(
+            &self,
+            weight: &[u8],
+            rows: usize,
+            cols: usize,
+        ) -> Result<Bf16MatrixBuffer> {
+            let packed = pack_bf16_tiled4(weight, rows, cols)?;
+            Ok(Bf16MatrixBuffer {
+                buffer: buffer_with_data(&self.device, &packed),
+                rows,
+                cols,
+                row_tile: 4,
             })
         }
 
@@ -1392,7 +1414,13 @@ pub(crate) mod platform {
             let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
 
             let encoder = self.command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.context.bf16_matvec);
+            let threadgroups = if weight.row_tile == 4 {
+                encoder.set_compute_pipeline_state(&self.context.bf16_matvec_tiled4);
+                weight.rows.div_ceil(4)
+            } else {
+                encoder.set_compute_pipeline_state(&self.context.bf16_matvec);
+                weight.rows
+            };
             encoder.set_buffer(0, Some(&weight.buffer), 0);
             encoder.set_buffer(1, Some(&input.buffer), 0);
             encoder.set_buffer(2, Some(&bias.buffer), 0);
@@ -1400,7 +1428,7 @@ pub(crate) mod platform {
             encoder.set_buffer(4, Some(&rows_buffer), 0);
             encoder.set_buffer(5, Some(&cols_buffer), 0);
             encoder.dispatch_thread_groups(
-                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(threadgroups as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
@@ -1447,7 +1475,13 @@ pub(crate) mod platform {
             let batch_rows_buffer = buffer_with_data(&self.context.device, &[batch_rows]);
 
             let encoder = self.command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.context.bf16_matvec_batch);
+            let threadgroups = if weight.row_tile == 4 {
+                encoder.set_compute_pipeline_state(&self.context.bf16_matvec_batch_tiled4);
+                weight.rows.div_ceil(4)
+            } else {
+                encoder.set_compute_pipeline_state(&self.context.bf16_matvec_batch);
+                weight.rows
+            };
             encoder.set_buffer(0, Some(&weight.buffer), 0);
             encoder.set_buffer(1, Some(&input.buffer), 0);
             encoder.set_buffer(2, Some(&bias.buffer), 0);
@@ -1456,7 +1490,7 @@ pub(crate) mod platform {
             encoder.set_buffer(5, Some(&cols_buffer), 0);
             encoder.set_buffer(6, Some(&batch_rows_buffer), 0);
             encoder.dispatch_thread_groups(
-                mtl_size(rows as NSUInteger, batch_rows as NSUInteger, 1),
+                mtl_size(threadgroups as NSUInteger, batch_rows as NSUInteger, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
@@ -2524,6 +2558,40 @@ pub(crate) mod platform {
         device.new_buffer_with_data(values, MTLResourceOptions::StorageModeShared)
     }
 
+    fn pack_bf16_tiled4(weight: &[u8], rows: usize, cols: usize) -> Result<Vec<u16>> {
+        let expected = rows
+            .checked_mul(cols)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| eyre!("BF16 tiled4 matrix byte shape overflow"))?;
+        if weight.len() != expected {
+            return Err(eyre!(
+                "BF16 tiled4 matrix has {} bytes, expected {expected}",
+                weight.len()
+            ));
+        }
+
+        let tiles = rows.div_ceil(4);
+        let values = tiles
+            .checked_mul(cols)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| eyre!("BF16 tiled4 packed length overflow"))?;
+        let mut packed = vec![0u16; values];
+        for tile in 0..tiles {
+            for col in 0..cols {
+                for lane in 0..4 {
+                    let row = tile * 4 + lane;
+                    if row >= rows {
+                        continue;
+                    }
+                    let source = (row * cols + col) * 2;
+                    packed[(tile * cols + col) * 4 + lane] =
+                        u16::from_le_bytes([weight[source], weight[source + 1]]);
+                }
+            }
+        }
+        Ok(packed)
+    }
+
     fn read_buffer<T: Copy>(buffer: &MetalBuffer, len: usize) -> Vec<T> {
         let values =
             unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<T>(), len) };
@@ -2656,6 +2724,15 @@ pub(crate) mod platform {
         }
 
         pub fn upload_bf16_matrix_bytes(
+            &self,
+            _weight: &[u8],
+            _rows: usize,
+            _cols: usize,
+        ) -> Result<Bf16MatrixBuffer> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn upload_bf16_matrix_tiled4_bytes(
             &self,
             _weight: &[u8],
             _rows: usize,

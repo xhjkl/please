@@ -208,6 +208,67 @@ kernel void bf16_matvec(
     }
 }
 
+kernel void bf16_matvec_tiled4(
+    device const ushort* weight [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tile [[threadgroup_position_in_grid]]
+) {
+    threadgroup float scratch0[256];
+    threadgroup float scratch1[256];
+    threadgroup float scratch2[256];
+    threadgroup float scratch3[256];
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    for (uint col = tid; col < cols; col += 256u) {
+        float x = input[col];
+        uint weight_start = (tile * cols + col) * 4u;
+        sum0 += bf16_to_float(weight[weight_start]) * x;
+        sum1 += bf16_to_float(weight[weight_start + 1u]) * x;
+        sum2 += bf16_to_float(weight[weight_start + 2u]) * x;
+        sum3 += bf16_to_float(weight[weight_start + 3u]) * x;
+    }
+
+    scratch0[tid] = sum0;
+    scratch1[tid] = sum1;
+    scratch2[tid] = sum2;
+    scratch3[tid] = sum3;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch0[tid] += scratch0[tid + stride];
+            scratch1[tid] += scratch1[tid + stride];
+            scratch2[tid] += scratch2[tid + stride];
+            scratch3[tid] += scratch3[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        uint row = tile * 4u;
+        if (row < rows) {
+            out[row] = scratch0[0] + bias[row];
+        }
+        if (row + 1u < rows) {
+            out[row + 1u] = scratch1[0] + bias[row + 1u];
+        }
+        if (row + 2u < rows) {
+            out[row + 2u] = scratch2[0] + bias[row + 2u];
+        }
+        if (row + 3u < rows) {
+            out[row + 3u] = scratch3[0] + bias[row + 3u];
+        }
+    }
+}
+
 kernel void bf16_matvec_batch(
     device const ushort* weight [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -244,6 +305,76 @@ kernel void bf16_matvec_batch(
 
     if (tid == 0u) {
         out[batch_row * rows + out_row] = scratch[0] + bias[out_row];
+    }
+}
+
+kernel void bf16_matvec_batch_tiled4(
+    device const ushort* weight [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& cols [[buffer(5)]],
+    constant uint& batch_rows [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]
+) {
+    threadgroup float scratch0[256];
+    threadgroup float scratch1[256];
+    threadgroup float scratch2[256];
+    threadgroup float scratch3[256];
+
+    uint tile = group.x;
+    uint batch_row = group.y;
+    if (batch_row >= batch_rows) {
+        return;
+    }
+
+    uint input_start = batch_row * cols;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    for (uint col = tid; col < cols; col += 256u) {
+        float x = input[input_start + col];
+        uint weight_start = (tile * cols + col) * 4u;
+        sum0 += bf16_to_float(weight[weight_start]) * x;
+        sum1 += bf16_to_float(weight[weight_start + 1u]) * x;
+        sum2 += bf16_to_float(weight[weight_start + 2u]) * x;
+        sum3 += bf16_to_float(weight[weight_start + 3u]) * x;
+    }
+
+    scratch0[tid] = sum0;
+    scratch1[tid] = sum1;
+    scratch2[tid] = sum2;
+    scratch3[tid] = sum3;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch0[tid] += scratch0[tid + stride];
+            scratch1[tid] += scratch1[tid + stride];
+            scratch2[tid] += scratch2[tid + stride];
+            scratch3[tid] += scratch3[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        uint row = tile * 4u;
+        uint out_start = batch_row * rows;
+        if (row < rows) {
+            out[out_start + row] = scratch0[0] + bias[row];
+        }
+        if (row + 1u < rows) {
+            out[out_start + row + 1u] = scratch1[0] + bias[row + 1u];
+        }
+        if (row + 2u < rows) {
+            out[out_start + row + 2u] = scratch2[0] + bias[row + 2u];
+        }
+        if (row + 3u < rows) {
+            out[out_start + row + 3u] = scratch3[0] + bias[row + 3u];
+        }
     }
 }
 
