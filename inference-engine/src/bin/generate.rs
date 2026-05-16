@@ -4,17 +4,24 @@ use inference_engine::harmony_adapter::{HarmonyAdapter, Message, Role};
 use inference_engine::{
     EngineRequest, GenerationEvent, GenerationLimits, PromptPlan, SamplingConfig, StopReason,
 };
+use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
     let args = Args::parse()?;
+    let started = Instant::now();
     let harmony = HarmonyAdapter::gpt_oss()?;
+    let harmony_load = started.elapsed();
+    let started = Instant::now();
     let messages = [Message::from((Role::User, args.prompt.clone()))];
     let tokens = harmony.render_completion_tokens(&messages)?;
+    let tokenize = started.elapsed();
     let context_capacity = tokens
         .len()
         .checked_add(args.max_new_tokens)
         .ok_or_else(|| eyre!("context capacity overflow"))?;
+    let started = Instant::now();
     let engine = MetalEngine::load_canonical_with_layers(args.layers)?;
+    let load = started.elapsed();
     let request = EngineRequest {
         prompt: PromptPlan {
             tokens,
@@ -30,7 +37,12 @@ fn main() -> Result<()> {
         fixture: None,
     };
 
-    let events = engine.generate(request)?;
+    let (events, profile) = if args.profile {
+        let (events, profile) = engine.generate_profiled(request)?;
+        (events, Some(profile))
+    } else {
+        (engine.generate(request)?, None)
+    };
     let mut text = String::new();
     let mut stop_reason = None;
     for event in events {
@@ -49,6 +61,13 @@ fn main() -> Result<()> {
         stop_reason.unwrap_or(StopReason::Cancelled)
     );
     println!("\n{text}");
+    if let Some(profile) = profile {
+        println!("\nsetup profile:");
+        println!("- harmony load: {}", format_duration(harmony_load));
+        println!("- tokenize/render: {}", format_duration(tokenize));
+        println!("- engine load: {}", format_duration(load));
+        print!("{}", profile.render_for_cli());
+    }
     Ok(())
 }
 
@@ -58,6 +77,7 @@ struct Args {
     max_new_tokens: usize,
     max_output_bytes: usize,
     sampling: SamplingConfig,
+    profile: bool,
 }
 
 impl Args {
@@ -70,6 +90,7 @@ impl Args {
             temperature: 0.0,
             ..SamplingConfig::default()
         };
+        let mut profile = false;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -121,6 +142,7 @@ impl Args {
                         .ok_or_else(|| eyre!("--top-p requires a value"))?;
                     sampling.top_p = value.parse()?;
                 }
+                "--profile" => profile = true,
                 _ => return Err(eyre!("unknown argument {arg}")),
             }
         }
@@ -144,6 +166,20 @@ impl Args {
             max_new_tokens,
             max_output_bytes,
             sampling,
+            profile,
         })
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let ns = duration.as_nanos();
+    if ns >= 1_000_000_000 {
+        format!("{:.2}s", ns as f64 / 1_000_000_000.0)
+    } else if ns >= 1_000_000 {
+        format!("{:.1}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.1}us", ns as f64 / 1_000.0)
+    } else {
+        format!("{ns}ns")
     }
 }

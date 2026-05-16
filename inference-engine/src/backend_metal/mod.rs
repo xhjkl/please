@@ -13,7 +13,9 @@ use crate::runtime_core::{
     SamplingConfig, SelectedLogit, StopReason,
 };
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const LAYERS: usize = 24;
 const Q_HEADS: usize = 64;
@@ -28,10 +30,130 @@ const MXFP4_BYTES_PER_GROUP: usize = 16;
 const MAX_PREFILL_PROBE_TOKENS: usize = 128;
 const MAX_KV_CACHE_PROBE_TOKENS: usize = 256;
 
+#[derive(Debug, Clone)]
+pub struct MetalProfileReport {
+    pub records: Vec<MetalProfileRecord>,
+}
+
+impl MetalProfileReport {
+    pub fn render_for_cli(&self) -> String {
+        let mut records = self.records.clone();
+        records.sort_by(|left, right| {
+            right
+                .wall_ns
+                .cmp(&left.wall_ns)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        let total_wall_ns = records
+            .iter()
+            .find(|record| record.name == "phase.generate")
+            .map(|record| record.wall_ns)
+            .unwrap_or_else(|| records.iter().map(|record| record.wall_ns).sum());
+
+        let mut out = String::new();
+        out.push_str("\nmetal runtime profile:\n");
+        out.push_str(&format!(
+            "- recorded wall: {}\n",
+            format_duration_ns(total_wall_ns)
+        ));
+        out.push_str("- gpu: Metal command-buffer GPU timestamps where available\n");
+        out.push_str("\n");
+        out.push_str(
+            "pct     wall      gpu       calls  cb     upload    readback  cache       name\n",
+        );
+        out.push_str("-----   -------   -------   -----  -----  --------  --------  ----------  -------------------------\n");
+        for record in records
+            .iter()
+            .filter(|record| record.name != "phase.generate")
+        {
+            if record.wall_ns == 0
+                && record.upload_bytes == 0
+                && record.readback_bytes == 0
+                && record.cache_hits == 0
+                && record.cache_misses == 0
+            {
+                continue;
+            }
+            let percent = if total_wall_ns == 0 {
+                0.0
+            } else {
+                (record.wall_ns as f64 / total_wall_ns as f64) * 100.0
+            };
+            out.push_str(&format!(
+                "{percent:>5.1}%  {:>7}  {:>7}  {:>5}  {:>5}  {:>8}  {:>8}  {:>4}/{:<4}   {}\n",
+                format_duration_ns(record.wall_ns),
+                format_duration_ns(record.gpu_ns),
+                record.calls,
+                record.command_buffers,
+                format_bytes(record.upload_bytes),
+                format_bytes(record.readback_bytes),
+                record.cache_hits,
+                record.cache_misses,
+                record.name
+            ));
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetalProfileRecord {
+    pub name: String,
+    pub calls: usize,
+    pub wall_ns: u128,
+    pub gpu_ns: u128,
+    pub command_buffers: usize,
+    pub upload_bytes: usize,
+    pub readback_bytes: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProfileDelta {
+    wall: Duration,
+    gpu_ns: u128,
+    command_buffers: usize,
+    upload_bytes: usize,
+    readback_bytes: usize,
+    cache_hits: usize,
+    cache_misses: usize,
+}
+
+#[derive(Default)]
+struct ProfileState {
+    enabled: bool,
+    records: HashMap<String, MetalProfileRecord>,
+}
+
+fn format_duration_ns(ns: u128) -> String {
+    if ns >= 1_000_000_000 {
+        format!("{:.2}s", ns as f64 / 1_000_000_000.0)
+    } else if ns >= 1_000_000 {
+        format!("{:.1}ms", ns as f64 / 1_000_000.0)
+    } else if ns >= 1_000 {
+        format!("{:.1}us", ns as f64 / 1_000.0)
+    } else {
+        format!("{ns}ns")
+    }
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1}KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 pub struct MetalOracleContext {
     platform: platform::MetalContext,
     lm_head: Option<platform::Bf16MatrixBuffer>,
     weights: Option<Arc<ResidentWeights>>,
+    profile: Arc<Mutex<ProfileState>>,
     gpu_bf16_matrices: Mutex<HashMap<String, platform::Bf16MatrixBuffer>>,
     gpu_bf16_vectors: Mutex<HashMap<String, platform::F32VectorBuffer>>,
     gpu_bf16_rows: Mutex<HashMap<(String, usize), platform::F32VectorBuffer>>,
@@ -44,6 +166,7 @@ impl MetalOracleContext {
             platform: platform::MetalContext::new()?,
             lm_head: None,
             weights: None,
+            profile: Arc::new(Mutex::new(ProfileState::default())),
             gpu_bf16_matrices: Mutex::new(HashMap::new()),
             gpu_bf16_vectors: Mutex::new(HashMap::new()),
             gpu_bf16_rows: Mutex::new(HashMap::new()),
@@ -59,6 +182,7 @@ impl MetalOracleContext {
             platform,
             lm_head: Some(lm_head),
             weights: Some(Arc::new(ResidentWeights::default())),
+            profile: Arc::new(Mutex::new(ProfileState::default())),
             gpu_bf16_matrices: Mutex::new(HashMap::new()),
             gpu_bf16_vectors: Mutex::new(HashMap::new()),
             gpu_bf16_rows: Mutex::new(HashMap::new()),
@@ -72,7 +196,206 @@ impl MetalOracleContext {
                 "Metal lm_head weight is not cached; construct MetalOracleContext::with_lm_head"
             ));
         };
-        self.platform.bf16_matrix_topk(lm_head, final_hidden, k)
+        let stats = ProfileDelta {
+            command_buffers: 2,
+            upload_bytes: final_hidden.len() * size_of::<f32>() + 3 * size_of::<u32>(),
+            readback_bytes: k * (size_of::<u32>() + size_of::<f32>()),
+            ..ProfileDelta::default()
+        };
+        self.profile_op("op.lm_head_topk", stats, || {
+            self.platform.bf16_matrix_topk(lm_head, final_hidden, k)
+        })
+    }
+
+    pub fn enable_profile(&self) {
+        self.platform.set_profile_enabled(true);
+        let _ = self.platform.take_gpu_time_ns();
+        let mut profile = self.profile.lock().unwrap();
+        profile.enabled = true;
+        profile.records.clear();
+    }
+
+    pub fn disable_profile(&self) {
+        self.profile.lock().unwrap().enabled = false;
+        self.platform.set_profile_enabled(false);
+    }
+
+    pub fn profile_report(&self) -> MetalProfileReport {
+        let records = self
+            .profile
+            .lock()
+            .unwrap()
+            .records
+            .values()
+            .cloned()
+            .collect();
+        MetalProfileReport { records }
+    }
+
+    fn profile_op<T>(
+        &self,
+        name: &str,
+        stats: ProfileDelta,
+        run: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if !self.profile.lock().unwrap().enabled {
+            return run();
+        }
+
+        let _ = self.platform.take_gpu_time_ns();
+        let started = Instant::now();
+        let result = run();
+        let mut stats = stats;
+        stats.wall = started.elapsed();
+        stats.gpu_ns = self.platform.take_gpu_time_ns();
+        self.record_profile(name, stats);
+        result
+    }
+
+    fn record_profile(&self, name: &str, delta: ProfileDelta) {
+        let mut profile = self.profile.lock().unwrap();
+        if !profile.enabled {
+            return;
+        }
+
+        let record =
+            profile
+                .records
+                .entry(name.to_string())
+                .or_insert_with(|| MetalProfileRecord {
+                    name: name.to_string(),
+                    ..MetalProfileRecord::default()
+                });
+        record.calls += usize::from(delta.wall > Duration::ZERO);
+        record.wall_ns += delta.wall.as_nanos();
+        record.gpu_ns += delta.gpu_ns;
+        record.command_buffers += delta.command_buffers;
+        record.upload_bytes += delta.upload_bytes;
+        record.readback_bytes += delta.readback_bytes;
+        record.cache_hits += delta.cache_hits;
+        record.cache_misses += delta.cache_misses;
+    }
+
+    fn rms_norm_profiled(&self, name: &str, x: &[f32], weight: &[f32]) -> Result<Vec<f32>> {
+        let groups = x.len().div_ceil(256);
+        let stats = ProfileDelta {
+            command_buffers: 2,
+            upload_bytes: (x.len() + weight.len()) * size_of::<f32>()
+                + size_of::<u32>()
+                + size_of::<f32>(),
+            readback_bytes: (groups + x.len()) * size_of::<f32>(),
+            ..ProfileDelta::default()
+        };
+        self.profile_op(name, stats, || self.platform.rms_norm(x, weight))
+    }
+
+    fn rope_row_profiled(&self, row: &[f32], heads: usize, position: usize) -> Result<Vec<f32>> {
+        let _ = (heads, position);
+        let stats = ProfileDelta {
+            command_buffers: 1,
+            upload_bytes: row.len() * size_of::<f32>() + 2 * size_of::<u32>(),
+            readback_bytes: row.len() * size_of::<f32>(),
+            ..ProfileDelta::default()
+        };
+        self.profile_op("op.rope", stats, || {
+            self.platform.rope_row(row, heads, position)
+        })
+    }
+
+    fn single_token_attention_profiled(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        sinks: &[f32],
+    ) -> Result<Vec<f32>> {
+        let stats = ProfileDelta {
+            command_buffers: 1,
+            upload_bytes: (q.len() + k.len() + v.len() + sinks.len()) * size_of::<f32>(),
+            readback_bytes: q.len() * size_of::<f32>(),
+            ..ProfileDelta::default()
+        };
+        self.profile_op("op.attention.single_token", stats, || {
+            self.platform.single_token_attention(q, k, v, sinks)
+        })
+    }
+
+    fn kv_cache_decode_attention_profiled(
+        &self,
+        layer: usize,
+        query_position: usize,
+        cache_start_position: usize,
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        sinks: &[f32],
+    ) -> Result<Vec<f32>> {
+        let stats = ProfileDelta {
+            command_buffers: 1,
+            upload_bytes: (q.len() + k_cache.len() + v_cache.len() + sinks.len())
+                * size_of::<f32>()
+                + 4 * size_of::<u32>(),
+            readback_bytes: q.len() * size_of::<f32>(),
+            ..ProfileDelta::default()
+        };
+        self.profile_op("op.attention.kv_decode", stats, || {
+            self.platform.kv_cache_decode_attention(
+                layer,
+                query_position,
+                cache_start_position,
+                q,
+                k_cache,
+                v_cache,
+                sinks,
+            )
+        })
+    }
+
+    fn vector_add_profiled(&self, name: &str, left: &[f32], right: &[f32]) -> Result<Vec<f32>> {
+        let stats = ProfileDelta {
+            command_buffers: 1,
+            upload_bytes: (left.len() + right.len()) * size_of::<f32>() + size_of::<u32>(),
+            readback_bytes: left.len() * size_of::<f32>(),
+            ..ProfileDelta::default()
+        };
+        self.profile_op(name, stats, || self.platform.vector_add(left, right))
+    }
+
+    fn top4_softmax_profiled(&self, logits: &[f32]) -> Result<Vec<ExpertScore>> {
+        let stats = ProfileDelta {
+            command_buffers: 1,
+            upload_bytes: logits.len() * size_of::<f32>() + size_of::<u32>(),
+            readback_bytes: 4 * (size_of::<u32>() + 2 * size_of::<f32>()),
+            ..ProfileDelta::default()
+        };
+        self.profile_op("op.router.top4", stats, || {
+            self.platform.top4_softmax(logits)
+        })
+    }
+
+    fn swiglu_profiled(&self, values: &[f32]) -> Result<Vec<f32>> {
+        let stats = ProfileDelta {
+            command_buffers: 1,
+            upload_bytes: values.len() * size_of::<f32>() + size_of::<u32>(),
+            readback_bytes: (values.len() / 2) * size_of::<f32>(),
+            ..ProfileDelta::default()
+        };
+        self.profile_op("op.swiglu", stats, || self.platform.swiglu(values))
+    }
+
+    fn weighted_sum4_profiled(&self, vectors: [&[f32]; 4], weights: [f32; 4]) -> Result<Vec<f32>> {
+        let n = vectors[0].len();
+        let stats = ProfileDelta {
+            command_buffers: 1,
+            upload_bytes: n * 4 * size_of::<f32>()
+                + weights.len() * size_of::<f32>()
+                + size_of::<u32>(),
+            readback_bytes: n * size_of::<f32>(),
+            ..ProfileDelta::default()
+        };
+        self.profile_op("op.moe.weighted_sum4", stats, || {
+            self.platform.weighted_sum4(vectors, weights)
+        })
     }
 
     fn bf16_matrix(
@@ -140,6 +463,20 @@ impl MetalOracleContext {
         bias_name: &str,
         input: &[f32],
     ) -> Result<Vec<f32>> {
+        let op_name = bf16_linear_profile_name(weight_name);
+        self.profile_op(&op_name, ProfileDelta::default(), || {
+            self.bf16_linear_matvec_inner(report, weight_name, bias_name, input, &op_name)
+        })
+    }
+
+    fn bf16_linear_matvec_inner(
+        &self,
+        report: &SourceModelReport,
+        weight_name: &str,
+        bias_name: &str,
+        input: &[f32],
+        op_name: &str,
+    ) -> Result<Vec<f32>> {
         if self.weights.is_none() {
             let bias = self.bf16_vector(report, bias_name)?;
             let weight = self.bf16_matrix(report, weight_name)?;
@@ -155,10 +492,26 @@ impl MetalOracleContext {
         let mut cache = self.gpu_bf16_matrices.lock().unwrap();
         if !cache.contains_key(weight_name) {
             let weight = self.bf16_matrix(report, weight_name)?;
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    upload_bytes: weight.values.len() * size_of::<u16>(),
+                    cache_misses: 1,
+                    ..ProfileDelta::default()
+                },
+            );
             let weight =
                 self.platform
                     .upload_bf16_matrix(&weight.values, weight.rows, weight.cols)?;
             cache.insert(weight_name.to_string(), weight);
+        } else {
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    cache_hits: 1,
+                    ..ProfileDelta::default()
+                },
+            );
         }
         let Some(weight) = cache.get(weight_name) else {
             return Err(eyre!("cached BF16 matrix is missing for {weight_name}"));
@@ -167,12 +520,37 @@ impl MetalOracleContext {
         let mut bias_cache = self.gpu_bf16_vectors.lock().unwrap();
         if !bias_cache.contains_key(bias_name) {
             let bias = self.bf16_vector(report, bias_name)?;
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    upload_bytes: bias.len() * size_of::<f32>(),
+                    cache_misses: 1,
+                    ..ProfileDelta::default()
+                },
+            );
             let bias = self.platform.upload_f32_vector(&bias)?;
             bias_cache.insert(bias_name.to_string(), bias);
+        } else {
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    cache_hits: 1,
+                    ..ProfileDelta::default()
+                },
+            );
         }
         let Some(bias) = bias_cache.get(bias_name) else {
             return Err(eyre!("cached BF16 bias is missing for {bias_name}"));
         };
+        self.record_profile(
+            op_name,
+            ProfileDelta {
+                command_buffers: 1,
+                upload_bytes: input.len() * size_of::<f32>() + 2 * size_of::<u32>(),
+                readback_bytes: weight.rows() * size_of::<f32>(),
+                ..ProfileDelta::default()
+            },
+        );
         self.platform.bf16_matrix_matvec(weight, input, bias)
     }
 
@@ -185,6 +563,32 @@ impl MetalOracleContext {
         expert: usize,
         rows: usize,
         input: &[f32],
+    ) -> Result<Vec<f32>> {
+        let op_name = mxfp4_profile_name(bias_name);
+        self.profile_op(&op_name, ProfileDelta::default(), || {
+            self.mxfp4_expert_matvec_inner(
+                report,
+                blocks_name,
+                scales_name,
+                bias_name,
+                expert,
+                rows,
+                input,
+                &op_name,
+            )
+        })
+    }
+
+    fn mxfp4_expert_matvec_inner(
+        &self,
+        report: &SourceModelReport,
+        blocks_name: &str,
+        scales_name: &str,
+        bias_name: &str,
+        expert: usize,
+        rows: usize,
+        input: &[f32],
+        op_name: &str,
     ) -> Result<Vec<f32>> {
         if self.weights.is_none() {
             let blocks = read_mxfp4_expert_blocks_metal(self, report, blocks_name, expert, rows)?;
@@ -215,14 +619,46 @@ impl MetalOracleContext {
         if !u8_cache.contains_key(&blocks_key) {
             let blocks =
                 self.u8_tensor_slice(report, blocks_name, blocks_offset, blocks_per_expert)?;
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    upload_bytes: blocks.len(),
+                    cache_misses: 1,
+                    ..ProfileDelta::default()
+                },
+            );
             let blocks = self.platform.upload_u8_buffer(&blocks)?;
             u8_cache.insert(blocks_key.clone(), blocks);
+        } else {
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    cache_hits: 1,
+                    ..ProfileDelta::default()
+                },
+            );
         }
         if !u8_cache.contains_key(&scales_key) {
             let scales =
                 self.u8_tensor_slice(report, scales_name, scales_offset, scales_per_expert)?;
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    upload_bytes: scales.len(),
+                    cache_misses: 1,
+                    ..ProfileDelta::default()
+                },
+            );
             let scales = self.platform.upload_u8_buffer(&scales)?;
             u8_cache.insert(scales_key.clone(), scales);
+        } else {
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    cache_hits: 1,
+                    ..ProfileDelta::default()
+                },
+            );
         }
         let Some(blocks) = u8_cache.get(&blocks_key) else {
             return Err(eyre!(
@@ -239,8 +675,24 @@ impl MetalOracleContext {
         let mut row_cache = self.gpu_bf16_rows.lock().unwrap();
         if !row_cache.contains_key(&bias_key) {
             let bias = self.bf16_matrix_row(report, bias_name, expert)?;
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    upload_bytes: bias.len() * size_of::<f32>(),
+                    cache_misses: 1,
+                    ..ProfileDelta::default()
+                },
+            );
             let bias = self.platform.upload_f32_vector(&bias)?;
             row_cache.insert(bias_key.clone(), bias);
+        } else {
+            self.record_profile(
+                op_name,
+                ProfileDelta {
+                    cache_hits: 1,
+                    ..ProfileDelta::default()
+                },
+            );
         }
         let Some(bias) = row_cache.get(&bias_key) else {
             return Err(eyre!(
@@ -248,8 +700,39 @@ impl MetalOracleContext {
             ));
         };
 
+        self.record_profile(
+            op_name,
+            ProfileDelta {
+                command_buffers: 1,
+                upload_bytes: input.len() * size_of::<f32>() + 2 * size_of::<u32>(),
+                readback_bytes: rows * size_of::<f32>(),
+                ..ProfileDelta::default()
+            },
+        );
         self.platform
             .mxfp4_matvec_resident(blocks, scales, rows, input, bias)
+    }
+}
+
+fn bf16_linear_profile_name(weight_name: &str) -> String {
+    for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+        if weight_name.contains(projection) {
+            return format!("op.bf16.{projection}");
+        }
+    }
+    if weight_name.contains(".mlp.router.") {
+        return "op.bf16.router".to_string();
+    }
+    "op.bf16.matvec".to_string()
+}
+
+fn mxfp4_profile_name(bias_name: &str) -> String {
+    if bias_name.contains("gate_up_proj") {
+        "op.mxfp4.gate_up".to_string()
+    } else if bias_name.contains("down_proj") {
+        "op.mxfp4.down".to_string()
+    } else {
+        "op.mxfp4.matvec".to_string()
     }
 }
 
@@ -369,6 +852,29 @@ impl MetalEngine {
     }
 
     pub fn generate(&self, request: EngineRequest) -> Result<Vec<GenerationEvent>> {
+        self.generate_inner(request)
+    }
+
+    pub fn generate_profiled(
+        &self,
+        request: EngineRequest,
+    ) -> Result<(Vec<GenerationEvent>, MetalProfileReport)> {
+        self.ctx.enable_profile();
+        let started = Instant::now();
+        let result = self.generate_inner(request);
+        self.ctx.record_profile(
+            "phase.generate",
+            ProfileDelta {
+                wall: started.elapsed(),
+                ..ProfileDelta::default()
+            },
+        );
+        let report = self.ctx.profile_report();
+        self.ctx.disable_profile();
+        result.map(|events| (events, report))
+    }
+
+    fn generate_inner(&self, request: EngineRequest) -> Result<Vec<GenerationEvent>> {
         let mut events = Vec::new();
         for notice in &request.prompt.notices {
             events.push(GenerationEvent::Notice(RuntimeNotice {
@@ -945,9 +1451,9 @@ pub fn probe_sample_decode(
         return Err(eyre!("greedy decode prefill returned no hidden states"));
     };
 
-    let norm_weight = model_store::read_bf16_vector(report, "model.norm.weight")?;
+    let norm_weight = ctx.bf16_vector(report, "model.norm.weight")?;
     let stop_tokens = harmony.stop_tokens()?;
-    let mut final_hidden = ctx.platform.rms_norm(hidden, &norm_weight)?;
+    let mut final_hidden = ctx.rms_norm_profiled("op.rms_norm.final", hidden, &norm_weight)?;
     let mut generated = Vec::with_capacity(max_new_tokens);
     let mut stop_reason = StopReason::MaxGeneratedTokens;
     let mut sampler = Sampler::new(sampling.clone());
@@ -993,7 +1499,7 @@ pub fn probe_sample_decode(
         for layer in 0..layers {
             x = decode_layer_metal(ctx, report, layer, &x, position, &mut kv_cache)?;
         }
-        final_hidden = ctx.platform.rms_norm(&x, &norm_weight)?;
+        final_hidden = ctx.rms_norm_profiled("op.rms_norm.final", &x, &norm_weight)?;
     }
 
     let token_ids = generated
@@ -1269,7 +1775,7 @@ fn single_token_final_norm_metal(
     }
 
     let norm_weight = ctx.bf16_vector(report, "model.norm.weight")?;
-    ctx.platform.rms_norm(&x, &norm_weight)
+    ctx.rms_norm_profiled("op.rms_norm.final", &x, &norm_weight)
 }
 
 fn single_token_layer_metal(
@@ -1282,16 +1788,17 @@ fn single_token_layer_metal(
     let prefix = format!("model.layers.{layer}");
     let (q, k, v) = layer_attention_qkv_metal(ctx, report, layer, input, position)?;
     let sinks = ctx.bf16_vector(report, &format!("{prefix}.self_attn.sinks"))?;
-    let attn = ctx.platform.single_token_attention(&q, &k, &v, &sinks)?;
+    let attn = ctx.single_token_attention_profiled(&q, &k, &v, &sinks)?;
     let projected = layer_projection_metal(ctx, report, layer, "o_proj", &attn)?;
-    let residual = ctx.platform.vector_add(input, &projected)?;
+    let residual = ctx.vector_add_profiled("op.residual.attention", input, &projected)?;
 
     let post_norm_weight =
         ctx.bf16_vector(report, &format!("{prefix}.post_attention_layernorm.weight"))?;
-    let router_input = ctx.platform.rms_norm(&residual, &post_norm_weight)?;
+    let router_input =
+        ctx.rms_norm_profiled("op.rms_norm.post_attention", &residual, &post_norm_weight)?;
     let router = layer_router_metal(ctx, report, layer, &router_input)?;
     let moe = layer_moe_top4_metal(ctx, report, layer, &router_input, &router)?;
-    ctx.platform.vector_add(&residual, &moe)
+    ctx.vector_add_profiled("op.residual.moe", &residual, &moe)
 }
 
 fn prefill_layers_metal(
@@ -1349,7 +1856,7 @@ fn prefill_final_norm_metal(
         return Err(eyre!("prefill final norm needs at least one token"));
     };
     let norm_weight = ctx.bf16_vector(report, "model.norm.weight")?;
-    ctx.platform.rms_norm(hidden, &norm_weight)
+    ctx.rms_norm_profiled("op.rms_norm.final", hidden, &norm_weight)
 }
 
 fn decode_one_final_norm_cpu(
@@ -1371,7 +1878,7 @@ fn decode_one_final_norm_metal(
 ) -> Result<Vec<f32>> {
     let hidden = decode_one_metal(ctx, report, prefill_tokens, decode_token, layers)?;
     let norm_weight = ctx.bf16_vector(report, "model.norm.weight")?;
-    ctx.platform.rms_norm(&hidden, &norm_weight)
+    ctx.rms_norm_profiled("op.rms_norm.final", &hidden, &norm_weight)
 }
 
 fn decode_one_metal(
@@ -1408,7 +1915,7 @@ fn decode_layer_metal(
     kv_cache.layer_mut(layer)?.push(position, &k, &v)?;
     let view = kv_cache.layer(layer)?.contiguous_view_for_query(position)?;
     let sinks = ctx.bf16_vector(report, &format!("{prefix}.self_attn.sinks"))?;
-    let attn = ctx.platform.kv_cache_decode_attention(
+    let attn = ctx.kv_cache_decode_attention_profiled(
         layer,
         position,
         view.start_position,
@@ -1418,14 +1925,15 @@ fn decode_layer_metal(
         &sinks,
     )?;
     let projected = layer_projection_metal(ctx, report, layer, "o_proj", &attn)?;
-    let residual = ctx.platform.vector_add(input, &projected)?;
+    let residual = ctx.vector_add_profiled("op.residual.attention", input, &projected)?;
 
     let post_norm_weight =
         ctx.bf16_vector(report, &format!("{prefix}.post_attention_layernorm.weight"))?;
-    let router_input = ctx.platform.rms_norm(&residual, &post_norm_weight)?;
+    let router_input =
+        ctx.rms_norm_profiled("op.rms_norm.post_attention", &residual, &post_norm_weight)?;
     let router = layer_router_metal(ctx, report, layer, &router_input)?;
     let moe = layer_moe_top4_metal(ctx, report, layer, &router_input, &router)?;
-    ctx.platform.vector_add(&residual, &moe)
+    ctx.vector_add_profiled("op.residual.moe", &residual, &moe)
 }
 
 fn prefill_layer_metal(
@@ -1445,7 +1953,7 @@ fn prefill_layer_metal(
     for (offset, (input, q)) in inputs.iter().zip(q_rows.iter()).enumerate() {
         let position = start_position + offset;
         let view = kv_cache.layer(layer)?.contiguous_view_for_query(position)?;
-        let attn = ctx.platform.kv_cache_decode_attention(
+        let attn = ctx.kv_cache_decode_attention_profiled(
             layer,
             position,
             view.start_position,
@@ -1455,17 +1963,18 @@ fn prefill_layer_metal(
             &sinks,
         )?;
         let projected = layer_projection_metal(ctx, report, layer, "o_proj", &attn)?;
-        residuals.push(ctx.platform.vector_add(input, &projected)?);
+        residuals.push(ctx.vector_add_profiled("op.residual.attention", input, &projected)?);
     }
 
     let post_norm_weight =
         ctx.bf16_vector(report, &format!("{prefix}.post_attention_layernorm.weight"))?;
     let mut out = Vec::with_capacity(residuals.len());
     for residual in residuals {
-        let router_input = ctx.platform.rms_norm(&residual, &post_norm_weight)?;
+        let router_input =
+            ctx.rms_norm_profiled("op.rms_norm.post_attention", &residual, &post_norm_weight)?;
         let router = layer_router_metal(ctx, report, layer, &router_input)?;
         let moe = layer_moe_top4_metal(ctx, report, layer, &router_input, &router)?;
-        out.push(ctx.platform.vector_add(&residual, &moe)?);
+        out.push(ctx.vector_add_profiled("op.residual.moe", &residual, &moe)?);
     }
 
     Ok(out)
@@ -1505,13 +2014,13 @@ fn layer_attention_qkv_metal(
 
     let prefix = format!("model.layers.{layer}");
     let input_norm_weight = ctx.bf16_vector(report, &format!("{prefix}.input_layernorm.weight"))?;
-    let attn_input = ctx.platform.rms_norm(input, &input_norm_weight)?;
+    let attn_input = ctx.rms_norm_profiled("op.rms_norm.input", input, &input_norm_weight)?;
 
     let q = layer_projection_metal(ctx, report, layer, "q_proj", &attn_input)?;
     let k = layer_projection_metal(ctx, report, layer, "k_proj", &attn_input)?;
     let v = layer_projection_metal(ctx, report, layer, "v_proj", &attn_input)?;
-    let q = ctx.platform.rope_row(&q, Q_HEADS, position)?;
-    let k = ctx.platform.rope_row(&k, KV_HEADS, position)?;
+    let q = ctx.rope_row_profiled(&q, Q_HEADS, position)?;
+    let k = ctx.rope_row_profiled(&k, KV_HEADS, position)?;
     Ok((q, k, v))
 }
 
@@ -1545,7 +2054,7 @@ fn layer_moe_top4_metal(
     input: &[f32],
     router: &[f32],
 ) -> Result<Vec<f32>> {
-    let top_experts = ctx.platform.top4_softmax(router)?;
+    let top_experts = ctx.top4_softmax_profiled(router)?;
     if top_experts.len() != 4 {
         return Err(eyre!(
             "Metal router returned {} experts, expected 4",
@@ -1564,7 +2073,7 @@ fn layer_moe_top4_metal(
         )?);
     }
 
-    ctx.platform.weighted_sum4(
+    ctx.weighted_sum4_profiled(
         [&downs[0], &downs[1], &downs[2], &downs[3]],
         [
             top_experts[0].weight,
@@ -1627,7 +2136,7 @@ fn layer_expert_down_proj_metal(
         GATE_UP_VALUES,
         input,
     )?;
-    let swiglu = ctx.platform.swiglu(&gate_up)?;
+    let swiglu = ctx.swiglu_profiled(&gate_up)?;
 
     let down_blocks_name = format!("{prefix}.down_proj_blocks");
     let down_scales_name = format!("{prefix}.down_proj_scales");
@@ -2249,17 +2758,24 @@ mod platform {
     use super::{ATTN_VALUES, KV_VALUES, MAX_KV_CACHE_PROBE_TOKENS, MAX_PREFILL_PROBE_TOKENS};
     use crate::runtime_core::ExpertScore;
     use eyre::{Result, eyre};
+    use metal::foreign_types::ForeignTypeRef;
     use metal::{
         CommandQueue, CompileOptions, ComputePipelineState, Device, Library, MTLResourceOptions,
         MTLSize, NSUInteger,
     };
+    use objc::runtime::Sel;
+    use std::ffi::c_void;
     use std::mem::size_of_val;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const THREADS_PER_GROUP: u64 = 256;
 
     pub struct MetalContext {
         device: Device,
         queue: CommandQueue,
+        profile_enabled: AtomicBool,
+        gpu_time_ns: Mutex<u128>,
         partial_sum_squares: ComputePipelineState,
         apply_rms_norm: ComputePipelineState,
         bf16_matvec: ComputePipelineState,
@@ -2280,6 +2796,12 @@ mod platform {
         buffer: metal::Buffer,
         rows: usize,
         cols: usize,
+    }
+
+    impl Bf16MatrixBuffer {
+        pub fn rows(&self) -> usize {
+            self.rows
+        }
     }
 
     pub struct F32VectorBuffer {
@@ -2909,6 +3431,8 @@ kernel void weighted_sum4(
                 .map_err(|error| eyre!("compile Metal kernels: {error}"))?;
 
             Ok(Self {
+                profile_enabled: AtomicBool::new(false),
+                gpu_time_ns: Mutex::new(0),
                 partial_sum_squares: pipeline(&device, &library, "partial_sum_squares")?,
                 apply_rms_norm: pipeline(&device, &library, "apply_rms_norm")?,
                 bf16_matvec: pipeline(&device, &library, "bf16_matvec")?,
@@ -2930,6 +3454,29 @@ kernel void weighted_sum4(
                 device,
                 queue,
             })
+        }
+
+        pub fn take_gpu_time_ns(&self) -> u128 {
+            let mut gpu_time_ns = self.gpu_time_ns.lock().unwrap();
+            let value = *gpu_time_ns;
+            *gpu_time_ns = 0;
+            value
+        }
+
+        pub fn set_profile_enabled(&self, enabled: bool) {
+            self.profile_enabled.store(enabled, Ordering::Relaxed);
+        }
+
+        fn finish_command_buffer(&self, command_buffer: &metal::CommandBufferRef) {
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            if !self.profile_enabled.load(Ordering::Relaxed) {
+                return;
+            }
+            let gpu_time_ns = command_buffer_gpu_time_ns(command_buffer);
+            if gpu_time_ns > 0 {
+                *self.gpu_time_ns.lock().unwrap() += gpu_time_ns;
+            }
         }
 
         pub fn rms_norm(&self, x: &[f32], weight: &[f32]) -> Result<Vec<f32>> {
@@ -2965,8 +3512,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             let partials = read_buffer::<f32>(&partial_buffer, groups as usize);
             let sum_squares = partials.iter().map(|value| *value as f64).sum::<f64>();
@@ -2991,8 +3537,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, x.len()))
         }
@@ -3055,8 +3600,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, rows as usize))
         }
@@ -3109,8 +3653,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, rows as usize))
         }
@@ -3199,8 +3742,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             let indices_buffer = self.device.new_buffer(
                 (k as usize * std::mem::size_of::<u32>()) as u64,
@@ -3221,8 +3763,7 @@ kernel void weighted_sum4(
             encoder.set_buffer(4, Some(&k_buffer), 0);
             encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             let indices = read_buffer::<u32>(&indices_buffer, k as usize);
             let values = read_buffer::<f32>(&values_buffer, k as usize);
@@ -3269,8 +3810,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, row.len()))
         }
@@ -3320,8 +3860,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, q.len()))
         }
@@ -3403,8 +3942,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, q.len()))
         }
@@ -3505,8 +4043,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, q.len()))
         }
@@ -3544,8 +4081,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, left.len()))
         }
@@ -3584,8 +4120,7 @@ kernel void weighted_sum4(
             encoder.set_buffer(4, Some(&n_buffer), 0);
             encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             let indices = read_buffer::<u32>(&indices_buffer, 4);
             let selected_logits = read_buffer::<f32>(&selected_logits_buffer, 4);
@@ -3674,8 +4209,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, rows as usize))
         }
@@ -3749,8 +4283,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, rows as usize))
         }
@@ -3786,8 +4319,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, out_len as usize))
         }
@@ -3831,8 +4363,7 @@ kernel void weighted_sum4(
                 MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+            self.finish_command_buffer(command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, n as usize))
         }
@@ -3859,6 +4390,30 @@ kernel void weighted_sum4(
         let values = unsafe { std::slice::from_raw_parts(buffer.contents().cast::<T>(), len) };
         values.to_vec()
     }
+
+    fn command_buffer_gpu_time_ns(command_buffer: &metal::CommandBufferRef) -> u128 {
+        let start = unsafe {
+            objc_msg_send_f64(
+                command_buffer.as_ptr().cast::<c_void>(),
+                Sel::register("GPUStartTime"),
+            )
+        };
+        let end = unsafe {
+            objc_msg_send_f64(
+                command_buffer.as_ptr().cast::<c_void>(),
+                Sel::register("GPUEndTime"),
+            )
+        };
+        if !start.is_finite() || !end.is_finite() || end <= start {
+            return 0;
+        }
+        ((end - start) * 1_000_000_000.0) as u128
+    }
+
+    unsafe extern "C" {
+        #[link_name = "objc_msgSend"]
+        fn objc_msg_send_f64(receiver: *mut c_void, selector: Sel) -> f64;
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3871,10 +4426,22 @@ mod platform {
     pub struct F32VectorBuffer;
     pub struct U8Buffer;
 
+    impl Bf16MatrixBuffer {
+        pub fn rows(&self) -> usize {
+            0
+        }
+    }
+
     impl MetalContext {
         pub fn new() -> Result<Self> {
             Err(eyre!("Metal backend is only available on macOS"))
         }
+
+        pub fn take_gpu_time_ns(&self) -> u128 {
+            0
+        }
+
+        pub fn set_profile_enabled(&self, _enabled: bool) {}
 
         pub fn rms_norm(&self, _x: &[f32], _weight: &[f32]) -> Result<Vec<f32>> {
             Err(eyre!("Metal backend is only available on macOS"))

@@ -112,7 +112,7 @@ fn probe_fixtures() -> Vec<ProbeFixture> {
             "code text",
             [(
                 Role::User,
-                "Explain:\n```rust\nlet Some(x) = maybe else { return Ok(()); };\n```",
+                "Explain:\n\trust\n\tlet Some(x) = maybe else { return Ok(()); };",
             )],
             prefill_token_limit,
         ),
