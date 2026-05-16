@@ -1,0 +1,13 @@
+[package]
+name = "inference-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eyre = "0.6"
+openai-harmony = "0.0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.33"
