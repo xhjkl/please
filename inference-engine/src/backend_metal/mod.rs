@@ -32,9 +32,9 @@ mod weights;
 
 pub use generation::MetalEngine;
 pub(crate) use probes::{decode_token_text, decode_tokens_text, metal_sampler_description};
+use profile::{GpuStage, ProfileDelta, StageMarker, TokenStage, stage_marker};
 #[cfg(feature = "profile")]
 pub use profile::{MetalProfileRecord, MetalProfileReport};
-use profile::{ProfileDelta, StageMarker, TokenStage, stage_marker};
 #[cfg(feature = "profile")]
 use profile::{ProfileState, StageProfileState};
 pub(crate) use runtime::platform;
@@ -137,6 +137,7 @@ impl MetalRuntime {
         MetalProfileReport {
             records,
             stage_profile,
+            counter_sampling: self.platform.counter_sampling_summary(),
         }
     }
 
@@ -208,6 +209,20 @@ impl MetalRuntime {
             return;
         };
         stage_profile.record(token_position, stage, ns);
+    }
+
+    #[cfg(feature = "profile")]
+    fn record_gpu_stages(&self, token_position: usize, stages: Vec<(GpuStage, u128)>) {
+        if stages.is_empty() {
+            return;
+        }
+        let mut profile = self.profile.lock().unwrap();
+        let Some(stage_profile) = &mut profile.stage_profile else {
+            return;
+        };
+        for (stage, ns) in stages {
+            stage_profile.record_gpu_stage(token_position, stage, ns);
+        }
     }
 
     fn bf16_matrix_buffer_from_map(

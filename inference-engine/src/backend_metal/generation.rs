@@ -1,7 +1,7 @@
 use eyre::{Result, eyre};
 
 use super::{
-    ATTN_VALUES, HIDDEN_SIZE, KV_HEADS, KV_VALUES, LAYERS, LM_HEAD_TOP1_BLOCK_SIZE,
+    ATTN_VALUES, GpuStage, HIDDEN_SIZE, KV_HEADS, KV_VALUES, LAYERS, LM_HEAD_TOP1_BLOCK_SIZE,
     MAX_RESIDENT_CONTEXT_TOKENS, MetalRuntime, Q_HEADS, StageMarker, TokenStage, decode_token_text,
     decode_tokens_text, metal_sampler_description, platform, stage_marker,
     weights::{GptOssLayerWeights, GptOssWeights},
@@ -727,7 +727,7 @@ fn copy_hidden(
     input: &platform::F32VectorBuffer,
     output: &platform::F32VectorBuffer,
 ) -> Result<()> {
-    let batch = ctx.platform.begin_batch();
+    let batch = ctx.platform.begin_labeled_batch("generation.copy_hidden");
     batch.copy_f32_slot_into(input, 0, HIDDEN_SIZE, output)?;
     finish_generation_batch(ctx, batch, no_stage_marker());
     Ok(())
@@ -743,7 +743,8 @@ fn decode_token_into_state(
     position: usize,
     token: u32,
 ) -> Result<PingPong> {
-    let batch = ctx.platform.begin_batch();
+    let batch = ctx.platform.begin_labeled_batch("generation.decode_token");
+    batch.set_stage(GpuStage::Embedding);
     batch.embedding_lookup_bf16_into(&weights.embed, token as usize, &scratch.hidden_ping)?;
     let mut current = PingPong::Ping;
 
@@ -831,7 +832,8 @@ fn decode_and_score_next_token(
     sampler: &mut Sampler,
 ) -> Result<ScoredToken> {
     let output_position = position + 1;
-    let batch = ctx.platform.begin_batch();
+    let batch = ctx.platform.begin_labeled_batch("generation.hot_token");
+    batch.set_stage(GpuStage::Embedding);
     batch.embedding_lookup_bf16_into(&weights.embed, token as usize, &scratch.hidden_ping)?;
     let mut current = PingPong::Ping;
 
@@ -852,6 +854,7 @@ fn decode_and_score_next_token(
     }
 
     let hidden = current_hidden(scratch, current);
+    batch.set_stage(GpuStage::LmHead);
     batch.rms_norm_into(&hidden, &weights.final_norm, &scratch.final_hidden)?;
     if sampler.needs_full_vocab() {
         batch.bf16_matrix_logits_into(
@@ -948,7 +951,10 @@ fn prefill_embeddings(
             ..ProfileDelta::default()
         },
     );
-    let batch = ctx.platform.begin_batch();
+    let batch = ctx
+        .platform
+        .begin_labeled_batch("generation.prefill_embeddings");
+    batch.set_stage(GpuStage::Embedding);
     batch.embedding_lookup_bf16_batch_into(
         &weights.embed,
         &scratch.prefill_tokens,
@@ -992,7 +998,9 @@ fn prefill_layers(
     } else {
         scratch.prefill_hidden_pong.clone()
     };
-    let batch = ctx.platform.begin_batch();
+    let batch = ctx
+        .platform
+        .begin_labeled_batch("generation.prefill_final_hidden");
     batch.copy_f32_slot_into(
         &final_prompt_hidden,
         token_count - 1,
@@ -1025,7 +1033,8 @@ fn prefill_layer(
     }
 
     let layer_cache = kv_cache.layer(layer)?;
-    let batch = ctx.platform.begin_batch();
+    let batch = ctx.platform.begin_labeled_batch("generation.prefill_layer");
+    batch.set_stage(GpuStage::InputNormQkv);
     batch.rms_norm_batch_into(
         input,
         &weights.input_norm,
@@ -1054,6 +1063,7 @@ fn prefill_layer(
         &scratch.prefill_v,
         token_count,
     )?;
+    batch.set_stage(GpuStage::RopeKvWrite);
     batch.rope_batch_into(
         &scratch.prefill_q,
         &scratch.prefill_q_rope,
@@ -1082,6 +1092,7 @@ fn prefill_layer(
         token_count,
         KV_VALUES,
     )?;
+    batch.set_stage(GpuStage::Attention);
     if start_position == 0 {
         batch.sequence_attention_into(
             layer,
@@ -1104,6 +1115,7 @@ fn prefill_layer(
             &scratch.prefill_attn,
         )?;
     }
+    batch.set_stage(GpuStage::AttnProj);
     batch.bf16_matrix_matvec_batch_into(
         &weights.attn.o.weight,
         &scratch.prefill_attn,
@@ -1112,6 +1124,7 @@ fn prefill_layer(
         token_count,
     )?;
     batch.vector_add_into(input, &scratch.prefill_projected, &scratch.prefill_residual)?;
+    batch.set_stage(GpuStage::RouterTop4);
     batch.rms_norm_batch_into(
         &scratch.prefill_residual,
         &weights.post_attn_norm,
@@ -1137,6 +1150,7 @@ fn prefill_layer(
 
     for row_offset in (0..token_count).step_by(PREFILL_MOE_CHUNK_TOKENS) {
         let rows = (token_count - row_offset).min(PREFILL_MOE_CHUNK_TOKENS);
+        batch.set_stage(GpuStage::ExpertsGate);
         batch.mxfp4_top4_gate_swiglu_batch_into(
             &weights.sparse_mlp.experts_carousel.gate_up_blocks,
             &weights.sparse_mlp.experts_carousel.gate_up_scales,
@@ -1147,6 +1161,7 @@ fn prefill_layer(
             row_offset,
             rows,
         )?;
+        batch.set_stage(GpuStage::ExpertsDown);
         batch.mxfp4_top4_down_weighted_batch_into(
             &weights.sparse_mlp.experts_carousel.down_blocks,
             &weights.sparse_mlp.experts_carousel.down_scales,
@@ -1257,7 +1272,8 @@ fn score_topk(
     k: usize,
     output_position: usize,
 ) -> Result<Vec<GreedyTokenReport>> {
-    let batch = ctx.platform.begin_batch();
+    let batch = ctx.platform.begin_labeled_batch("generation.score_topk");
+    batch.set_stage(GpuStage::LmHead);
     batch.rms_norm_into(hidden, &weights.final_norm, &scratch.final_hidden)?;
     if k == 1 {
         batch.bf16_matrix_top1_into(
@@ -1310,7 +1326,10 @@ fn sample_full_vocab_debug(
     sampler: &mut Sampler,
     output_position: usize,
 ) -> Result<GreedyTokenReport> {
-    let batch = ctx.platform.begin_batch();
+    let batch = ctx
+        .platform
+        .begin_labeled_batch("generation.full_vocab_debug");
+    batch.set_stage(GpuStage::LmHead);
     batch.rms_norm_into(hidden, &weights.final_norm, &scratch.final_hidden)?;
     batch.bf16_matrix_logits_into(&weights.lm_head, &scratch.final_hidden, &scratch.lm_logits)?;
     finish_generation_batch(
@@ -1354,6 +1373,7 @@ fn encode_decode_layer(
     }
 
     let layer_cache = kv_cache.layer(layer)?;
+    batch.set_stage(GpuStage::InputNormQkv);
     batch.rms_norm_into(input, &weights.input_norm, &scratch.normed)?;
     batch.bf16_qkv_matvec_into(
         &weights.attn.q.weight,
@@ -1367,10 +1387,12 @@ fn encode_decode_layer(
         &scratch.k,
         &scratch.v,
     )?;
+    batch.set_stage(GpuStage::RopeKvWrite);
     batch.rope_row_into(&scratch.q, &scratch.q_rope, Q_HEADS, position)?;
     batch.rope_row_into(&scratch.k, &scratch.k_rope, KV_HEADS, position)?;
     batch.write_f32_slot_into(&scratch.k_rope, &layer_cache.k, position, KV_VALUES)?;
     batch.write_f32_slot_into(&scratch.v, &layer_cache.v, position, KV_VALUES)?;
+    batch.set_stage(GpuStage::Attention);
     batch.kv_cache_decode_attention_into(
         layer,
         position,
@@ -1382,6 +1404,7 @@ fn encode_decode_layer(
         &weights.attn.sinks,
         &scratch.attn,
     )?;
+    batch.set_stage(GpuStage::AttnProj);
     batch.bf16_matrix_matvec_into(
         &weights.attn.o.weight,
         &scratch.attn,
@@ -1389,6 +1412,7 @@ fn encode_decode_layer(
         &scratch.projected,
     )?;
     batch.vector_add_into(input, &scratch.projected, &scratch.residual)?;
+    batch.set_stage(GpuStage::RouterTop4);
     batch.rms_norm_into(
         &scratch.residual,
         &weights.post_attn_norm,
@@ -1407,6 +1431,7 @@ fn encode_decode_layer(
         &scratch.router_weights,
     )?;
 
+    batch.set_stage(GpuStage::ExpertsGate);
     batch.mxfp4_top4_gate_swiglu_into(
         &weights.sparse_mlp.experts_carousel.gate_up_blocks,
         &weights.sparse_mlp.experts_carousel.gate_up_scales,
@@ -1415,6 +1440,7 @@ fn encode_decode_layer(
         &scratch.router_indices,
         &scratch.expert_acts_packed,
     )?;
+    batch.set_stage(GpuStage::ExpertsDown);
     batch.mxfp4_top4_down_weighted_into(
         &weights.sparse_mlp.experts_carousel.down_blocks,
         &weights.sparse_mlp.experts_carousel.down_scales,
@@ -1434,7 +1460,8 @@ fn finish_generation_batch(
     batch: platform::MetalBatch<'_>,
     stage: StageMarker,
 ) -> u128 {
-    let gpu_ns = batch.finish();
+    let timing = batch.finish();
+    let gpu_ns = timing.gpu_ns;
     #[cfg(not(feature = "profile"))]
     {
         let _ = ctx;
@@ -1451,6 +1478,7 @@ fn finish_generation_batch(
     #[cfg(feature = "profile")]
     if let Some((token_position, stage)) = stage {
         ctx.record_token_stage(token_position, stage, gpu_ns);
+        ctx.record_gpu_stages(token_position, timing.gpu_stages);
     }
     gpu_ns
 }

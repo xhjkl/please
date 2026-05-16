@@ -8,6 +8,8 @@ pub struct MetalProfileReport {
     pub records: Vec<MetalProfileRecord>,
     #[cfg(feature = "profile")]
     pub stage_profile: Option<MetalStageProfileReport>,
+    #[cfg(feature = "profile")]
+    pub counter_sampling: String,
 }
 
 #[cfg(feature = "profile")]
@@ -34,6 +36,7 @@ impl MetalProfileReport {
             format_duration_ns(total_wall_ns)
         ));
         out.push_str("- gpu: Metal command-buffer GPU timestamps where available\n");
+        out.push_str(&format!("- counter samples: {}\n", self.counter_sampling));
         out.push_str("\nkey metrics:\n");
         out.push_str(&format!(
             "- hot token door-to-door: {}\n",
@@ -138,6 +141,8 @@ pub struct MetalStageProfileReport {
     token_positions: Vec<Option<usize>>,
     stage_names: Vec<&'static str>,
     values_ns: Vec<Vec<u128>>,
+    gpu_stage_names: Vec<&'static str>,
+    gpu_values_ns: Vec<Vec<u128>>,
 }
 
 #[cfg(feature = "profile")]
@@ -202,6 +207,83 @@ impl MetalStageProfileReport {
         out
     }
 
+    fn render_gpu_stage_breakdown(&self) -> String {
+        let active_stages = self.active_gpu_stages();
+        let mut rows = self
+            .token_positions
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, position)| Some((slot, (*position)?)))
+            .filter(|(slot, _)| self.gpu_values_ns[*slot].iter().any(|ns| *ns != 0))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|(_, position)| *position);
+
+        let mut out = String::new();
+        out.push_str("\nhot token dispatch-stage profile:\n");
+        out.push_str("- source: Metal counter samples around compute encoders\n");
+        out.push_str(
+            "- note: profile builds insert counter samples and are not production timing\n\n",
+        );
+        if rows.is_empty() || active_stages.is_empty() {
+            out.push_str(
+                "(no dispatch-stage samples; counter samples may be unsupported on this device)\n",
+            );
+            return out;
+        }
+
+        out.push_str("token      sampled_total");
+        for stage in &active_stages {
+            out.push_str(&format!("  {:>14}", self.gpu_stage_names[*stage]));
+        }
+        out.push('\n');
+        out.push_str("---------  -------------");
+        for _ in &active_stages {
+            out.push_str("  --------------");
+        }
+        out.push('\n');
+
+        let mut totals = vec![0u128; self.gpu_stage_names.len()];
+        let mut row_count = 0u128;
+        for (slot, position) in &rows {
+            row_count += 1;
+            let sampled_total = self.gpu_values_ns[*slot].iter().sum::<u128>();
+            out.push_str(&format!(
+                "{position:>9}  {:>13}",
+                format_duration_ns(sampled_total)
+            ));
+            for stage in &active_stages {
+                let value = self.gpu_values_ns[*slot][*stage];
+                totals[*stage] = totals[*stage].saturating_add(value);
+                out.push_str(&format!("  {:>14}", format_duration_ns(value)));
+            }
+            out.push('\n');
+        }
+
+        if row_count > 1 {
+            out.push_str("average    ");
+            let average_total = active_stages
+                .iter()
+                .map(|stage| totals[*stage])
+                .sum::<u128>()
+                / row_count;
+            out.push_str(&format!("{:>13}", format_duration_ns(average_total)));
+            for stage in &active_stages {
+                out.push_str(&format!(
+                    "  {:>14}",
+                    format_duration_ns(totals[*stage] / row_count)
+                ));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn active_gpu_stages(&self) -> Vec<usize> {
+        (0..self.gpu_stage_names.len())
+            .filter(|stage| self.gpu_values_ns.iter().any(|row| row[*stage] != 0))
+            .collect()
+    }
+
     fn value_at(&self, token_position: usize, stage: TokenStage) -> u128 {
         if self.token_positions.is_empty() {
             return 0;
@@ -243,6 +325,7 @@ impl MetalStageProfileReport {
             }
             out.push('\n');
         }
+        out.push_str(&self.render_gpu_stage_breakdown());
         out
     }
 }
@@ -287,6 +370,69 @@ pub(crate) enum TokenStage {
     HotToken,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum GpuStage {
+    Other,
+    Embedding,
+    InputNormQkv,
+    RopeKvWrite,
+    Attention,
+    AttnProj,
+    RouterTop4,
+    ExpertsGate,
+    ExpertsDown,
+    LmHead,
+}
+
+impl GpuStage {
+    #[cfg(feature = "profile")]
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Other,
+        Self::Embedding,
+        Self::InputNormQkv,
+        Self::RopeKvWrite,
+        Self::Attention,
+        Self::AttnProj,
+        Self::RouterTop4,
+        Self::ExpertsGate,
+        Self::ExpertsDown,
+        Self::LmHead,
+    ];
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Other => 0,
+            Self::Embedding => 1,
+            Self::InputNormQkv => 2,
+            Self::RopeKvWrite => 3,
+            Self::Attention => 4,
+            Self::AttnProj => 5,
+            Self::RouterTop4 => 6,
+            Self::ExpertsGate => 7,
+            Self::ExpertsDown => 8,
+            Self::LmHead => 9,
+        }
+    }
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Other => "other",
+            Self::Embedding => "embedding",
+            Self::InputNormQkv => "norm_qkv",
+            Self::RopeKvWrite => "rope_kv",
+            Self::Attention => "attention",
+            Self::AttnProj => "attn_proj",
+            Self::RouterTop4 => "router_top4",
+            Self::ExpertsGate => "experts_gate",
+            Self::ExpertsDown => "experts_down",
+            Self::LmHead => "lm_head",
+        }
+    }
+}
+
 impl TokenStage {
     #[cfg(feature = "profile")]
     const ALL: [Self; 3] = [Self::Token, Self::LmHead, Self::HotToken];
@@ -315,6 +461,7 @@ impl TokenStage {
 pub(crate) struct StageProfileState {
     token_positions: Vec<Option<usize>>,
     values_ns: Vec<Vec<u128>>,
+    gpu_values_ns: Vec<Vec<u128>>,
 }
 
 #[cfg(feature = "profile")]
@@ -323,6 +470,7 @@ impl StageProfileState {
         Self {
             token_positions: vec![None; ring_capacity],
             values_ns: vec![vec![0; TokenStage::ALL.len()]; ring_capacity],
+            gpu_values_ns: vec![vec![0; GpuStage::ALL.len()]; ring_capacity],
         }
     }
 
@@ -334,9 +482,24 @@ impl StageProfileState {
         if self.token_positions[slot] != Some(token_position) {
             self.token_positions[slot] = Some(token_position);
             self.values_ns[slot].fill(0);
+            self.gpu_values_ns[slot].fill(0);
         }
         self.values_ns[slot][stage.index()] =
             self.values_ns[slot][stage.index()].saturating_add(ns);
+    }
+
+    pub(crate) fn record_gpu_stage(&mut self, token_position: usize, stage: GpuStage, ns: u128) {
+        if self.token_positions.is_empty() || ns == 0 {
+            return;
+        }
+        let slot = token_position % self.token_positions.len();
+        if self.token_positions[slot] != Some(token_position) {
+            self.token_positions[slot] = Some(token_position);
+            self.values_ns[slot].fill(0);
+            self.gpu_values_ns[slot].fill(0);
+        }
+        self.gpu_values_ns[slot][stage.index()] =
+            self.gpu_values_ns[slot][stage.index()].saturating_add(ns);
     }
 
     pub(crate) fn report(&self) -> MetalStageProfileReport {
@@ -344,6 +507,8 @@ impl StageProfileState {
             token_positions: self.token_positions.clone(),
             stage_names: TokenStage::ALL.iter().map(|stage| stage.name()).collect(),
             values_ns: self.values_ns.clone(),
+            gpu_stage_names: GpuStage::ALL.iter().map(|stage| stage.name()).collect(),
+            gpu_values_ns: self.gpu_values_ns.clone(),
         }
     }
 }

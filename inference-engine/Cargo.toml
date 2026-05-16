@@ -7,6 +7,7 @@ edition = "2024"
 default = []
 profile = [
     "objc2-metal/MTLBlitCommandEncoder",
+    "objc2-metal/MTLComputePass",
     "objc2-metal/MTLCounters",
 ]
 

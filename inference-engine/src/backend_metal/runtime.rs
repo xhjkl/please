@@ -1,3 +1,4 @@
+use super::profile::GpuStage;
 use super::{
     ATTN_VALUES, EXPERTS, GATE_UP_VALUES, HIDDEN_SIZE, KV_VALUES, LM_HEAD_TOP1_BLOCK_SIZE,
     LOCAL_WINDOW_TOKENS, MAX_KV_CACHE_PROBE_TOKENS, MAX_PREFILL_PROBE_TOKENS,
@@ -6,6 +7,7 @@ use super::{
 
 #[cfg(target_os = "macos")]
 pub(crate) mod platform {
+    use super::GpuStage;
     use super::{
         ATTN_VALUES, EXPERTS, GATE_UP_VALUES, HIDDEN_SIZE, KV_VALUES, LM_HEAD_TOP1_BLOCK_SIZE,
         LOCAL_WINDOW_TOKENS, MAX_KV_CACHE_PROBE_TOKENS, MAX_PREFILL_PROBE_TOKENS,
@@ -16,19 +18,36 @@ pub(crate) mod platform {
     use objc2::ffi::NSUInteger;
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
+    #[cfg(feature = "profile")]
+    use objc2_foundation::NSRange;
     use objc2_foundation::NSString;
     use objc2_metal::{
         MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
         MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
         MTLFunction, MTLLibrary, MTLResourceOptions, MTLSize,
     };
+    #[cfg(feature = "profile")]
+    use objc2_metal::{
+        MTLComputePassDescriptor, MTLCounterResultTimestamp, MTLCounterSampleBuffer,
+        MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint, MTLCounterSet, MTLStorageMode,
+    };
+    #[cfg(feature = "profile")]
+    use std::cell::{Cell, RefCell};
+    #[cfg(feature = "profile")]
+    use std::collections::HashMap;
     use std::ffi::c_void;
+    #[cfg(feature = "profile")]
+    use std::mem::size_of;
     use std::mem::size_of_val;
     use std::ptr::NonNull;
+    #[cfg(feature = "profile")]
+    use std::slice;
     #[cfg(feature = "profile")]
     use std::sync::Mutex;
 
     const THREADS_PER_GROUP: u64 = 256;
+    #[cfg(feature = "profile")]
+    const MAX_COUNTER_SAMPLES_PER_BATCH: usize = 1024;
 
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {}
@@ -45,6 +64,34 @@ pub(crate) mod platform {
     pub struct MetalBatch<'a> {
         context: &'a MetalContext,
         command_buffer: Retained<MetalCommandBuffer>,
+        #[cfg(feature = "profile")]
+        label: Option<String>,
+        #[cfg(feature = "profile")]
+        stage: Cell<GpuStage>,
+        #[cfg(feature = "profile")]
+        counter_samples: RefCell<Option<CounterSamples>>,
+    }
+
+    pub struct BatchTiming {
+        pub gpu_ns: u128,
+        #[cfg(feature = "profile")]
+        pub gpu_stages: Vec<(GpuStage, u128)>,
+    }
+
+    #[cfg(feature = "profile")]
+    struct CounterSamples {
+        sample_buffer: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
+        stages: Vec<GpuStage>,
+        sample_limit: usize,
+        timestamp_frequency: u64,
+        mode: CounterSamplingMode,
+    }
+
+    #[cfg(feature = "profile")]
+    #[derive(Debug, Clone, Copy)]
+    enum CounterSamplingMode {
+        EncoderBoundary,
+        DispatchBoundary,
     }
 
     pub struct MetalContext {
@@ -52,6 +99,8 @@ pub(crate) mod platform {
         queue: Retained<MetalCommandQueue>,
         #[cfg(feature = "profile")]
         gpu_time_ns: Mutex<u128>,
+        #[cfg(feature = "profile")]
+        counter_sampling_status: Mutex<String>,
         partial_sum_squares: Retained<MetalComputePipelineState>,
         apply_rms_norm: Retained<MetalComputePipelineState>,
         apply_rms_norm_from_partials: Retained<MetalComputePipelineState>,
@@ -140,6 +189,8 @@ pub(crate) mod platform {
             Ok(Self {
                 #[cfg(feature = "profile")]
                 gpu_time_ns: Mutex::new(0),
+                #[cfg(feature = "profile")]
+                counter_sampling_status: Mutex::new("not attempted".to_string()),
                 partial_sum_squares: pipeline(&device, &library, "partial_sum_squares")?,
                 apply_rms_norm: pipeline(&device, &library, "apply_rms_norm")?,
                 apply_rms_norm_from_partials: pipeline(
@@ -211,6 +262,50 @@ pub(crate) mod platform {
             value
         }
 
+        #[cfg(feature = "profile")]
+        pub fn counter_sampling_summary(&self) -> String {
+            self.counter_sampling_status.lock().unwrap().clone()
+        }
+
+        #[cfg(feature = "profile")]
+        fn set_counter_sampling_status(&self, status: impl Into<String>) {
+            *self.counter_sampling_status.lock().unwrap() = status.into();
+        }
+
+        #[cfg(feature = "profile")]
+        fn detect_counter_sampling(&self) -> &'static str {
+            if !self
+                .device
+                .supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary)
+                && !self
+                    .device
+                    .supportsCounterSampling(MTLCounterSamplingPoint::AtDispatchBoundary)
+            {
+                return "unsupported by this Metal device";
+            }
+            let Some(counter_sets) = self.device.counterSets() else {
+                return "counter sets unavailable";
+            };
+            let timestamp_name = NSString::from_str("timestamp");
+            if counter_sets
+                .iter()
+                .all(|counter_set| &*counter_set.name() != &*timestamp_name)
+            {
+                return "timestamp counter set unavailable";
+            }
+            if self.device.queryTimestampFrequency() == 0 {
+                return "timestamp frequency unavailable";
+            }
+            if self
+                .device
+                .supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary)
+            {
+                "compute-pass encoder-boundary timestamps"
+            } else {
+                "compute-dispatch-boundary timestamps"
+            }
+        }
+
         fn finish_command_buffer(&self, command_buffer: &MetalCommandBuffer) -> u128 {
             command_buffer.commit();
             command_buffer.wait_until_completed();
@@ -228,11 +323,81 @@ pub(crate) mod platform {
             }
         }
 
-        pub fn begin_batch(&self) -> MetalBatch<'_> {
+        pub fn begin_labeled_batch(&self, label: &str) -> MetalBatch<'_> {
+            let command_buffer = self.queue.new_command_buffer();
+            #[cfg(feature = "profile")]
+            command_buffer.setLabel(Some(&NSString::from_str(label)));
+            #[cfg(not(feature = "profile"))]
+            let _ = label;
+            #[cfg(feature = "profile")]
+            let counter_samples = self.counter_samples(label);
             MetalBatch {
                 context: self,
-                command_buffer: self.queue.new_command_buffer(),
+                command_buffer,
+                #[cfg(feature = "profile")]
+                label: Some(label.to_owned()),
+                #[cfg(feature = "profile")]
+                stage: Cell::new(GpuStage::Other),
+                #[cfg(feature = "profile")]
+                counter_samples: RefCell::new(counter_samples),
             }
+        }
+
+        #[cfg(feature = "profile")]
+        fn counter_samples(&self, label: &str) -> Option<CounterSamples> {
+            let status = self.detect_counter_sampling();
+            self.set_counter_sampling_status(status);
+            if status != "compute-pass encoder-boundary timestamps"
+                && status != "compute-dispatch-boundary timestamps"
+            {
+                return None;
+            }
+            let mode = if self
+                .device
+                .supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary)
+            {
+                CounterSamplingMode::EncoderBoundary
+            } else if self
+                .device
+                .supportsCounterSampling(MTLCounterSamplingPoint::AtDispatchBoundary)
+            {
+                CounterSamplingMode::DispatchBoundary
+            } else {
+                return None;
+            };
+            let counter_sets = self.device.counterSets()?;
+            let timestamp_name = NSString::from_str("timestamp");
+            let timestamp_counter = counter_sets
+                .iter()
+                .find(|counter_set| &*counter_set.name() == &*timestamp_name)?;
+            let descriptor = MTLCounterSampleBufferDescriptor::new();
+            descriptor.setCounterSet(Some(&timestamp_counter));
+            descriptor.setStorageMode(MTLStorageMode::Shared);
+            descriptor.setLabel(&NSString::from_str(label));
+            unsafe {
+                descriptor.setSampleCount(MAX_COUNTER_SAMPLES_PER_BATCH as NSUInteger);
+            }
+            let sample_buffer = self
+                .device
+                .newCounterSampleBufferWithDescriptor_error(&descriptor)
+                .inspect_err(|error| {
+                    self.set_counter_sampling_status(format!(
+                        "sample buffer creation failed: {error:?}"
+                    ))
+                })
+                .ok()?;
+            let timestamp_frequency = self.device.queryTimestampFrequency();
+            if timestamp_frequency == 0 {
+                self.set_counter_sampling_status("timestamp frequency unavailable");
+                return None;
+            }
+            Some(CounterSamples {
+                sample_buffer,
+                stages: Vec::new(),
+                sample_limit: MAX_COUNTER_SAMPLES_PER_BATCH,
+                timestamp_frequency,
+                mode,
+            })
         }
 
         pub fn alloc_f32_vector(&self, len: usize) -> Result<F32VectorBuffer> {
@@ -1214,8 +1379,116 @@ pub(crate) mod platform {
     }
 
     impl<'a> MetalBatch<'a> {
-        pub fn finish(self) -> u128 {
-            self.context.finish_command_buffer(&self.command_buffer)
+        pub fn finish(self) -> BatchTiming {
+            #[cfg(feature = "profile")]
+            self.sample_stage_boundary(GpuStage::Other);
+            let gpu_ns = self.context.finish_command_buffer(&self.command_buffer);
+            #[cfg(feature = "profile")]
+            let gpu_stages = self
+                .counter_samples
+                .into_inner()
+                .map(CounterSamples::resolve)
+                .unwrap_or_default();
+            BatchTiming {
+                gpu_ns,
+                #[cfg(feature = "profile")]
+                gpu_stages,
+            }
+        }
+
+        pub fn set_stage(&self, stage: GpuStage) {
+            #[cfg(feature = "profile")]
+            self.stage.set(stage);
+            #[cfg(not(feature = "profile"))]
+            let _ = stage;
+        }
+
+        fn encoder(&self, label: &str) -> Retained<MetalComputeCommandEncoder> {
+            #[cfg(feature = "profile")]
+            let sample_indices = self.reserve_encoder_boundary_samples(self.stage.get());
+            #[cfg(feature = "profile")]
+            let sampled_by_encoder = sample_indices.is_some();
+            #[cfg(feature = "profile")]
+            let encoder = if let Some((start, end)) = sample_indices {
+                self.command_buffer
+                    .new_compute_command_encoder_with_samples(
+                        self.counter_sample_buffer()
+                            .as_deref()
+                            .expect("reserved sample indices require a sample buffer"),
+                        start,
+                        end,
+                    )
+            } else {
+                self.command_buffer.new_compute_command_encoder()
+            };
+            #[cfg(not(feature = "profile"))]
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            #[cfg(feature = "profile")]
+            if let Some(batch_label) = &self.label {
+                let label = format!("{batch_label}.{label}");
+                encoder.setLabel(Some(&NSString::from_str(&label)));
+            }
+            #[cfg(not(feature = "profile"))]
+            let _ = label;
+            #[cfg(feature = "profile")]
+            if !sampled_by_encoder {
+                self.sample_encoder_boundary(&encoder, self.stage.get());
+            }
+            encoder
+        }
+
+        fn end_encoder(&self, encoder: Retained<MetalComputeCommandEncoder>) {
+            #[cfg(feature = "profile")]
+            if self.uses_dispatch_boundary_samples() {
+                self.sample_encoder_boundary(&encoder, GpuStage::Other);
+            }
+            encoder.end_encoding();
+        }
+
+        #[cfg(feature = "profile")]
+        fn sample_stage_boundary(&self, stage: GpuStage) {
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            if let Some(batch_label) = &self.label {
+                let label = format!("{batch_label}.profile_boundary");
+                encoder.setLabel(Some(&NSString::from_str(&label)));
+            }
+            self.sample_encoder_boundary(&encoder, stage);
+            encoder.end_encoding();
+        }
+
+        #[cfg(feature = "profile")]
+        fn sample_encoder_boundary(&self, encoder: &MetalComputeCommandEncoder, stage: GpuStage) {
+            let mut counter_samples = self.counter_samples.borrow_mut();
+            let Some(counter_samples) = &mut *counter_samples else {
+                return;
+            };
+            counter_samples.sample(encoder, stage);
+        }
+
+        #[cfg(feature = "profile")]
+        fn reserve_encoder_boundary_samples(&self, stage: GpuStage) -> Option<(usize, usize)> {
+            let mut counter_samples = self.counter_samples.borrow_mut();
+            let counter_samples = counter_samples.as_mut()?;
+            counter_samples.reserve_encoder_boundary(stage)
+        }
+
+        #[cfg(feature = "profile")]
+        fn uses_dispatch_boundary_samples(&self) -> bool {
+            let counter_samples = self.counter_samples.borrow();
+            let Some(counter_samples) = &*counter_samples else {
+                return false;
+            };
+            counter_samples.uses_dispatch_boundary()
+        }
+
+        #[cfg(feature = "profile")]
+        fn counter_sample_buffer(
+            &self,
+        ) -> Option<Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>> {
+            let counter_samples = self.counter_samples.borrow();
+            counter_samples
+                .as_ref()
+                .map(|counter_samples| counter_samples.sample_buffer.clone())
         }
 
         pub fn embedding_lookup_bf16_into(
@@ -1243,7 +1516,7 @@ pub(crate) mod platform {
             let token_buffer = buffer_with_data(&self.context.device, &[token]);
             let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("embedding_lookup_bf16");
             encoder.set_compute_pipeline_state(&self.context.embedding_lookup_bf16);
             encoder.set_buffer(0, Some(&weight.buffer), 0);
             encoder.set_buffer(1, Some(&out.buffer), 0);
@@ -1253,7 +1526,7 @@ pub(crate) mod platform {
                 mtl_size(weight.cols as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1288,7 +1561,7 @@ pub(crate) mod platform {
             let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
             let token_count_buffer = buffer_with_data(&self.context.device, &[token_count]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("embedding_lookup_bf16_batch");
             encoder.set_compute_pipeline_state(&self.context.embedding_lookup_bf16_batch);
             encoder.set_buffer(0, Some(&weight.buffer), 0);
             encoder.set_buffer(1, Some(&tokens.buffer), 0);
@@ -1299,7 +1572,7 @@ pub(crate) mod platform {
                 mtl_size(expected as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1330,7 +1603,7 @@ pub(crate) mod platform {
             let n_buffer = buffer_with_data(&self.context.device, &[n]);
             let groups_buffer = buffer_with_data(&self.context.device, &[groups as u32]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("partial_sum_squares");
             encoder.set_compute_pipeline_state(&self.context.partial_sum_squares);
             encoder.set_buffer(0, Some(&input.buffer), 0);
             encoder.set_buffer(1, Some(&partial_buffer), 0);
@@ -1339,9 +1612,9 @@ pub(crate) mod platform {
                 mtl_size(groups as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("apply_rms_norm_from_partials");
             encoder.set_compute_pipeline_state(&self.context.apply_rms_norm_from_partials);
             encoder.set_buffer(0, Some(&input.buffer), 0);
             encoder.set_buffer(1, Some(&weight.buffer), 0);
@@ -1353,7 +1626,7 @@ pub(crate) mod platform {
                 mtl_size(input.len as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1390,7 +1663,7 @@ pub(crate) mod platform {
             let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
             let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("rms_norm_batch");
             encoder.set_compute_pipeline_state(&self.context.rms_norm_batch);
             encoder.set_buffer(0, Some(&input.buffer), 0);
             encoder.set_buffer(1, Some(&weight.buffer), 0);
@@ -1401,7 +1674,7 @@ pub(crate) mod platform {
                 mtl_size(rows as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1433,7 +1706,7 @@ pub(crate) mod platform {
             let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
             let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("bf16_matrix_matvec");
             let threadgroups = if weight.row_tile == 4 {
                 encoder.set_compute_pipeline_state(&self.context.bf16_matvec_tiled4);
                 weight.rows.div_ceil(4)
@@ -1451,7 +1724,7 @@ pub(crate) mod platform {
                 mtl_size(threadgroups as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1531,7 +1804,7 @@ pub(crate) mod platform {
             let kv_tiles_buffer = buffer_with_data(&self.context.device, &[kv_tiles]);
             let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("bf16_qkv_matvec");
             encoder.set_compute_pipeline_state(&self.context.bf16_qkv_matvec_tiled4);
             encoder.set_buffer(0, Some(&q_weight.buffer), 0);
             encoder.set_buffer(1, Some(&k_weight.buffer), 0);
@@ -1550,7 +1823,7 @@ pub(crate) mod platform {
                 mtl_size(total_tiles as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1593,7 +1866,7 @@ pub(crate) mod platform {
             let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
             let batch_rows_buffer = buffer_with_data(&self.context.device, &[batch_rows]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("bf16_matrix_matvec_batch");
             let threadgroups = if weight.row_tile == 4 {
                 encoder.set_compute_pipeline_state(&self.context.bf16_matvec_batch_tiled4);
                 weight.rows.div_ceil(4)
@@ -1612,7 +1885,7 @@ pub(crate) mod platform {
                 mtl_size(threadgroups as NSUInteger, batch_rows as NSUInteger, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1652,7 +1925,7 @@ pub(crate) mod platform {
             let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
             let k_buffer = buffer_with_data(&self.context.device, &[k]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("bf16_matvec_logits");
             encoder.set_compute_pipeline_state(&self.context.bf16_matvec_logits);
             encoder.set_buffer(0, Some(&weight.buffer), 0);
             encoder.set_buffer(1, Some(&input.buffer), 0);
@@ -1663,9 +1936,9 @@ pub(crate) mod platform {
                 mtl_size(rows as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("topk_logits");
             encoder.set_compute_pipeline_state(&self.context.topk_logits);
             encoder.set_buffer(0, Some(&logits.buffer), 0);
             encoder.set_buffer(1, Some(&indices.buffer), 0);
@@ -1673,7 +1946,7 @@ pub(crate) mod platform {
             encoder.set_buffer(3, Some(&rows_buffer), 0);
             encoder.set_buffer(4, Some(&k_buffer), 0);
             encoder.dispatch_threads(mtl_size(1, 1, 1), mtl_size(1, 1, 1));
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1703,7 +1976,7 @@ pub(crate) mod platform {
             let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
             let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("bf16_matvec_logits");
             encoder.set_compute_pipeline_state(&self.context.bf16_matvec_logits);
             encoder.set_buffer(0, Some(&weight.buffer), 0);
             encoder.set_buffer(1, Some(&input.buffer), 0);
@@ -1714,7 +1987,7 @@ pub(crate) mod platform {
                 mtl_size(rows as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1761,7 +2034,7 @@ pub(crate) mod platform {
             let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
             let blocks_buffer = buffer_with_data(&self.context.device, &[blocks]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("bf16_matvec_logits");
             encoder.set_compute_pipeline_state(&self.context.bf16_matvec_logits);
             encoder.set_buffer(0, Some(&weight.buffer), 0);
             encoder.set_buffer(1, Some(&input.buffer), 0);
@@ -1772,9 +2045,9 @@ pub(crate) mod platform {
                 mtl_size(rows as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("top1_logits_blocks");
             encoder.set_compute_pipeline_state(&self.context.top1_logits_blocks);
             encoder.set_buffer(0, Some(&logits.buffer), 0);
             encoder.set_buffer(1, Some(&block_indices.buffer), 0);
@@ -1784,9 +2057,9 @@ pub(crate) mod platform {
                 mtl_size(blocks as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("top1_logits_final");
             encoder.set_compute_pipeline_state(&self.context.top1_logits_final);
             encoder.set_buffer(0, Some(&block_indices.buffer), 0);
             encoder.set_buffer(1, Some(&block_values.buffer), 0);
@@ -1797,7 +2070,7 @@ pub(crate) mod platform {
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1824,7 +2097,7 @@ pub(crate) mod platform {
             let heads_buffer = buffer_with_data(&self.context.device, &[heads]);
             let position_buffer = buffer_with_data(&self.context.device, &[position]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("rope_row");
             encoder.set_compute_pipeline_state(&self.context.rope_row);
             encoder.set_buffer(0, Some(&input.buffer), 0);
             encoder.set_buffer(1, Some(&out.buffer), 0);
@@ -1834,7 +2107,7 @@ pub(crate) mod platform {
                 mtl_size(expected as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1870,7 +2143,7 @@ pub(crate) mod platform {
             let start_position_buffer = buffer_with_data(&self.context.device, &[start_position]);
             let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("rope_batch");
             encoder.set_compute_pipeline_state(&self.context.rope_batch);
             encoder.set_buffer(0, Some(&input.buffer), 0);
             encoder.set_buffer(1, Some(&out.buffer), 0);
@@ -1881,7 +2154,7 @@ pub(crate) mod platform {
                 mtl_size(expected as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1914,7 +2187,7 @@ pub(crate) mod platform {
             let slot_buffer = buffer_with_data(&self.context.device, &[slot]);
             let width_buffer = buffer_with_data(&self.context.device, &[width]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("write_f32_slot");
             encoder.set_compute_pipeline_state(&self.context.write_f32_slot);
             encoder.set_buffer(0, Some(&input.buffer), 0);
             encoder.set_buffer(1, Some(&output.buffer), 0);
@@ -1924,7 +2197,7 @@ pub(crate) mod platform {
                 mtl_size(width as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -1966,7 +2239,7 @@ pub(crate) mod platform {
             let slots_buffer = buffer_with_data(&self.context.device, &[slots]);
             let width_buffer = buffer_with_data(&self.context.device, &[width]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("write_f32_slots_batch");
             encoder.set_compute_pipeline_state(&self.context.write_f32_slots_batch);
             encoder.set_buffer(0, Some(&input.buffer), 0);
             encoder.set_buffer(1, Some(&output.buffer), 0);
@@ -1977,7 +2250,7 @@ pub(crate) mod platform {
                 mtl_size(input_expected as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2010,7 +2283,7 @@ pub(crate) mod platform {
             let slot_buffer = buffer_with_data(&self.context.device, &[slot]);
             let width_buffer = buffer_with_data(&self.context.device, &[width]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("copy_f32_slot");
             encoder.set_compute_pipeline_state(&self.context.copy_f32_slot);
             encoder.set_buffer(0, Some(&input.buffer), 0);
             encoder.set_buffer(1, Some(&output.buffer), 0);
@@ -2020,7 +2293,7 @@ pub(crate) mod platform {
                 mtl_size(width as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2070,7 +2343,7 @@ pub(crate) mod platform {
             let seq_len_buffer = buffer_with_data(&self.context.device, &[seq_len]);
             let layer_buffer = buffer_with_data(&self.context.device, &[layer]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("sequence_attention");
             encoder.set_compute_pipeline_state(&self.context.sequence_attention);
             encoder.set_buffer(0, Some(&q.buffer), 0);
             encoder.set_buffer(1, Some(&k.buffer), 0);
@@ -2083,7 +2356,7 @@ pub(crate) mod platform {
                 mtl_size(Q_HEADS as NSUInteger, seq_len as NSUInteger, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2137,7 +2410,7 @@ pub(crate) mod platform {
             let start_position_buffer = buffer_with_data(&self.context.device, &[start_position]);
             let suffix_len_buffer = buffer_with_data(&self.context.device, &[suffix_len]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("suffix_sequence_attention");
             encoder.set_compute_pipeline_state(&self.context.suffix_sequence_attention);
             encoder.set_buffer(0, Some(&q.buffer), 0);
             encoder.set_buffer(1, Some(&k_cache.buffer), 0);
@@ -2151,7 +2424,7 @@ pub(crate) mod platform {
                 mtl_size(Q_HEADS as NSUInteger, suffix_len as NSUInteger, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2211,7 +2484,7 @@ pub(crate) mod platform {
                 buffer_with_data(&self.context.device, &[cache_start_position]);
             let cache_len_buffer = buffer_with_data(&self.context.device, &[cache_len]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("kv_cache_decode_attention");
             encoder.set_compute_pipeline_state(&self.context.kv_cache_decode_attention);
             encoder.set_buffer(0, Some(&q.buffer), 0);
             encoder.set_buffer(1, Some(&k_cache.buffer), 0);
@@ -2226,7 +2499,7 @@ pub(crate) mod platform {
                 mtl_size(Q_HEADS as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2248,7 +2521,7 @@ pub(crate) mod platform {
             let n = left.len as u32;
             let n_buffer = buffer_with_data(&self.context.device, &[n]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("vector_add");
             encoder.set_compute_pipeline_state(&self.context.vector_add);
             encoder.set_buffer(0, Some(&left.buffer), 0);
             encoder.set_buffer(1, Some(&right.buffer), 0);
@@ -2258,7 +2531,7 @@ pub(crate) mod platform {
                 mtl_size(left.len as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2278,7 +2551,7 @@ pub(crate) mod platform {
             let n = logits.len as u32;
             let n_buffer = buffer_with_data(&self.context.device, &[n]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("top4_softmax");
             encoder.set_compute_pipeline_state(&self.context.top4_softmax);
             encoder.set_buffer(0, Some(&logits.buffer), 0);
             encoder.set_buffer(1, Some(&indices.buffer), 0);
@@ -2286,7 +2559,7 @@ pub(crate) mod platform {
             encoder.set_buffer(3, Some(&weights.buffer), 0);
             encoder.set_buffer(4, Some(&n_buffer), 0);
             encoder.dispatch_threads(mtl_size(1, 1, 1), mtl_size(1, 1, 1));
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2332,7 +2605,7 @@ pub(crate) mod platform {
             let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
             let experts_buffer = buffer_with_data(&self.context.device, &[experts]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("top4_softmax_batch");
             encoder.set_compute_pipeline_state(&self.context.top4_softmax_batch);
             encoder.set_buffer(0, Some(&logits.buffer), 0);
             encoder.set_buffer(1, Some(&indices.buffer), 0);
@@ -2341,7 +2614,7 @@ pub(crate) mod platform {
             encoder.set_buffer(4, Some(&rows_buffer), 0);
             encoder.set_buffer(5, Some(&experts_buffer), 0);
             encoder.dispatch_threads(mtl_size(rows as NSUInteger, 1, 1), mtl_size(1, 1, 1));
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2386,7 +2659,7 @@ pub(crate) mod platform {
                 ));
             }
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("mxfp4_top4_gate_swiglu");
             encoder.set_compute_pipeline_state(&self.context.mxfp4_top4_gate_swiglu);
             encoder.set_buffer(0, Some(&blocks.buffer), 0);
             encoder.set_buffer(1, Some(&scales.buffer), 0);
@@ -2398,7 +2671,7 @@ pub(crate) mod platform {
                 mtl_size(HIDDEN_SIZE as NSUInteger, 4, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2469,7 +2742,7 @@ pub(crate) mod platform {
             let row_offset_buffer = buffer_with_data(&self.context.device, &[row_offset]);
             let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("mxfp4_top4_gate_swiglu_batch");
             encoder.set_compute_pipeline_state(&self.context.mxfp4_top4_gate_swiglu_batch);
             encoder.set_buffer(0, Some(&blocks.buffer), 0);
             encoder.set_buffer(1, Some(&scales.buffer), 0);
@@ -2483,7 +2756,7 @@ pub(crate) mod platform {
                 mtl_size(HIDDEN_SIZE as NSUInteger, 4, rows as NSUInteger),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2538,7 +2811,7 @@ pub(crate) mod platform {
                 ));
             }
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("mxfp4_top4_down_weighted");
             encoder.set_compute_pipeline_state(&self.context.mxfp4_top4_down_weighted);
             encoder.set_buffer(0, Some(&blocks.buffer), 0);
             encoder.set_buffer(1, Some(&scales.buffer), 0);
@@ -2552,7 +2825,7 @@ pub(crate) mod platform {
                 mtl_size(HIDDEN_SIZE as NSUInteger, 1, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
         }
 
@@ -2629,7 +2902,7 @@ pub(crate) mod platform {
             let row_offset_buffer = buffer_with_data(&self.context.device, &[row_offset]);
             let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
 
-            let encoder = self.command_buffer.new_compute_command_encoder();
+            let encoder = self.encoder("mxfp4_top4_down_weighted_batch");
             encoder.set_compute_pipeline_state(&self.context.mxfp4_top4_down_weighted_batch);
             encoder.set_buffer(0, Some(&blocks.buffer), 0);
             encoder.set_buffer(1, Some(&scales.buffer), 0);
@@ -2645,8 +2918,92 @@ pub(crate) mod platform {
                 mtl_size(HIDDEN_SIZE as NSUInteger, rows as NSUInteger, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
-            encoder.end_encoding();
+            self.end_encoder(encoder);
             Ok(())
+        }
+    }
+
+    #[cfg(feature = "profile")]
+    impl CounterSamples {
+        fn reserve_encoder_boundary(&mut self, stage: GpuStage) -> Option<(usize, usize)> {
+            if !matches!(self.mode, CounterSamplingMode::EncoderBoundary) {
+                return None;
+            }
+            if self.stages.len().saturating_add(2) > self.sample_limit {
+                return None;
+            }
+            let start = self.stages.len();
+            self.stages.push(stage);
+            let end = self.stages.len();
+            self.stages.push(GpuStage::Other);
+            Some((start, end))
+        }
+
+        fn uses_dispatch_boundary(&self) -> bool {
+            matches!(self.mode, CounterSamplingMode::DispatchBoundary)
+        }
+
+        fn sample(&mut self, encoder: &MetalComputeCommandEncoder, stage: GpuStage) {
+            if !self.uses_dispatch_boundary() {
+                return;
+            }
+            if self.stages.len() >= self.sample_limit {
+                return;
+            }
+            unsafe {
+                encoder.sampleCountersInBuffer_atSampleIndex_withBarrier(
+                    &self.sample_buffer,
+                    self.stages.len() as NSUInteger,
+                    true,
+                );
+            }
+            self.stages.push(stage);
+        }
+
+        fn resolve(self) -> Vec<(GpuStage, u128)> {
+            if self.stages.len() < 2 {
+                return Vec::new();
+            }
+            let Some(data) = (unsafe {
+                self.sample_buffer
+                    .resolveCounterRange(NSRange::new(0, self.stages.len()))
+            }) else {
+                return Vec::new();
+            };
+            let bytes = unsafe { data.as_bytes_unchecked() };
+            let timestamp_count = bytes.len() / size_of::<MTLCounterResultTimestamp>();
+            if timestamp_count < 2 {
+                return Vec::new();
+            }
+            let timestamp_count = timestamp_count.min(self.stages.len());
+            let timestamps = unsafe {
+                slice::from_raw_parts(
+                    bytes.as_ptr().cast::<MTLCounterResultTimestamp>(),
+                    timestamp_count,
+                )
+            };
+            let mut values = HashMap::<usize, u128>::new();
+            for index in 0..timestamp_count.saturating_sub(1) {
+                let stage = self.stages[index];
+                if stage == GpuStage::Other {
+                    continue;
+                }
+                let start = timestamps[index].timestamp;
+                let end = timestamps[index + 1].timestamp;
+                let ticks = end.saturating_sub(start) as u128;
+                let ns = ticks.saturating_mul(1_000_000_000) / self.timestamp_frequency as u128;
+                *values.entry(stage.index()).or_default() = values
+                    .get(&stage.index())
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(ns);
+            }
+            let mut values = values
+                .into_iter()
+                .map(|(index, ns)| (GpuStage::ALL[index], ns))
+                .collect::<Vec<_>>();
+            values.sort_by_key(|(stage, _)| stage.index());
+            values
         }
     }
 
@@ -2702,6 +3059,13 @@ pub(crate) mod platform {
 
     trait MetalCommandBufferExt {
         fn new_compute_command_encoder(&self) -> Retained<MetalComputeCommandEncoder>;
+        #[cfg(feature = "profile")]
+        fn new_compute_command_encoder_with_samples(
+            &self,
+            sample_buffer: &ProtocolObject<dyn MTLCounterSampleBuffer>,
+            start_sample: usize,
+            end_sample: usize,
+        ) -> Retained<MetalComputeCommandEncoder>;
         fn wait_until_completed(&self);
     }
 
@@ -2709,6 +3073,25 @@ pub(crate) mod platform {
         fn new_compute_command_encoder(&self) -> Retained<MetalComputeCommandEncoder> {
             self.computeCommandEncoder()
                 .expect("Metal compute encoder allocation failed")
+        }
+
+        #[cfg(feature = "profile")]
+        fn new_compute_command_encoder_with_samples(
+            &self,
+            sample_buffer: &ProtocolObject<dyn MTLCounterSampleBuffer>,
+            start_sample: usize,
+            end_sample: usize,
+        ) -> Retained<MetalComputeCommandEncoder> {
+            let descriptor = MTLComputePassDescriptor::computePassDescriptor();
+            let attachments = descriptor.sampleBufferAttachments();
+            let attachment = unsafe { attachments.objectAtIndexedSubscript(0) };
+            attachment.setSampleBuffer(Some(sample_buffer));
+            unsafe {
+                attachment.setStartOfEncoderSampleIndex(start_sample as NSUInteger);
+                attachment.setEndOfEncoderSampleIndex(end_sample as NSUInteger);
+            }
+            self.computeCommandEncoderWithDescriptor(&descriptor)
+                .expect("Metal sampled compute encoder allocation failed")
         }
 
         fn wait_until_completed(&self) {
@@ -2847,12 +3230,18 @@ pub(crate) mod platform {
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) mod platform {
+    use super::GpuStage;
     use crate::runtime_core::ExpertScore;
     use eyre::{Result, eyre};
     use std::marker::PhantomData;
 
     pub struct MetalBatch<'a> {
         _marker: PhantomData<&'a ()>,
+    }
+    pub struct BatchTiming {
+        pub gpu_ns: u128,
+        #[cfg(feature = "profile")]
+        pub gpu_stages: Vec<(GpuStage, u128)>,
     }
     pub struct MetalContext;
     #[derive(Clone)]
@@ -2883,7 +3272,12 @@ pub(crate) mod platform {
             0
         }
 
-        pub fn begin_batch(&self) -> MetalBatch<'_> {
+        #[cfg(feature = "profile")]
+        pub fn counter_sampling_summary(&self) -> String {
+            "Metal backend is only available on macOS".to_string()
+        }
+
+        pub fn begin_labeled_batch(&self, _label: &str) -> MetalBatch<'_> {
             MetalBatch {
                 _marker: PhantomData,
             }
@@ -3056,8 +3450,16 @@ pub(crate) mod platform {
     }
 
     impl<'a> MetalBatch<'a> {
-        pub fn finish(self) -> u128 {
-            0
+        pub fn finish(self) -> BatchTiming {
+            BatchTiming {
+                gpu_ns: 0,
+                #[cfg(feature = "profile")]
+                gpu_stages: Vec::new(),
+            }
+        }
+
+        pub fn set_stage(&self, stage: GpuStage) {
+            let _ = stage;
         }
 
         pub fn embedding_lookup_bf16_into(
