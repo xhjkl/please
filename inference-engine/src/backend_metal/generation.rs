@@ -2,7 +2,7 @@ use eyre::{Result, eyre};
 
 use super::{
     ATTN_VALUES, HIDDEN_SIZE, KV_HEADS, KV_VALUES, LAYERS, LM_HEAD_TOP1_BLOCK_SIZE,
-    MAX_KV_CACHE_PROBE_TOKENS, MetalOracleContext, MetalProfileReport, ProfileDelta, Q_HEADS,
+    MAX_RESIDENT_CONTEXT_TOKENS, MetalOracleContext, MetalProfileReport, ProfileDelta, Q_HEADS,
     StageMarker, TokenStage, decode_token_text, decode_tokens_text, metal_sampler_description,
     platform, stage_marker,
     weights::{GptOssLayerWeights, GptOssWeights},
@@ -89,9 +89,9 @@ impl ResidentGpuKvCache {
         if capacity == 0 {
             return Err(eyre!("resident KV cache needs non-zero capacity"));
         }
-        if capacity > MAX_KV_CACHE_PROBE_TOKENS {
+        if capacity > MAX_RESIDENT_CONTEXT_TOKENS {
             return Err(eyre!(
-                "resident KV cache currently supports at most {MAX_KV_CACHE_PROBE_TOKENS} positions, got {capacity}"
+                "resident KV cache currently supports at most {MAX_RESIDENT_CONTEXT_TOKENS} positions, got {capacity}"
             ));
         }
         let mut layer_caches = Vec::with_capacity(layers);
@@ -285,9 +285,9 @@ fn resident_sample_decode_inner(
         .len()
         .checked_add(max_new_tokens)
         .ok_or_else(|| eyre!("resident decode context length overflow"))?;
-    if context_tokens > MAX_KV_CACHE_PROBE_TOKENS {
+    if context_tokens > MAX_RESIDENT_CONTEXT_TOKENS {
         return Err(eyre!(
-            "resident decode currently supports at most {MAX_KV_CACHE_PROBE_TOKENS} context tokens, got {context_tokens}"
+            "resident decode currently supports at most {MAX_RESIDENT_CONTEXT_TOKENS} context tokens, got {context_tokens}"
         ));
     }
     #[cfg(feature = "metal-stage-profile")]

@@ -510,36 +510,35 @@ kernel void kv_cache_decode_attention(
             return;
         }
 
-        float long_scores[256];
         float max_value = sinks[head];
+        float denom = 1.0f;
+        float values[64];
+        for (uint dim = 0u; dim < 64u; dim++) {
+            values[dim] = 0.0f;
+        }
+
         for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
             uint key_position = effective_key_start + key_offset;
             uint cache_offset = key_position - cache_start_position;
             uint k_start = cache_offset * 512u + kv_start;
+            uint v_start = cache_offset * 512u + kv_start;
             float sum = 0.0f;
             for (uint dim = 0u; dim < 64u; dim++) {
                 sum += q[q_start + dim] * k_cache[k_start + dim];
             }
             float score = sum * 0.125f;
-            long_scores[key_offset] = score;
-            max_value = max(max_value, score);
-        }
-
-        float denom = exp(sinks[head] - max_value);
-        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-            denom += exp(long_scores[key_offset] - max_value);
+            float next_max = max(max_value, score);
+            float old_scale = exp(max_value - next_max);
+            float new_scale = exp(score - next_max);
+            for (uint dim = 0u; dim < 64u; dim++) {
+                values[dim] = values[dim] * old_scale + v_cache[v_start + dim] * new_scale;
+            }
+            denom = denom * old_scale + new_scale;
+            max_value = next_max;
         }
 
         for (uint dim = 0u; dim < 64u; dim++) {
-            float value = 0.0f;
-            for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
-                uint key_position = effective_key_start + key_offset;
-                uint cache_offset = key_position - cache_start_position;
-                uint v_start = cache_offset * 512u + kv_start;
-                float weight = exp(long_scores[key_offset] - max_value) / denom;
-                value += weight * v_cache[v_start + dim];
-            }
-            out[q_start + dim] = value;
+            out[q_start + dim] = values[dim] / denom;
         }
         return;
     }

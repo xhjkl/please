@@ -1,15 +1,15 @@
 use super::{
     ATTN_VALUES, EXPERTS, GATE_UP_VALUES, HIDDEN_SIZE, KV_VALUES, LM_HEAD_TOP1_BLOCK_SIZE,
-    MAX_KV_CACHE_PROBE_TOKENS, MAX_PREFILL_PROBE_TOKENS, MXFP4_BYTES_PER_GROUP, MXFP4_GROUPS,
-    Q_HEADS,
+    LOCAL_WINDOW_TOKENS, MAX_KV_CACHE_PROBE_TOKENS, MAX_PREFILL_PROBE_TOKENS,
+    MXFP4_BYTES_PER_GROUP, MXFP4_GROUPS, Q_HEADS,
 };
 
 #[cfg(target_os = "macos")]
 pub(crate) mod platform {
     use super::{
         ATTN_VALUES, EXPERTS, GATE_UP_VALUES, HIDDEN_SIZE, KV_VALUES, LM_HEAD_TOP1_BLOCK_SIZE,
-        MAX_KV_CACHE_PROBE_TOKENS, MAX_PREFILL_PROBE_TOKENS, MXFP4_BYTES_PER_GROUP, MXFP4_GROUPS,
-        Q_HEADS,
+        LOCAL_WINDOW_TOKENS, MAX_KV_CACHE_PROBE_TOKENS, MAX_PREFILL_PROBE_TOKENS,
+        MXFP4_BYTES_PER_GROUP, MXFP4_GROUPS, Q_HEADS,
     };
     use crate::runtime_core::ExpertScore;
     use eyre::{Result, eyre};
@@ -737,9 +737,9 @@ pub(crate) mod platform {
             }
 
             let mut effective_key_start = cache_start_position;
-            if layer % 2 == 0 && query_position + 1 > MAX_PREFILL_PROBE_TOKENS {
+            if layer % 2 == 0 && query_position + 1 > LOCAL_WINDOW_TOKENS {
                 effective_key_start =
-                    effective_key_start.max(query_position + 1 - MAX_PREFILL_PROBE_TOKENS);
+                    effective_key_start.max(query_position + 1 - LOCAL_WINDOW_TOKENS);
             }
             let key_count = query_position + 1 - effective_key_start;
             if key_count > MAX_KV_CACHE_PROBE_TOKENS {
@@ -1512,18 +1512,14 @@ pub(crate) mod platform {
                     "KV-cache start position {cache_start_position} exceeds query position {query_position}"
                 ));
             }
-            let effective_key_start =
-                if layer % 2 == 0 && query_position + 1 > MAX_PREFILL_PROBE_TOKENS {
-                    cache_start_position.max(query_position + 1 - MAX_PREFILL_PROBE_TOKENS)
-                } else {
-                    cache_start_position
-                };
+            let effective_key_start = if layer % 2 == 0 && query_position + 1 > LOCAL_WINDOW_TOKENS
+            {
+                cache_start_position.max(query_position + 1 - LOCAL_WINDOW_TOKENS)
+            } else {
+                cache_start_position
+            };
             let key_count = query_position + 1 - effective_key_start;
-            if key_count > MAX_KV_CACHE_PROBE_TOKENS {
-                return Err(eyre!(
-                    "resident KV decode currently supports at most {MAX_KV_CACHE_PROBE_TOKENS} keys, got {key_count}"
-                ));
-            }
+            let _ = key_count;
 
             let layer = layer as u32;
             let query_position = query_position as u32;
