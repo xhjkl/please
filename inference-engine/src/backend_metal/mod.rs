@@ -2758,42 +2758,58 @@ mod platform {
     use super::{ATTN_VALUES, KV_VALUES, MAX_KV_CACHE_PROBE_TOKENS, MAX_PREFILL_PROBE_TOKENS};
     use crate::runtime_core::ExpertScore;
     use eyre::{Result, eyre};
-    use metal::foreign_types::ForeignTypeRef;
-    use metal::{
-        CommandQueue, CompileOptions, ComputePipelineState, Device, Library, MTLResourceOptions,
-        MTLSize, NSUInteger,
+    use objc2::ffi::NSUInteger;
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_foundation::NSString;
+    use objc2_metal::{
+        MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
+        MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+        MTLFunction, MTLLibrary, MTLResourceOptions, MTLSize,
     };
-    use objc::runtime::Sel;
     use std::ffi::c_void;
     use std::mem::size_of_val;
+    use std::ptr::NonNull;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const THREADS_PER_GROUP: u64 = 256;
 
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {}
+
+    type MetalDevice = ProtocolObject<dyn MTLDevice>;
+    type MetalCommandQueue = ProtocolObject<dyn MTLCommandQueue>;
+    type MetalCommandBuffer = ProtocolObject<dyn MTLCommandBuffer>;
+    type MetalComputeCommandEncoder = ProtocolObject<dyn MTLComputeCommandEncoder>;
+    type MetalComputePipelineState = ProtocolObject<dyn MTLComputePipelineState>;
+    type MetalFunction = ProtocolObject<dyn MTLFunction>;
+    type MetalLibrary = ProtocolObject<dyn MTLLibrary>;
+    type MetalBuffer = ProtocolObject<dyn MTLBuffer>;
+
     pub struct MetalContext {
-        device: Device,
-        queue: CommandQueue,
+        device: Retained<MetalDevice>,
+        queue: Retained<MetalCommandQueue>,
         profile_enabled: AtomicBool,
         gpu_time_ns: Mutex<u128>,
-        partial_sum_squares: ComputePipelineState,
-        apply_rms_norm: ComputePipelineState,
-        bf16_matvec: ComputePipelineState,
-        bf16_matvec_logits: ComputePipelineState,
-        topk_logits: ComputePipelineState,
-        rope_row: ComputePipelineState,
-        single_token_attention: ComputePipelineState,
-        sequence_attention: ComputePipelineState,
-        kv_cache_decode_attention: ComputePipelineState,
-        vector_add: ComputePipelineState,
-        top4_softmax: ComputePipelineState,
-        mxfp4_matvec: ComputePipelineState,
-        swiglu: ComputePipelineState,
-        weighted_sum4: ComputePipelineState,
+        partial_sum_squares: Retained<MetalComputePipelineState>,
+        apply_rms_norm: Retained<MetalComputePipelineState>,
+        bf16_matvec: Retained<MetalComputePipelineState>,
+        bf16_matvec_logits: Retained<MetalComputePipelineState>,
+        topk_logits: Retained<MetalComputePipelineState>,
+        rope_row: Retained<MetalComputePipelineState>,
+        single_token_attention: Retained<MetalComputePipelineState>,
+        sequence_attention: Retained<MetalComputePipelineState>,
+        kv_cache_decode_attention: Retained<MetalComputePipelineState>,
+        vector_add: Retained<MetalComputePipelineState>,
+        top4_softmax: Retained<MetalComputePipelineState>,
+        mxfp4_matvec: Retained<MetalComputePipelineState>,
+        swiglu: Retained<MetalComputePipelineState>,
+        weighted_sum4: Retained<MetalComputePipelineState>,
     }
 
     pub struct Bf16MatrixBuffer {
-        buffer: metal::Buffer,
+        buffer: Retained<MetalBuffer>,
         rows: usize,
         cols: usize,
     }
@@ -2805,12 +2821,12 @@ mod platform {
     }
 
     pub struct F32VectorBuffer {
-        buffer: metal::Buffer,
+        buffer: Retained<MetalBuffer>,
         len: usize,
     }
 
     pub struct U8Buffer {
-        buffer: metal::Buffer,
+        buffer: Retained<MetalBuffer>,
         len: usize,
     }
 
@@ -3423,12 +3439,14 @@ kernel void weighted_sum4(
 
     impl MetalContext {
         pub fn new() -> Result<Self> {
-            let device = Device::system_default().ok_or_else(|| eyre!("no Metal device found"))?;
+            let device =
+                MTLCreateSystemDefaultDevice().ok_or_else(|| eyre!("no Metal device found"))?;
             let queue = device.new_command_queue();
-            let options = CompileOptions::new();
+            let options = MTLCompileOptions::new();
+            let source = NSString::from_str(KERNEL_SOURCE);
             let library = device
-                .new_library_with_source(KERNEL_SOURCE, &options)
-                .map_err(|error| eyre!("compile Metal kernels: {error}"))?;
+                .newLibraryWithSource_options_error(&source, Some(&options))
+                .map_err(|error| eyre!("compile Metal kernels: {error:?}"))?;
 
             Ok(Self {
                 profile_enabled: AtomicBool::new(false),
@@ -3467,7 +3485,7 @@ kernel void weighted_sum4(
             self.profile_enabled.store(enabled, Ordering::Relaxed);
         }
 
-        fn finish_command_buffer(&self, command_buffer: &metal::CommandBufferRef) {
+        fn finish_command_buffer(&self, command_buffer: &MetalCommandBuffer) {
             command_buffer.commit();
             command_buffer.wait_until_completed();
             if !self.profile_enabled.load(Ordering::Relaxed) {
@@ -3508,11 +3526,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(1, Some(&partial_buffer), 0);
             encoder.set_buffer(2, Some(&n_buffer), 0);
             encoder.dispatch_thread_groups(
-                MTLSize::new(groups as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(groups as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             let partials = read_buffer::<f32>(&partial_buffer, groups as usize);
             let sum_squares = partials.iter().map(|value| *value as f64).sum::<f64>();
@@ -3533,11 +3551,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(3, Some(&scale_buffer), 0);
             encoder.set_buffer(4, Some(&n_buffer), 0);
             encoder.dispatch_threads(
-                MTLSize::new(x.len() as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(x.len() as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, x.len()))
         }
@@ -3596,11 +3614,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(4, Some(&rows_buffer), 0);
             encoder.set_buffer(5, Some(&cols_buffer), 0);
             encoder.dispatch_thread_groups(
-                MTLSize::new(rows as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, rows as usize))
         }
@@ -3649,11 +3667,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(4, Some(&rows_buffer), 0);
             encoder.set_buffer(5, Some(&cols_buffer), 0);
             encoder.dispatch_thread_groups(
-                MTLSize::new(rows as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, rows as usize))
         }
@@ -3738,11 +3756,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(3, Some(&rows_buffer), 0);
             encoder.set_buffer(4, Some(&cols_buffer), 0);
             encoder.dispatch_thread_groups(
-                MTLSize::new(rows as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             let indices_buffer = self.device.new_buffer(
                 (k as usize * std::mem::size_of::<u32>()) as u64,
@@ -3761,9 +3779,9 @@ kernel void weighted_sum4(
             encoder.set_buffer(2, Some(&values_buffer), 0);
             encoder.set_buffer(3, Some(&rows_buffer), 0);
             encoder.set_buffer(4, Some(&k_buffer), 0);
-            encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            encoder.dispatch_threads(mtl_size(1, 1, 1), mtl_size(1, 1, 1));
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             let indices = read_buffer::<u32>(&indices_buffer, k as usize);
             let values = read_buffer::<f32>(&values_buffer, k as usize);
@@ -3806,11 +3824,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(2, Some(&heads_buffer), 0);
             encoder.set_buffer(3, Some(&position_buffer), 0);
             encoder.dispatch_threads(
-                MTLSize::new(row.len() as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(row.len() as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, row.len()))
         }
@@ -3856,11 +3874,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(3, Some(&sinks_buffer), 0);
             encoder.set_buffer(4, Some(&out_buffer), 0);
             encoder.dispatch_thread_groups(
-                MTLSize::new(64, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(64, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, q.len()))
         }
@@ -3938,11 +3956,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(5, Some(&seq_len_buffer), 0);
             encoder.set_buffer(6, Some(&layer_buffer), 0);
             encoder.dispatch_thread_groups(
-                MTLSize::new(64, seq_len as NSUInteger, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(64, seq_len as NSUInteger, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, q.len()))
         }
@@ -4039,11 +4057,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(7, Some(&cache_start_position_buffer), 0);
             encoder.set_buffer(8, Some(&cache_len_buffer), 0);
             encoder.dispatch_thread_groups(
-                MTLSize::new(64, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(64, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, q.len()))
         }
@@ -4077,11 +4095,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(2, Some(&out_buffer), 0);
             encoder.set_buffer(3, Some(&n_buffer), 0);
             encoder.dispatch_threads(
-                MTLSize::new(left.len() as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(left.len() as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, left.len()))
         }
@@ -4118,9 +4136,9 @@ kernel void weighted_sum4(
             encoder.set_buffer(2, Some(&selected_logits_buffer), 0);
             encoder.set_buffer(3, Some(&weights_buffer), 0);
             encoder.set_buffer(4, Some(&n_buffer), 0);
-            encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            encoder.dispatch_threads(mtl_size(1, 1, 1), mtl_size(1, 1, 1));
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             let indices = read_buffer::<u32>(&indices_buffer, 4);
             let selected_logits = read_buffer::<f32>(&selected_logits_buffer, 4);
@@ -4205,11 +4223,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(5, Some(&rows_buffer), 0);
             encoder.set_buffer(6, Some(&groups_buffer), 0);
             encoder.dispatch_thread_groups(
-                MTLSize::new(rows as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, rows as usize))
         }
@@ -4279,11 +4297,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(5, Some(&rows_buffer), 0);
             encoder.set_buffer(6, Some(&groups_buffer), 0);
             encoder.dispatch_thread_groups(
-                MTLSize::new(rows as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, rows as usize))
         }
@@ -4315,11 +4333,11 @@ kernel void weighted_sum4(
             encoder.set_buffer(1, Some(&out_buffer), 0);
             encoder.set_buffer(2, Some(&n_buffer), 0);
             encoder.dispatch_threads(
-                MTLSize::new(out_len as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(out_len as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, out_len as usize))
         }
@@ -4359,60 +4377,173 @@ kernel void weighted_sum4(
             encoder.set_buffer(2, Some(&out_buffer), 0);
             encoder.set_buffer(3, Some(&n_buffer), 0);
             encoder.dispatch_threads(
-                MTLSize::new(n as NSUInteger, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP as NSUInteger, 1, 1),
+                mtl_size(n as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
-            self.finish_command_buffer(command_buffer);
+            self.finish_command_buffer(&command_buffer);
 
             Ok(read_buffer::<f32>(&out_buffer, n as usize))
         }
     }
 
-    fn pipeline(device: &Device, library: &Library, name: &str) -> Result<ComputePipelineState> {
-        let function = library
-            .get_function(name, None)
-            .map_err(|error| eyre!("load Metal function {name}: {error}"))?;
+    trait MetalDeviceExt {
+        fn new_command_queue(&self) -> Retained<MetalCommandQueue>;
+        fn new_buffer(&self, length: u64, options: MTLResourceOptions) -> Retained<MetalBuffer>;
+        fn new_buffer_with_data<T>(
+            &self,
+            values: &[T],
+            options: MTLResourceOptions,
+        ) -> Retained<MetalBuffer>;
+    }
+
+    impl MetalDeviceExt for MetalDevice {
+        fn new_command_queue(&self) -> Retained<MetalCommandQueue> {
+            self.newCommandQueue()
+                .expect("Metal command queue allocation failed")
+        }
+
+        fn new_buffer(&self, length: u64, options: MTLResourceOptions) -> Retained<MetalBuffer> {
+            self.newBufferWithLength_options(length as NSUInteger, options)
+                .expect("Metal buffer allocation failed")
+        }
+
+        fn new_buffer_with_data<T>(
+            &self,
+            values: &[T],
+            options: MTLResourceOptions,
+        ) -> Retained<MetalBuffer> {
+            let pointer = NonNull::new(values.as_ptr().cast_mut().cast::<c_void>())
+                .expect("slice pointers are never null");
+            unsafe {
+                self.newBufferWithBytes_length_options(
+                    pointer,
+                    size_of_val(values) as NSUInteger,
+                    options,
+                )
+            }
+            .expect("Metal buffer allocation failed")
+        }
+    }
+
+    trait MetalCommandQueueExt {
+        fn new_command_buffer(&self) -> Retained<MetalCommandBuffer>;
+    }
+
+    impl MetalCommandQueueExt for MetalCommandQueue {
+        fn new_command_buffer(&self) -> Retained<MetalCommandBuffer> {
+            self.commandBuffer()
+                .expect("Metal command buffer allocation failed")
+        }
+    }
+
+    trait MetalCommandBufferExt {
+        fn new_compute_command_encoder(&self) -> Retained<MetalComputeCommandEncoder>;
+        fn wait_until_completed(&self);
+    }
+
+    impl MetalCommandBufferExt for MetalCommandBuffer {
+        fn new_compute_command_encoder(&self) -> Retained<MetalComputeCommandEncoder> {
+            self.computeCommandEncoder()
+                .expect("Metal compute encoder allocation failed")
+        }
+
+        fn wait_until_completed(&self) {
+            self.waitUntilCompleted();
+        }
+    }
+
+    trait MetalComputeCommandEncoderExt {
+        fn set_compute_pipeline_state(&self, state: &Retained<MetalComputePipelineState>);
+        fn set_buffer(&self, index: u64, buffer: Option<&Retained<MetalBuffer>>, offset: u64);
+        fn dispatch_thread_groups(
+            &self,
+            threadgroups_per_grid: MTLSize,
+            threads_per_threadgroup: MTLSize,
+        );
+        fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize);
+        fn end_encoding(&self);
+    }
+
+    impl MetalComputeCommandEncoderExt for MetalComputeCommandEncoder {
+        fn set_compute_pipeline_state(&self, state: &Retained<MetalComputePipelineState>) {
+            self.setComputePipelineState(state);
+        }
+
+        fn set_buffer(&self, index: u64, buffer: Option<&Retained<MetalBuffer>>, offset: u64) {
+            unsafe {
+                self.setBuffer_offset_atIndex(
+                    buffer.map(|buffer| &**buffer),
+                    offset as NSUInteger,
+                    index as NSUInteger,
+                );
+            }
+        }
+
+        fn dispatch_thread_groups(
+            &self,
+            threadgroups_per_grid: MTLSize,
+            threads_per_threadgroup: MTLSize,
+        ) {
+            self.dispatchThreadgroups_threadsPerThreadgroup(
+                threadgroups_per_grid,
+                threads_per_threadgroup,
+            );
+        }
+
+        fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize) {
+            self.dispatchThreads_threadsPerThreadgroup(threads_per_grid, threads_per_threadgroup);
+        }
+
+        fn end_encoding(&self) {
+            self.endEncoding();
+        }
+    }
+
+    fn pipeline(
+        device: &MetalDevice,
+        library: &MetalLibrary,
+        name: &str,
+    ) -> Result<Retained<MetalComputePipelineState>> {
+        let function = metal_function(library, name)?;
         device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|error| eyre!("create Metal pipeline {name}: {error}"))
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|error| eyre!("create Metal pipeline {name}: {error:?}"))
     }
 
-    fn buffer_with_data<T>(device: &Device, values: &[T]) -> metal::Buffer {
-        device.new_buffer_with_data(
-            values.as_ptr().cast(),
-            size_of_val(values) as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+    fn metal_function(library: &MetalLibrary, name: &str) -> Result<Retained<MetalFunction>> {
+        let name = NSString::from_str(name);
+        let function = library
+            .newFunctionWithName(&name)
+            .ok_or_else(|| eyre!("load Metal function {name}"))?;
+        Ok(function)
     }
 
-    fn read_buffer<T: Copy>(buffer: &metal::BufferRef, len: usize) -> Vec<T> {
-        let values = unsafe { std::slice::from_raw_parts(buffer.contents().cast::<T>(), len) };
+    fn buffer_with_data<T>(device: &MetalDevice, values: &[T]) -> Retained<MetalBuffer> {
+        device.new_buffer_with_data(values, MTLResourceOptions::StorageModeShared)
+    }
+
+    fn read_buffer<T: Copy>(buffer: &MetalBuffer, len: usize) -> Vec<T> {
+        let values =
+            unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<T>(), len) };
         values.to_vec()
     }
 
-    fn command_buffer_gpu_time_ns(command_buffer: &metal::CommandBufferRef) -> u128 {
-        let start = unsafe {
-            objc_msg_send_f64(
-                command_buffer.as_ptr().cast::<c_void>(),
-                Sel::register("GPUStartTime"),
-            )
-        };
-        let end = unsafe {
-            objc_msg_send_f64(
-                command_buffer.as_ptr().cast::<c_void>(),
-                Sel::register("GPUEndTime"),
-            )
-        };
+    fn mtl_size(width: NSUInteger, height: NSUInteger, depth: NSUInteger) -> MTLSize {
+        MTLSize {
+            width,
+            height,
+            depth,
+        }
+    }
+
+    fn command_buffer_gpu_time_ns(command_buffer: &MetalCommandBuffer) -> u128 {
+        let start = command_buffer.GPUStartTime();
+        let end = command_buffer.GPUEndTime();
         if !start.is_finite() || !end.is_finite() || end <= start {
             return 0;
         }
         ((end - start) * 1_000_000_000.0) as u128
-    }
-
-    unsafe extern "C" {
-        #[link_name = "objc_msgSend"]
-        fn objc_msg_send_f64(receiver: *mut c_void, selector: Sel) -> f64;
     }
 }
 
