@@ -18,6 +18,8 @@ use crate::runtime_core::{
 use std::mem::size_of;
 use std::time::Instant;
 
+const PREFILL_MOE_CHUNK_TOKENS: usize = 16;
+
 struct ResidentDecodeScratch {
     hidden_a: platform::F32VectorBuffer,
     hidden_b: platform::F32VectorBuffer,
@@ -49,6 +51,10 @@ struct ResidentDecodeScratch {
     prefill_residual: platform::F32VectorBuffer,
     prefill_router_input: platform::F32VectorBuffer,
     prefill_router_logits: platform::F32VectorBuffer,
+    prefill_router_indices: platform::U32Buffer,
+    prefill_router_selected_logits: platform::F32VectorBuffer,
+    prefill_router_weights: platform::F32VectorBuffer,
+    prefill_expert_acts_packed: platform::F32VectorBuffer,
     final_hidden: platform::F32VectorBuffer,
     lm_logits: platform::F32VectorBuffer,
     lm_top1_block_indices: platform::U32Buffer,
@@ -72,6 +78,13 @@ impl ResidentDecodeScratch {
         let prefill_router_values = context_tokens
             .checked_mul(32)
             .ok_or_else(|| eyre!("prefill router buffer length overflow"))?;
+        let prefill_router_choice_values = context_tokens
+            .checked_mul(4)
+            .ok_or_else(|| eyre!("prefill router choice buffer length overflow"))?;
+        let prefill_expert_act_values = PREFILL_MOE_CHUNK_TOKENS
+            .checked_mul(4)
+            .and_then(|values| values.checked_mul(HIDDEN_SIZE))
+            .ok_or_else(|| eyre!("prefill expert activation buffer length overflow"))?;
         Ok(Self {
             hidden_a: platform.alloc_f32_vector(HIDDEN_SIZE)?,
             hidden_b: platform.alloc_f32_vector(HIDDEN_SIZE)?,
@@ -103,6 +116,11 @@ impl ResidentDecodeScratch {
             prefill_residual: platform.alloc_f32_vector(prefill_values)?,
             prefill_router_input: platform.alloc_f32_vector(prefill_values)?,
             prefill_router_logits: platform.alloc_f32_vector(prefill_router_values)?,
+            prefill_router_indices: platform.alloc_u32_buffer(prefill_router_choice_values)?,
+            prefill_router_selected_logits: platform
+                .alloc_f32_vector(prefill_router_choice_values)?,
+            prefill_router_weights: platform.alloc_f32_vector(prefill_router_choice_values)?,
+            prefill_expert_acts_packed: platform.alloc_f32_vector(prefill_expert_act_values)?,
             final_hidden: platform.alloc_f32_vector(HIDDEN_SIZE)?,
             lm_logits: platform.alloc_f32_vector(vocab)?,
             lm_top1_block_indices: platform.alloc_u32_buffer(lm_top1_blocks)?,
@@ -504,6 +522,16 @@ fn resident_prefill_embeddings(
     scratch: &ResidentDecodeScratch,
     prompt_tokens: &[u32],
 ) -> Result<()> {
+    let vocab = weights.embed.rows();
+    for token in prompt_tokens {
+        let token = *token as usize;
+        if token >= vocab {
+            return Err(eyre!(
+                "prompt token {token} exceeds embedding vocabulary rows {vocab}"
+            ));
+        }
+    }
+
     let tokens = ctx.platform.upload_u32_buffer(prompt_tokens)?;
     ctx.record_profile(
         "op.input.prompt_tokens",
@@ -672,51 +700,39 @@ fn resident_prefill_layer(
         &scratch.prefill_router_logits,
         prompt_len,
     )?;
+    batch.top4_softmax_batch_into(
+        &scratch.prefill_router_logits,
+        &scratch.prefill_router_indices,
+        &scratch.prefill_router_selected_logits,
+        &scratch.prefill_router_weights,
+        prompt_len,
+        32,
+    )?;
 
-    for position in 0..prompt_len {
-        batch.read_f32_slot_into(
-            &scratch.prefill_router_logits,
-            position,
-            32,
-            &scratch.router_logits,
-        )?;
-        batch.top4_softmax_into(
-            &scratch.router_logits,
-            &scratch.router_indices,
-            &scratch.router_selected_logits,
-            &scratch.router_weights,
-        )?;
-        batch.read_f32_slot_into(
-            &scratch.prefill_router_input,
-            position,
-            HIDDEN_SIZE,
-            &scratch.router_input,
-        )?;
-        batch.read_f32_slot_into(
-            &scratch.prefill_residual,
-            position,
-            HIDDEN_SIZE,
-            &scratch.residual,
-        )?;
-        batch.mxfp4_top4_gate_swiglu_into(
+    for row_offset in (0..prompt_len).step_by(PREFILL_MOE_CHUNK_TOKENS) {
+        let rows = (prompt_len - row_offset).min(PREFILL_MOE_CHUNK_TOKENS);
+        batch.mxfp4_top4_gate_swiglu_batch_into(
             &weights.sparse_mlp.experts.gate_up_blocks,
             &weights.sparse_mlp.experts.gate_up_scales,
             &weights.sparse_mlp.experts.gate_up_bias,
-            &scratch.router_input,
-            &scratch.router_indices,
-            &scratch.expert_acts_packed,
+            &scratch.prefill_router_input,
+            &scratch.prefill_router_indices,
+            &scratch.prefill_expert_acts_packed,
+            row_offset,
+            rows,
         )?;
-        batch.mxfp4_top4_down_weighted_into(
+        batch.mxfp4_top4_down_weighted_batch_into(
             &weights.sparse_mlp.experts.down_blocks,
             &weights.sparse_mlp.experts.down_scales,
             &weights.sparse_mlp.experts.down_bias,
-            &scratch.expert_acts_packed,
-            &scratch.router_indices,
-            &scratch.router_weights,
-            &scratch.residual,
-            &scratch.hidden_a,
+            &scratch.prefill_expert_acts_packed,
+            &scratch.prefill_router_indices,
+            &scratch.prefill_router_weights,
+            &scratch.prefill_residual,
+            output,
+            row_offset,
+            rows,
         )?;
-        batch.write_f32_slot_into(&scratch.hidden_a, output, position, HIDDEN_SIZE)?;
     }
 
     finish_resident_batch(ctx, batch, no_stage_marker());

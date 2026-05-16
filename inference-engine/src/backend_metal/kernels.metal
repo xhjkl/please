@@ -866,6 +866,60 @@ kernel void top4_softmax(
     }
 }
 
+kernel void top4_softmax_batch(
+    device const float* logits [[buffer(0)]],
+    device uint* out_indices [[buffer(1)]],
+    device float* out_logits [[buffer(2)]],
+    device float* out_weights [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& n [[buffer(5)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row >= rows) {
+        return;
+    }
+
+    float best_logits[4] = {
+        -INFINITY,
+        -INFINITY,
+        -INFINITY,
+        -INFINITY,
+    };
+    uint best_indices[4] = { 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu };
+    uint logits_start = row * n;
+
+    for (uint i = 0; i < n; i++) {
+        float value = logits[logits_start + i];
+        for (uint rank = 0; rank < 4u; rank++) {
+            bool better = value > best_logits[rank]
+                || (value == best_logits[rank] && i < best_indices[rank]);
+            if (!better) {
+                continue;
+            }
+            for (uint move = 3u; move > rank; move--) {
+                best_logits[move] = best_logits[move - 1u];
+                best_indices[move] = best_indices[move - 1u];
+            }
+            best_logits[rank] = value;
+            best_indices[rank] = i;
+            break;
+        }
+    }
+
+    float max_value = best_logits[0];
+    float denom = 0.0f;
+    for (uint rank = 0; rank < 4u; rank++) {
+        denom += exp(best_logits[rank] - max_value);
+    }
+
+    uint out_start = row * 4u;
+    for (uint rank = 0; rank < 4u; rank++) {
+        out_indices[out_start + rank] = best_indices[rank];
+        out_logits[out_start + rank] = best_logits[rank];
+        out_weights[out_start + rank] = exp(best_logits[rank] - max_value) / denom;
+    }
+}
+
 kernel void mxfp4_matvec(
     device const uchar* blocks [[buffer(0)]],
     device const uchar* scales [[buffer(1)]],
@@ -980,6 +1034,83 @@ kernel void mxfp4_top4_gate_swiglu(
     }
 }
 
+kernel void mxfp4_top4_gate_swiglu_batch(
+    device const uchar* blocks [[buffer(0)]],
+    device const uchar* scales [[buffer(1)]],
+    device const ushort* bias [[buffer(2)]],
+    device const float* input [[buffer(3)]],
+    device const uint* top_indices [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    constant uint& row_offset [[buffer(6)]],
+    constant uint& rows [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]
+) {
+    threadgroup float gate_scratch[256];
+    threadgroup float linear_scratch[256];
+
+    uint row = group.x;
+    uint slot = group.y;
+    uint batch_row = group.z;
+    uint source_row = row_offset + batch_row;
+    uint top_start = source_row * 4u;
+    uint expert = top_indices[top_start + slot];
+    float gate_sum = 0.0f;
+    float linear_sum = 0.0f;
+
+    if (row < GPTOSS_HIDDEN_SIZE && slot < 4u && batch_row < rows && expert < GPTOSS_EXPERTS) {
+        uint gate_row = row * 2u;
+        uint linear_row = gate_row + 1u;
+        uint values_per_row = GPTOSS_MXFP4_GROUPS * GPTOSS_MXFP4_BYTES_PER_GROUP;
+        uint expert_block_start = expert * GPTOSS_GATE_UP_VALUES * values_per_row;
+        uint expert_scale_start = expert * GPTOSS_GATE_UP_VALUES * GPTOSS_MXFP4_GROUPS;
+        uint gate_block_start = expert_block_start + gate_row * values_per_row;
+        uint linear_block_start = expert_block_start + linear_row * values_per_row;
+        uint gate_scale_start = expert_scale_start + gate_row * GPTOSS_MXFP4_GROUPS;
+        uint linear_scale_start = expert_scale_start + linear_row * GPTOSS_MXFP4_GROUPS;
+        uint input_row_start = source_row * GPTOSS_HIDDEN_SIZE;
+
+        for (uint packed_index = tid; packed_index < values_per_row; packed_index += 256u) {
+            uint group_index = packed_index / GPTOSS_MXFP4_BYTES_PER_GROUP;
+            uint byte_in_group = packed_index - group_index * GPTOSS_MXFP4_BYTES_PER_GROUP;
+            uint input_start = input_row_start + group_index * 32u + byte_in_group * 2u;
+
+            uchar gate_packed = blocks[gate_block_start + packed_index];
+            float gate_scale = exp2(float(scales[gate_scale_start + group_index]) - 127.0f);
+            gate_sum += fp4_to_float(uint(gate_packed & 0x0fu)) * gate_scale * input[input_start];
+            gate_sum += fp4_to_float(uint(gate_packed >> 4)) * gate_scale * input[input_start + 1u];
+
+            uchar linear_packed = blocks[linear_block_start + packed_index];
+            float linear_scale = exp2(float(scales[linear_scale_start + group_index]) - 127.0f);
+            linear_sum += fp4_to_float(uint(linear_packed & 0x0fu)) * linear_scale * input[input_start];
+            linear_sum += fp4_to_float(uint(linear_packed >> 4)) * linear_scale * input[input_start + 1u];
+        }
+    }
+
+    gate_scratch[tid] = gate_sum;
+    linear_scratch[tid] = linear_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            gate_scratch[tid] += gate_scratch[tid + stride];
+            linear_scratch[tid] += linear_scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u && row < GPTOSS_HIDDEN_SIZE && slot < 4u && batch_row < rows && expert < GPTOSS_EXPERTS) {
+        uint bias_start = expert * GPTOSS_GATE_UP_VALUES;
+        float gate = gate_scratch[0] + bf16_to_float(bias[bias_start + row * 2u]);
+        float linear = linear_scratch[0] + bf16_to_float(bias[bias_start + row * 2u + 1u]);
+        float x_glu = min(gate, 7.0f);
+        float x_linear = clamp(linear, -7.0f, 7.0f);
+        float out_glu = x_glu / (1.0f + exp(-1.702f * x_glu));
+        uint out_start = (batch_row * 4u + slot) * GPTOSS_HIDDEN_SIZE;
+        out[out_start + row] = out_glu * (x_linear + 1.0f);
+    }
+}
+
 kernel void mxfp4_top4_down_weighted(
     device const uchar* blocks [[buffer(0)]],
     device const uchar* scales [[buffer(1)]],
@@ -1040,6 +1171,77 @@ kernel void mxfp4_top4_down_weighted(
             }
         }
         out[row] = residual[row] + scratch[0] + bias_sum;
+    }
+}
+
+kernel void mxfp4_top4_down_weighted_batch(
+    device const uchar* blocks [[buffer(0)]],
+    device const uchar* scales [[buffer(1)]],
+    device const ushort* bias [[buffer(2)]],
+    device const float* expert_acts [[buffer(3)]],
+    device const uint* top_indices [[buffer(4)]],
+    device const float* top_weights [[buffer(5)]],
+    device const float* residual [[buffer(6)]],
+    device float* out [[buffer(7)]],
+    constant uint& row_offset [[buffer(8)]],
+    constant uint& rows [[buffer(9)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]
+) {
+    threadgroup float scratch[256];
+    uint row = group.x;
+    uint batch_row = group.y;
+    uint source_row = row_offset + batch_row;
+    float sum = 0.0f;
+
+    if (row < GPTOSS_HIDDEN_SIZE && batch_row < rows) {
+        uint values_per_row = GPTOSS_MXFP4_GROUPS * GPTOSS_MXFP4_BYTES_PER_GROUP;
+        uint top_start = source_row * 4u;
+        for (uint slot = 0u; slot < 4u; slot++) {
+            uint expert = top_indices[top_start + slot];
+            if (expert >= GPTOSS_EXPERTS) {
+                continue;
+            }
+            float weight = top_weights[top_start + slot];
+            uint expert_block_start = expert * GPTOSS_HIDDEN_SIZE * values_per_row;
+            uint expert_scale_start = expert * GPTOSS_HIDDEN_SIZE * GPTOSS_MXFP4_GROUPS;
+            uint row_block_start = expert_block_start + row * values_per_row;
+            uint row_scale_start = expert_scale_start + row * GPTOSS_MXFP4_GROUPS;
+            uint input_slot_start = (batch_row * 4u + slot) * GPTOSS_HIDDEN_SIZE;
+
+            for (uint packed_index = tid; packed_index < values_per_row; packed_index += 256u) {
+                uint group_index = packed_index / GPTOSS_MXFP4_BYTES_PER_GROUP;
+                uint byte_in_group = packed_index - group_index * GPTOSS_MXFP4_BYTES_PER_GROUP;
+                uchar packed = blocks[row_block_start + packed_index];
+                float scale = exp2(float(scales[row_scale_start + group_index]) - 127.0f);
+                uint input_start = input_slot_start + group_index * 32u + byte_in_group * 2u;
+                sum += weight * fp4_to_float(uint(packed & 0x0fu)) * scale * expert_acts[input_start];
+                sum += weight * fp4_to_float(uint(packed >> 4)) * scale * expert_acts[input_start + 1u];
+            }
+        }
+    }
+
+    scratch[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u && row < GPTOSS_HIDDEN_SIZE && batch_row < rows) {
+        uint top_start = source_row * 4u;
+        float bias_sum = 0.0f;
+        for (uint slot = 0u; slot < 4u; slot++) {
+            uint expert = top_indices[top_start + slot];
+            if (expert < GPTOSS_EXPERTS) {
+                bias_sum += top_weights[top_start + slot] * bf16_to_float(bias[expert * GPTOSS_HIDDEN_SIZE + row]);
+            }
+        }
+        uint hidden_index = source_row * GPTOSS_HIDDEN_SIZE + row;
+        out[hidden_index] = residual[hidden_index] + scratch[0] + bias_sum;
     }
 }
 

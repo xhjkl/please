@@ -74,9 +74,12 @@ pub(crate) mod platform {
         read_f32_slot: Retained<MetalComputePipelineState>,
         vector_add: Retained<MetalComputePipelineState>,
         top4_softmax: Retained<MetalComputePipelineState>,
+        top4_softmax_batch: Retained<MetalComputePipelineState>,
         mxfp4_matvec: Retained<MetalComputePipelineState>,
         mxfp4_top4_gate_swiglu: Retained<MetalComputePipelineState>,
+        mxfp4_top4_gate_swiglu_batch: Retained<MetalComputePipelineState>,
         mxfp4_top4_down_weighted: Retained<MetalComputePipelineState>,
+        mxfp4_top4_down_weighted_batch: Retained<MetalComputePipelineState>,
         swiglu: Retained<MetalComputePipelineState>,
         weighted_sum4: Retained<MetalComputePipelineState>,
     }
@@ -166,9 +169,20 @@ pub(crate) mod platform {
                 read_f32_slot: pipeline(&device, &library, "read_f32_slot")?,
                 vector_add: pipeline(&device, &library, "vector_add")?,
                 top4_softmax: pipeline(&device, &library, "top4_softmax")?,
+                top4_softmax_batch: pipeline(&device, &library, "top4_softmax_batch")?,
                 mxfp4_matvec: pipeline(&device, &library, "mxfp4_matvec")?,
                 mxfp4_top4_gate_swiglu: pipeline(&device, &library, "mxfp4_top4_gate_swiglu")?,
+                mxfp4_top4_gate_swiglu_batch: pipeline(
+                    &device,
+                    &library,
+                    "mxfp4_top4_gate_swiglu_batch",
+                )?,
                 mxfp4_top4_down_weighted: pipeline(&device, &library, "mxfp4_top4_down_weighted")?,
+                mxfp4_top4_down_weighted_batch: pipeline(
+                    &device,
+                    &library,
+                    "mxfp4_top4_down_weighted_batch",
+                )?,
                 swiglu: pipeline(&device, &library, "swiglu")?,
                 weighted_sum4: pipeline(&device, &library, "weighted_sum4")?,
                 device,
@@ -1989,6 +2003,61 @@ pub(crate) mod platform {
             Ok(())
         }
 
+        pub fn top4_softmax_batch_into(
+            &self,
+            logits: &F32VectorBuffer,
+            indices: &U32Buffer,
+            selected_logits: &F32VectorBuffer,
+            weights: &F32VectorBuffer,
+            rows: usize,
+            experts: usize,
+        ) -> Result<()> {
+            if rows == 0 {
+                return Ok(());
+            }
+            if experts < 4 {
+                return Err(eyre!(
+                    "batched top4_softmax needs at least 4 experts, got {experts}"
+                ));
+            }
+            let logits_expected = rows
+                .checked_mul(experts)
+                .ok_or_else(|| eyre!("batched top4 logits length overflow"))?;
+            let output_expected = rows
+                .checked_mul(4)
+                .ok_or_else(|| eyre!("batched top4 output length overflow"))?;
+            if logits.len < logits_expected
+                || indices.len < output_expected
+                || selected_logits.len < output_expected
+                || weights.len < output_expected
+            {
+                return Err(eyre!(
+                    "batched top4 shape mismatch: logits {}, indices {}, selected {}, weights {}, expected logits at least {logits_expected} and outputs at least {output_expected}",
+                    logits.len,
+                    indices.len,
+                    selected_logits.len,
+                    weights.len
+                ));
+            }
+
+            let rows = rows as u32;
+            let experts = experts as u32;
+            let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
+            let experts_buffer = buffer_with_data(&self.context.device, &[experts]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.top4_softmax_batch);
+            encoder.set_buffer(0, Some(&logits.buffer), 0);
+            encoder.set_buffer(1, Some(&indices.buffer), 0);
+            encoder.set_buffer(2, Some(&selected_logits.buffer), 0);
+            encoder.set_buffer(3, Some(&weights.buffer), 0);
+            encoder.set_buffer(4, Some(&rows_buffer), 0);
+            encoder.set_buffer(5, Some(&experts_buffer), 0);
+            encoder.dispatch_threads(mtl_size(rows as NSUInteger, 1, 1), mtl_size(1, 1, 1));
+            encoder.end_encoding();
+            Ok(())
+        }
+
         pub fn mxfp4_top4_gate_swiglu_into(
             &self,
             blocks: &U8Buffer,
@@ -2040,6 +2109,91 @@ pub(crate) mod platform {
             encoder.set_buffer(5, Some(&out.buffer), 0);
             encoder.dispatch_thread_groups(
                 mtl_size(HIDDEN_SIZE as NSUInteger, 4, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn mxfp4_top4_gate_swiglu_batch_into(
+            &self,
+            blocks: &U8Buffer,
+            scales: &U8Buffer,
+            bias: &Bf16MatrixBuffer,
+            input: &F32VectorBuffer,
+            top_indices: &U32Buffer,
+            out: &F32VectorBuffer,
+            row_offset: usize,
+            rows: usize,
+        ) -> Result<()> {
+            let expected_blocks = EXPERTS
+                .checked_mul(GATE_UP_VALUES)
+                .and_then(|value| value.checked_mul(MXFP4_GROUPS))
+                .and_then(|value| value.checked_mul(MXFP4_BYTES_PER_GROUP))
+                .ok_or_else(|| eyre!("MXFP4 batched gate-up slab block length overflow"))?;
+            let expected_scales = EXPERTS
+                .checked_mul(GATE_UP_VALUES)
+                .and_then(|value| value.checked_mul(MXFP4_GROUPS))
+                .ok_or_else(|| eyre!("MXFP4 batched gate-up slab scale length overflow"))?;
+            if blocks.len != expected_blocks || scales.len != expected_scales {
+                return Err(eyre!(
+                    "MXFP4 batched gate-up slab length mismatch: blocks {}, scales {}, expected {expected_blocks}/{expected_scales}",
+                    blocks.len,
+                    scales.len
+                ));
+            }
+            if bias.rows != EXPERTS || bias.cols != GATE_UP_VALUES {
+                return Err(eyre!(
+                    "MXFP4 batched gate-up bias shape is {}x{}, expected {EXPERTS}x{GATE_UP_VALUES}",
+                    bias.rows,
+                    bias.cols
+                ));
+            }
+            let input_expected = row_offset
+                .checked_add(rows)
+                .and_then(|rows| rows.checked_mul(HIDDEN_SIZE))
+                .ok_or_else(|| eyre!("MXFP4 batched gate-up input length overflow"))?;
+            let top_expected = row_offset
+                .checked_add(rows)
+                .and_then(|rows| rows.checked_mul(4))
+                .ok_or_else(|| eyre!("MXFP4 batched gate-up top-index length overflow"))?;
+            let out_expected = rows
+                .checked_mul(4)
+                .and_then(|values| values.checked_mul(HIDDEN_SIZE))
+                .ok_or_else(|| eyre!("MXFP4 batched gate-up output length overflow"))?;
+            if input.len < input_expected
+                || top_indices.len < top_expected
+                || out.len < out_expected
+            {
+                return Err(eyre!(
+                    "MXFP4 batched gate-up shape mismatch: input {}, top_indices {}, out {}, expected input/top/out at least {input_expected}/{top_expected}/{out_expected}",
+                    input.len,
+                    top_indices.len,
+                    out.len
+                ));
+            }
+            if rows == 0 {
+                return Ok(());
+            }
+
+            let row_offset = row_offset as u32;
+            let rows = rows as u32;
+            let row_offset_buffer = buffer_with_data(&self.context.device, &[row_offset]);
+            let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.mxfp4_top4_gate_swiglu_batch);
+            encoder.set_buffer(0, Some(&blocks.buffer), 0);
+            encoder.set_buffer(1, Some(&scales.buffer), 0);
+            encoder.set_buffer(2, Some(&bias.buffer), 0);
+            encoder.set_buffer(3, Some(&input.buffer), 0);
+            encoder.set_buffer(4, Some(&top_indices.buffer), 0);
+            encoder.set_buffer(5, Some(&out.buffer), 0);
+            encoder.set_buffer(6, Some(&row_offset_buffer), 0);
+            encoder.set_buffer(7, Some(&rows_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(HIDDEN_SIZE as NSUInteger, 4, rows as NSUInteger),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
@@ -2109,6 +2263,99 @@ pub(crate) mod platform {
             encoder.set_buffer(7, Some(&out.buffer), 0);
             encoder.dispatch_thread_groups(
                 mtl_size(HIDDEN_SIZE as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn mxfp4_top4_down_weighted_batch_into(
+            &self,
+            blocks: &U8Buffer,
+            scales: &U8Buffer,
+            bias: &Bf16MatrixBuffer,
+            expert_acts: &F32VectorBuffer,
+            top_indices: &U32Buffer,
+            top_weights: &F32VectorBuffer,
+            residual: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+            row_offset: usize,
+            rows: usize,
+        ) -> Result<()> {
+            let expected_blocks = EXPERTS
+                .checked_mul(HIDDEN_SIZE)
+                .and_then(|value| value.checked_mul(MXFP4_GROUPS))
+                .and_then(|value| value.checked_mul(MXFP4_BYTES_PER_GROUP))
+                .ok_or_else(|| eyre!("MXFP4 batched down slab block length overflow"))?;
+            let expected_scales = EXPERTS
+                .checked_mul(HIDDEN_SIZE)
+                .and_then(|value| value.checked_mul(MXFP4_GROUPS))
+                .ok_or_else(|| eyre!("MXFP4 batched down slab scale length overflow"))?;
+            if blocks.len != expected_blocks || scales.len != expected_scales {
+                return Err(eyre!(
+                    "MXFP4 batched down slab length mismatch: blocks {}, scales {}, expected {expected_blocks}/{expected_scales}",
+                    blocks.len,
+                    scales.len
+                ));
+            }
+            if bias.rows != EXPERTS || bias.cols != HIDDEN_SIZE {
+                return Err(eyre!(
+                    "MXFP4 batched down bias shape is {}x{}, expected {EXPERTS}x{HIDDEN_SIZE}",
+                    bias.rows,
+                    bias.cols
+                ));
+            }
+            let hidden_expected = row_offset
+                .checked_add(rows)
+                .and_then(|rows| rows.checked_mul(HIDDEN_SIZE))
+                .ok_or_else(|| eyre!("MXFP4 batched down hidden length overflow"))?;
+            let top_expected = row_offset
+                .checked_add(rows)
+                .and_then(|rows| rows.checked_mul(4))
+                .ok_or_else(|| eyre!("MXFP4 batched down top length overflow"))?;
+            let acts_expected = rows
+                .checked_mul(4)
+                .and_then(|values| values.checked_mul(HIDDEN_SIZE))
+                .ok_or_else(|| eyre!("MXFP4 batched down activation length overflow"))?;
+            if expert_acts.len < acts_expected
+                || top_indices.len < top_expected
+                || top_weights.len < top_expected
+                || residual.len < hidden_expected
+                || out.len < hidden_expected
+            {
+                return Err(eyre!(
+                    "MXFP4 batched down shape mismatch: acts {}, top_indices {}, top_weights {}, residual {}, out {}, expected acts/top/hidden at least {acts_expected}/{top_expected}/{hidden_expected}",
+                    expert_acts.len,
+                    top_indices.len,
+                    top_weights.len,
+                    residual.len,
+                    out.len
+                ));
+            }
+            if rows == 0 {
+                return Ok(());
+            }
+
+            let row_offset = row_offset as u32;
+            let rows = rows as u32;
+            let row_offset_buffer = buffer_with_data(&self.context.device, &[row_offset]);
+            let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.mxfp4_top4_down_weighted_batch);
+            encoder.set_buffer(0, Some(&blocks.buffer), 0);
+            encoder.set_buffer(1, Some(&scales.buffer), 0);
+            encoder.set_buffer(2, Some(&bias.buffer), 0);
+            encoder.set_buffer(3, Some(&expert_acts.buffer), 0);
+            encoder.set_buffer(4, Some(&top_indices.buffer), 0);
+            encoder.set_buffer(5, Some(&top_weights.buffer), 0);
+            encoder.set_buffer(6, Some(&residual.buffer), 0);
+            encoder.set_buffer(7, Some(&out.buffer), 0);
+            encoder.set_buffer(8, Some(&row_offset_buffer), 0);
+            encoder.set_buffer(9, Some(&rows_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(HIDDEN_SIZE as NSUInteger, rows as NSUInteger, 1),
                 mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
             );
             encoder.end_encoding();
@@ -2662,6 +2909,18 @@ pub(crate) mod platform {
             Err(eyre!("Metal backend is only available on macOS"))
         }
 
+        pub fn top4_softmax_batch_into(
+            &self,
+            _logits: &F32VectorBuffer,
+            _indices: &U32Buffer,
+            _selected_logits: &F32VectorBuffer,
+            _weights: &F32VectorBuffer,
+            _rows: usize,
+            _experts: usize,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
         pub fn mxfp4_top4_gate_swiglu_into(
             &self,
             _blocks: &U8Buffer,
@@ -2670,6 +2929,21 @@ pub(crate) mod platform {
             _input: &F32VectorBuffer,
             _top_indices: &U32Buffer,
             _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn mxfp4_top4_gate_swiglu_batch_into(
+            &self,
+            _blocks: &U8Buffer,
+            _scales: &U8Buffer,
+            _bias: &Bf16MatrixBuffer,
+            _input: &F32VectorBuffer,
+            _top_indices: &U32Buffer,
+            _out: &F32VectorBuffer,
+            _row_offset: usize,
+            _rows: usize,
         ) -> Result<()> {
             Err(eyre!("Metal backend is only available on macOS"))
         }
@@ -2685,6 +2959,23 @@ pub(crate) mod platform {
             _top_weights: &F32VectorBuffer,
             _residual: &F32VectorBuffer,
             _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn mxfp4_top4_down_weighted_batch_into(
+            &self,
+            _blocks: &U8Buffer,
+            _scales: &U8Buffer,
+            _bias: &Bf16MatrixBuffer,
+            _expert_acts: &F32VectorBuffer,
+            _top_indices: &U32Buffer,
+            _top_weights: &F32VectorBuffer,
+            _residual: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+            _row_offset: usize,
+            _rows: usize,
         ) -> Result<()> {
             Err(eyre!("Metal backend is only available on macOS"))
         }
