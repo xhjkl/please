@@ -255,11 +255,22 @@ pub(crate) mod platform {
             })
         }
 
-        pub fn upload_u32_buffer(&self, values: &[u32]) -> Result<U32Buffer> {
-            Ok(U32Buffer {
-                buffer: buffer_with_data(&self.device, values),
-                len: values.len(),
-            })
+        pub fn write_u32_buffer(&self, buffer: &U32Buffer, values: &[u32]) -> Result<()> {
+            if values.len() > buffer.len {
+                return Err(eyre!(
+                    "u32 buffer write has {} values, capacity {}",
+                    values.len(),
+                    buffer.len
+                ));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    values.as_ptr(),
+                    buffer.buffer.contents().as_ptr().cast::<u32>(),
+                    values.len(),
+                );
+            }
+            Ok(())
         }
 
         pub fn read_f32_vector(&self, buffer: &F32VectorBuffer) -> Vec<f32> {
@@ -2886,7 +2897,7 @@ pub(crate) mod platform {
             Err(eyre!("Metal backend is only available on macOS"))
         }
 
-        pub fn upload_u32_buffer(&self, _values: &[u32]) -> Result<U32Buffer> {
+        pub fn write_u32_buffer(&self, _buffer: &U32Buffer, _values: &[u32]) -> Result<()> {
             Err(eyre!("Metal backend is only available on macOS"))
         }
 

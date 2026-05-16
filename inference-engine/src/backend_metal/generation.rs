@@ -79,6 +79,8 @@ struct GenerationScratch {
     prefill_router_selected_logits: platform::F32VectorBuffer,
     prefill_router_weights: platform::F32VectorBuffer,
     prefill_expert_acts_packed: platform::F32VectorBuffer,
+    prefill_tokens: platform::U32Buffer,
+    prefix_final_hidden: platform::F32VectorBuffer,
     final_hidden: platform::F32VectorBuffer,
     lm_logits: platform::F32VectorBuffer,
     lm_top1_block_indices: platform::U32Buffer,
@@ -145,6 +147,8 @@ impl GenerationScratch {
                 .alloc_f32_vector(prefill_router_choice_values)?,
             prefill_router_weights: platform.alloc_f32_vector(prefill_router_choice_values)?,
             prefill_expert_acts_packed: platform.alloc_f32_vector(prefill_expert_act_values)?,
+            prefill_tokens: platform.alloc_u32_buffer(context_tokens)?,
+            prefix_final_hidden: platform.alloc_f32_vector(HIDDEN_SIZE)?,
             final_hidden: platform.alloc_f32_vector(HIDDEN_SIZE)?,
             lm_logits: platform.alloc_f32_vector(vocab)?,
             lm_top1_block_indices: platform.alloc_u32_buffer(lm_top1_blocks)?,
@@ -203,7 +207,6 @@ struct PrefixCache {
     tokens: Vec<u32>,
     layers: usize,
     capacity: usize,
-    final_hidden: platform::F32VectorBuffer,
 }
 
 struct MetalSession {
@@ -655,13 +658,11 @@ fn prepare_prompt_state(
             },
         );
         if prompt_tokens.len() == pinned_prefix_len {
-            let final_hidden = session
-                .prefix_cache
-                .as_ref()
-                .ok_or_else(|| eyre!("resident prefix cache disappeared after hit"))?
-                .final_hidden
-                .clone();
-            copy_hidden(ctx, &final_hidden, &session.scratch.hidden_ping)?;
+            copy_hidden(
+                ctx,
+                &session.scratch.prefix_final_hidden,
+                &session.scratch.hidden_ping,
+            )?;
             return Ok(PingPong::Ping);
         }
 
@@ -696,15 +697,13 @@ fn prepare_prompt_state(
         0,
         pinned_prefix_len,
     )?;
-    let final_hidden = ctx.platform.alloc_f32_vector(HIDDEN_SIZE)?;
     let hidden = current_hidden(&session.scratch, current);
-    copy_hidden(ctx, &hidden, &final_hidden)?;
+    copy_hidden(ctx, &hidden, &session.scratch.prefix_final_hidden)?;
 
     session.prefix_cache = Some(PrefixCache {
         tokens: prefix_tokens.to_vec(),
         layers,
         capacity: context_tokens,
-        final_hidden,
     });
 
     if prompt_tokens.len() == pinned_prefix_len {
@@ -939,20 +938,20 @@ fn prefill_embeddings(
         }
     }
 
-    let tokens = ctx.platform.upload_u32_buffer(prompt_tokens)?;
+    ctx.platform
+        .write_u32_buffer(&scratch.prefill_tokens, prompt_tokens)?;
     #[cfg(feature = "profile")]
     ctx.record_profile(
         "op.input.prompt_tokens",
         ProfileDelta {
             upload_bytes: prompt_tokens.len() * size_of::<u32>(),
-            cache_misses: 1,
             ..ProfileDelta::default()
         },
     );
     let batch = ctx.platform.begin_batch();
     batch.embedding_lookup_bf16_batch_into(
         &weights.embed,
-        &tokens,
+        &scratch.prefill_tokens,
         prompt_tokens.len(),
         &scratch.prefill_hidden_ping,
     )?;
