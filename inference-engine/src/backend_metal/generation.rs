@@ -407,35 +407,48 @@ fn resident_sample_decode_inner(
     for step in 0..max_new_tokens {
         let output_position = prompt_tokens.len() + step;
         let current_hidden = resident_current_hidden(&scratch, current_is_a);
-        let candidates = resident_lm_head_topk(
-            ctx,
-            harmony,
-            weights,
-            &mut scratch,
-            &current_hidden,
-            sampler.candidate_count(),
-            output_position,
-        )?;
-        let sample_candidates = candidates
-            .iter()
-            .map(|token| SampleCandidate {
-                token: token.token,
-                logit: token.logit,
-                probability: 0.0,
-            })
-            .collect::<Vec<_>>();
-        let sampled = sampler.choose(&sample_candidates)?;
+        let sampled = if sampler.needs_full_vocab() {
+            resident_lm_head_full_vocab_sample(
+                ctx,
+                harmony,
+                weights,
+                &mut scratch,
+                &current_hidden,
+                &mut sampler,
+                output_position,
+            )?
+        } else {
+            let candidates = resident_lm_head_topk(
+                ctx,
+                harmony,
+                weights,
+                &mut scratch,
+                &current_hidden,
+                sampler.candidate_count(),
+                output_position,
+            )?;
+            let sample_candidates = candidates
+                .iter()
+                .map(|token| SampleCandidate {
+                    token: token.token,
+                    logit: token.logit,
+                    probability: 0.0,
+                })
+                .collect::<Vec<_>>();
+            let sampled = sampler.choose(&sample_candidates)?;
+            let text = candidates
+                .iter()
+                .find(|token| token.token == sampled.token)
+                .map(|token| token.text.clone())
+                .unwrap_or(decode_token_text(harmony, sampled.token)?);
+            GreedyTokenReport {
+                token: sampled.token,
+                logit: sampled.logit,
+                text,
+            }
+        };
         let token_id = sampled.token;
-        let text = candidates
-            .iter()
-            .find(|token| token.token == token_id)
-            .map(|token| token.text.clone())
-            .unwrap_or(decode_token_text(harmony, token_id)?);
-        generated.push(GreedyTokenReport {
-            token: token_id,
-            logit: sampled.logit,
-            text,
-        });
+        generated.push(sampled);
         if !recorded_first_token {
             ctx.record_profile(
                 "metric.cold_start_to_first_token",
@@ -965,6 +978,40 @@ fn resident_lm_head_topk(
             })
         })
         .collect()
+}
+
+fn resident_lm_head_full_vocab_sample(
+    ctx: &MetalOracleContext,
+    harmony: &HarmonyAdapter,
+    weights: &GptOssWeights,
+    scratch: &mut ResidentDecodeScratch,
+    hidden: &platform::F32VectorBuffer,
+    sampler: &mut Sampler,
+    output_position: usize,
+) -> Result<GreedyTokenReport> {
+    let batch = ctx.platform.begin_batch();
+    batch.rms_norm_into(hidden, &weights.final_norm, &scratch.final_hidden)?;
+    batch.bf16_matrix_logits_into(&weights.lm_head, &scratch.final_hidden, &scratch.lm_logits)?;
+    finish_resident_batch(
+        ctx,
+        batch,
+        stage_marker(output_position, TokenStage::LmHead),
+    );
+
+    ctx.record_profile(
+        "op.lm_head.full_vocab_readback",
+        ProfileDelta {
+            readback_bytes: weights.lm_head.rows() * size_of::<f32>(),
+            ..ProfileDelta::default()
+        },
+    );
+    let logits = ctx.platform.read_f32_vector(&scratch.lm_logits);
+    let sampled = sampler.choose_from_logits(&logits)?;
+    Ok(GreedyTokenReport {
+        token: sampled.token,
+        logit: sampled.logit,
+        text: decode_token_text(harmony, sampled.token)?,
+    })
 }
 
 fn resident_decode_layer(

@@ -1361,6 +1361,11 @@ pub(crate) fn decode_tokens_text(harmony: &HarmonyAdapter, tokens: &[u32]) -> Re
 pub(crate) fn metal_sampler_description(sampling: &SamplingConfig) -> String {
     if sampling.temperature <= 0.0 {
         "cached Metal BF16 lm_head logits + Metal top-1".to_string()
+    } else if sampling.top_k == 0 && sampling.top_p < 1.0 {
+        format!(
+            "cached Metal BF16 full-vocab lm_head logits + seeded full-vocab top-p sampler (seed {}, temperature {:.4}, top_p {:.4})",
+            sampling.seed, sampling.temperature, sampling.top_p
+        )
     } else {
         format!(
             "cached Metal BF16 lm_head logits + seeded temperature/top-k/top-p sampler (seed {}, temperature {:.4}, top_k {}, top_p {:.4})",

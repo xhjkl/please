@@ -1558,6 +1558,47 @@ pub(crate) mod platform {
             Ok(())
         }
 
+        pub fn bf16_matrix_logits_into(
+            &self,
+            weight: &Bf16MatrixBuffer,
+            input: &F32VectorBuffer,
+            logits: &F32VectorBuffer,
+        ) -> Result<()> {
+            if input.len != weight.cols {
+                return Err(eyre!(
+                    "BF16 logits input has {} values, expected {}",
+                    input.len,
+                    weight.cols
+                ));
+            }
+            if logits.len != weight.rows {
+                return Err(eyre!(
+                    "BF16 logits scratch has {} values, expected {}",
+                    logits.len,
+                    weight.rows
+                ));
+            }
+
+            let rows = weight.rows as u32;
+            let cols = weight.cols as u32;
+            let rows_buffer = buffer_with_data(&self.context.device, &[rows]);
+            let cols_buffer = buffer_with_data(&self.context.device, &[cols]);
+
+            let encoder = self.command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.context.bf16_matvec_logits);
+            encoder.set_buffer(0, Some(&weight.buffer), 0);
+            encoder.set_buffer(1, Some(&input.buffer), 0);
+            encoder.set_buffer(2, Some(&logits.buffer), 0);
+            encoder.set_buffer(3, Some(&rows_buffer), 0);
+            encoder.set_buffer(4, Some(&cols_buffer), 0);
+            encoder.dispatch_thread_groups(
+                mtl_size(rows as NSUInteger, 1, 1),
+                mtl_size(THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            encoder.end_encoding();
+            Ok(())
+        }
+
         pub fn bf16_matrix_top1_into(
             &self,
             weight: &Bf16MatrixBuffer,
@@ -2901,6 +2942,15 @@ pub(crate) mod platform {
             _indices: &U32Buffer,
             _values: &F32VectorBuffer,
             _k: usize,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn bf16_matrix_logits_into(
+            &self,
+            _weight: &Bf16MatrixBuffer,
+            _input: &F32VectorBuffer,
+            _logits: &F32VectorBuffer,
         ) -> Result<()> {
             Err(eyre!("Metal backend is only available on macOS"))
         }
