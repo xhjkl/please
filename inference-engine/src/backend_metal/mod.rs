@@ -1,6 +1,6 @@
 use eyre::{Result, eyre};
 
-use crate::model_store::{self, SourceModelReport};
+use crate::model_store::{self, SafeTensorMap, SourceModelReport};
 use crate::runtime_core::ExpertScore;
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -70,6 +70,22 @@ impl MetalOracleContext {
     pub fn with_lm_head(report: &SourceModelReport) -> Result<Self> {
         let platform = platform::MetalContext::new()?;
         let weight = model_store::read_bf16_matrix(report, "lm_head.weight")?;
+        let lm_head = platform.upload_bf16_matrix(&weight.values, weight.rows, weight.cols)?;
+        Ok(Self {
+            platform,
+            lm_head: Some(lm_head),
+            weights: Some(Arc::new(ResidentWeights::default())),
+            profile: Arc::new(Mutex::new(ProfileState::default())),
+            gpu_bf16_matrices: Mutex::new(HashMap::new()),
+            gpu_bf16_vectors: Mutex::new(HashMap::new()),
+            gpu_bf16_rows: Mutex::new(HashMap::new()),
+            gpu_u8_slices: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn with_lm_head_map(source: &SafeTensorMap) -> Result<Self> {
+        let platform = platform::MetalContext::new()?;
+        let weight = source.read_bf16_matrix("lm_head.weight")?;
         let lm_head = platform.upload_bf16_matrix(&weight.values, weight.rows, weight.cols)?;
         Ok(Self {
             platform,
@@ -335,6 +351,17 @@ impl MetalOracleContext {
         weights.bf16_matrix(report, tensor_name)
     }
 
+    fn bf16_matrix_from_map(
+        &self,
+        source: &SafeTensorMap,
+        tensor_name: &str,
+    ) -> Result<Arc<model_store::Bf16Matrix>> {
+        let Some(weights) = &self.weights else {
+            return Ok(Arc::new(source.read_bf16_matrix(tensor_name)?));
+        };
+        weights.bf16_matrix_from_map(source, tensor_name)
+    }
+
     fn bf16_vector(&self, report: &SourceModelReport, tensor_name: &str) -> Result<Arc<Vec<f32>>> {
         let Some(weights) = &self.weights else {
             return Ok(Arc::new(model_store::read_bf16_vector(
@@ -343,6 +370,17 @@ impl MetalOracleContext {
             )?));
         };
         weights.bf16_vector(report, tensor_name)
+    }
+
+    fn bf16_vector_from_map(
+        &self,
+        source: &SafeTensorMap,
+        tensor_name: &str,
+    ) -> Result<Arc<Vec<f32>>> {
+        let Some(weights) = &self.weights else {
+            return Ok(Arc::new(source.read_bf16_vector(tensor_name)?));
+        };
+        weights.bf16_vector_from_map(source, tensor_name)
     }
 
     fn bf16_matrix_row(
@@ -377,6 +415,23 @@ impl MetalOracleContext {
             )?));
         };
         weights.u8_tensor_slice(report, tensor_name, element_offset, element_len)
+    }
+
+    fn u8_tensor_slice_from_map(
+        &self,
+        source: &SafeTensorMap,
+        tensor_name: &str,
+        element_offset: usize,
+        element_len: usize,
+    ) -> Result<Arc<Vec<u8>>> {
+        let Some(weights) = &self.weights else {
+            return Ok(Arc::new(source.read_u8_tensor_slice(
+                tensor_name,
+                element_offset,
+                element_len,
+            )?));
+        };
+        weights.u8_tensor_slice_from_map(source, tensor_name, element_offset, element_len)
     }
 
     fn bf16_linear_matvec(
@@ -636,15 +691,15 @@ impl MetalOracleContext {
             .mxfp4_matvec_resident(blocks, scales, rows, input, bias)
     }
 
-    fn bf16_matrix_buffer(
+    fn bf16_matrix_buffer_from_map(
         &self,
-        report: &SourceModelReport,
+        source: &SafeTensorMap,
         tensor_name: &str,
         op_name: &str,
     ) -> Result<platform::Bf16MatrixBuffer> {
         let mut cache = self.gpu_bf16_matrices.lock().unwrap();
         if !cache.contains_key(tensor_name) {
-            let weight = self.bf16_matrix(report, tensor_name)?;
+            let weight = self.bf16_matrix_from_map(source, tensor_name)?;
             self.record_profile(
                 op_name,
                 ProfileDelta {
@@ -672,15 +727,15 @@ impl MetalOracleContext {
             .ok_or_else(|| eyre!("cached BF16 matrix is missing for {tensor_name}"))
     }
 
-    fn bf16_vector_buffer(
+    fn bf16_vector_buffer_from_map(
         &self,
-        report: &SourceModelReport,
+        source: &SafeTensorMap,
         tensor_name: &str,
         op_name: &str,
     ) -> Result<platform::F32VectorBuffer> {
         let mut cache = self.gpu_bf16_vectors.lock().unwrap();
         if !cache.contains_key(tensor_name) {
-            let weight = self.bf16_vector(report, tensor_name)?;
+            let weight = self.bf16_vector_from_map(source, tensor_name)?;
             self.record_profile(
                 op_name,
                 ProfileDelta {
@@ -706,9 +761,9 @@ impl MetalOracleContext {
             .ok_or_else(|| eyre!("cached BF16 vector is missing for {tensor_name}"))
     }
 
-    fn u8_slice_buffer(
+    fn u8_slice_buffer_from_map(
         &self,
-        report: &SourceModelReport,
+        source: &SafeTensorMap,
         tensor_name: &str,
         element_offset: usize,
         element_len: usize,
@@ -717,7 +772,8 @@ impl MetalOracleContext {
         let key = (tensor_name.to_string(), element_offset, element_len);
         let mut cache = self.gpu_u8_slices.lock().unwrap();
         if !cache.contains_key(&key) {
-            let value = self.u8_tensor_slice(report, tensor_name, element_offset, element_len)?;
+            let value =
+                self.u8_tensor_slice_from_map(source, tensor_name, element_offset, element_len)?;
             self.record_profile(
                 op_name,
                 ProfileDelta {
@@ -743,46 +799,46 @@ impl MetalOracleContext {
             .ok_or_else(|| eyre!("cached u8 slice is missing for {tensor_name}"))
     }
 
-    fn mxfp4_layer_expert_slabs(
+    fn mxfp4_layer_expert_slabs_from_map(
         &self,
-        report: &SourceModelReport,
+        source: &SafeTensorMap,
         expert_prefix: &str,
     ) -> Result<ResidentLayerExpertSlabs> {
-        let gate_up_blocks = self.u8_slice_buffer(
-            report,
+        let gate_up_blocks = self.u8_slice_buffer_from_map(
+            source,
             &format!("{expert_prefix}.gate_up_proj_blocks"),
             0,
             mxfp4_slab_blocks_len(GATE_UP_VALUES)?,
             "op.mxfp4.gate_up",
         )?;
-        let gate_up_scales = self.u8_slice_buffer(
-            report,
+        let gate_up_scales = self.u8_slice_buffer_from_map(
+            source,
             &format!("{expert_prefix}.gate_up_proj_scales"),
             0,
             mxfp4_slab_scales_len(GATE_UP_VALUES)?,
             "op.mxfp4.gate_up",
         )?;
-        let gate_up_bias = self.bf16_matrix_buffer(
-            report,
+        let gate_up_bias = self.bf16_matrix_buffer_from_map(
+            source,
             &format!("{expert_prefix}.gate_up_proj_bias"),
             "op.mxfp4.gate_up",
         )?;
-        let down_blocks = self.u8_slice_buffer(
-            report,
+        let down_blocks = self.u8_slice_buffer_from_map(
+            source,
             &format!("{expert_prefix}.down_proj_blocks"),
             0,
             mxfp4_slab_blocks_len(HIDDEN_SIZE)?,
             "op.mxfp4.down",
         )?;
-        let down_scales = self.u8_slice_buffer(
-            report,
+        let down_scales = self.u8_slice_buffer_from_map(
+            source,
             &format!("{expert_prefix}.down_proj_scales"),
             0,
             mxfp4_slab_scales_len(HIDDEN_SIZE)?,
             "op.mxfp4.down",
         )?;
-        let down_bias = self.bf16_matrix_buffer(
-            report,
+        let down_bias = self.bf16_matrix_buffer_from_map(
+            source,
             &format!("{expert_prefix}.down_proj_bias"),
             "op.mxfp4.down",
         )?;

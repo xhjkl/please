@@ -5,10 +5,11 @@ use super::{
     MAX_KV_CACHE_PROBE_TOKENS, MetalOracleContext, MetalProfileReport, ProfileDelta, Q_HEADS,
     StageMarker, TokenStage, decode_token_text, decode_tokens_text, metal_sampler_description,
     platform, stage_marker,
+    weights::{GptOssLayerWeights, GptOssWeights},
 };
-use crate::gptoss_spec::weights;
+use crate::gptoss_spec::weights as spec_weights;
 use crate::harmony_adapter::HarmonyAdapter;
-use crate::model_store::{self, SourceModelReport};
+use crate::model_store;
 use crate::runtime_core::sampler::{SampleCandidate, Sampler};
 use crate::runtime_core::{
     EngineRequest, GenerationEvent, GreedyDecodeProbeReport, GreedyTokenReport, RuntimeNotice,
@@ -114,9 +115,9 @@ impl ResidentGpuKvCache {
 }
 
 pub struct MetalEngine {
-    report: SourceModelReport,
     harmony: HarmonyAdapter,
     ctx: MetalOracleContext,
+    weights: GptOssWeights,
     layers: usize,
 }
 
@@ -133,19 +134,21 @@ impl MetalEngine {
         }
 
         let report = model_store::inspect_canonical_safetensors()?;
-        let validation = weights::validate_gpt_oss_20b_source(&report);
+        let validation = spec_weights::validate_gpt_oss_20b_source(&report);
         if !validation.is_ok() {
             return Err(eyre!(
                 "canonical gpt-oss SafeTensors layout did not validate"
             ));
         }
+        let source = model_store::SafeTensorMap::open(report)?;
 
         let harmony = HarmonyAdapter::gpt_oss()?;
-        let ctx = MetalOracleContext::with_lm_head(&report)?;
+        let ctx = MetalOracleContext::with_lm_head_map(&source)?;
+        let weights = GptOssWeights::load(&ctx, &source, layers)?;
         Ok(Self {
-            report,
             harmony,
             ctx,
+            weights,
             layers,
         })
     }
@@ -189,7 +192,7 @@ impl MetalEngine {
 
         let generated = resident_sample_decode(
             &self.ctx,
-            &self.report,
+            &self.weights,
             &self.harmony,
             &prompt_tokens,
             self.layers,
@@ -227,7 +230,7 @@ fn request_prompt_tokens(request: &EngineRequest) -> Result<Vec<u32>> {
 
 fn resident_sample_decode(
     ctx: &MetalOracleContext,
-    report: &SourceModelReport,
+    weights: &GptOssWeights,
     harmony: &HarmonyAdapter,
     prompt_tokens: &[u32],
     layers: usize,
@@ -240,7 +243,7 @@ fn resident_sample_decode(
         || {
             resident_sample_decode_inner(
                 ctx,
-                report,
+                weights,
                 harmony,
                 prompt_tokens,
                 layers,
@@ -253,7 +256,7 @@ fn resident_sample_decode(
 
 fn resident_sample_decode_inner(
     ctx: &MetalOracleContext,
-    report: &SourceModelReport,
+    weights: &GptOssWeights,
     harmony: &HarmonyAdapter,
     prompt_tokens: &[u32],
     layers: usize,
@@ -290,27 +293,16 @@ fn resident_sample_decode_inner(
     #[cfg(feature = "metal-stage-profile")]
     ctx.reset_stage_profile(context_tokens);
 
-    let Some(lm_head) = &ctx.lm_head else {
-        return Err(eyre!(
-            "Metal lm_head weight is not cached; construct MetalOracleContext::with_lm_head"
-        ));
-    };
-    let mut scratch = ResidentDecodeScratch::new(&ctx.platform, lm_head.rows())?;
+    let mut scratch = ResidentDecodeScratch::new(&ctx.platform, weights.lm_head.rows())?;
     let mut kv_cache = ResidentGpuKvCache::new(&ctx.platform, layers, context_tokens)?;
-    let embed = ctx.bf16_matrix_buffer(
-        report,
-        "model.embed_tokens.weight",
-        "op.weight.embed_tokens",
-    )?;
 
     let mut current_is_a = true;
     for (position, token) in prompt_tokens.iter().copied().enumerate() {
         current_is_a = resident_decode_token(
             ctx,
-            report,
+            weights,
             &mut scratch,
             &mut kv_cache,
-            &embed,
             layers,
             position,
             token,
@@ -327,8 +319,8 @@ fn resident_sample_decode_inner(
         let current_hidden = resident_current_hidden(&scratch, current_is_a);
         let candidates = resident_lm_head_topk(
             ctx,
-            report,
             harmony,
+            weights,
             &mut scratch,
             &current_hidden,
             sampler.candidate_count(),
@@ -366,10 +358,9 @@ fn resident_sample_decode_inner(
         let position = output_position;
         current_is_a = resident_decode_token(
             ctx,
-            report,
+            weights,
             &mut scratch,
             &mut kv_cache,
-            &embed,
             layers,
             position,
             token_id,
@@ -423,22 +414,29 @@ fn resident_current_hidden(
 #[allow(clippy::too_many_arguments)]
 fn resident_decode_token(
     ctx: &MetalOracleContext,
-    report: &SourceModelReport,
+    weights: &GptOssWeights,
     scratch: &mut ResidentDecodeScratch,
     kv_cache: &mut ResidentGpuKvCache,
-    embed: &platform::Bf16MatrixBuffer,
     layers: usize,
     position: usize,
     token: u32,
 ) -> Result<bool> {
     let batch = ctx.platform.begin_batch();
-    batch.embedding_lookup_bf16_into(embed, token as usize, &scratch.hidden_a)?;
+    batch.embedding_lookup_bf16_into(&weights.embed, token as usize, &scratch.hidden_a)?;
     let mut current_is_a = true;
 
     for layer in 0..layers {
         let (input, output) = resident_hidden_pair(scratch, current_is_a);
+        let layer_weights = weights.layer(layer)?;
         resident_decode_layer(
-            ctx, report, &batch, scratch, kv_cache, layer, position, &input, &output,
+            &batch,
+            scratch,
+            kv_cache,
+            layer_weights,
+            layer,
+            position,
+            &input,
+            &output,
         )?;
         current_is_a = !current_is_a;
     }
@@ -449,26 +447,18 @@ fn resident_decode_token(
 
 fn resident_lm_head_topk(
     ctx: &MetalOracleContext,
-    report: &SourceModelReport,
     harmony: &HarmonyAdapter,
+    weights: &GptOssWeights,
     scratch: &mut ResidentDecodeScratch,
     hidden: &platform::F32VectorBuffer,
     k: usize,
     output_position: usize,
 ) -> Result<Vec<GreedyTokenReport>> {
-    let Some(lm_head) = &ctx.lm_head else {
-        return Err(eyre!(
-            "Metal lm_head weight is not cached; construct MetalOracleContext::with_lm_head"
-        ));
-    };
-    let norm_weight =
-        ctx.bf16_vector_buffer(report, "model.norm.weight", "op.weight.final_norm")?;
-
     let batch = ctx.platform.begin_batch();
-    batch.rms_norm_into(hidden, &norm_weight, &scratch.final_hidden)?;
+    batch.rms_norm_into(hidden, &weights.final_norm, &scratch.final_hidden)?;
     if k == 1 {
         batch.bf16_matrix_top1_into(
-            lm_head,
+            &weights.lm_head,
             &scratch.final_hidden,
             &scratch.lm_logits,
             &scratch.lm_top1_block_indices,
@@ -478,7 +468,7 @@ fn resident_lm_head_topk(
         )?;
     } else {
         batch.bf16_matrix_topk_into(
-            lm_head,
+            &weights.lm_head,
             &scratch.final_hidden,
             &scratch.lm_logits,
             &scratch.lm_top_indices,
@@ -509,11 +499,10 @@ fn resident_lm_head_topk(
 }
 
 fn resident_decode_layer(
-    ctx: &MetalOracleContext,
-    report: &SourceModelReport,
     batch: &platform::MetalBatch<'_>,
     scratch: &mut ResidentDecodeScratch,
     kv_cache: &mut ResidentGpuKvCache,
+    weights: &GptOssLayerWeights,
     layer: usize,
     position: usize,
     input: &platform::F32VectorBuffer,
@@ -526,78 +515,26 @@ fn resident_decode_layer(
         ));
     }
 
-    let prefix = format!("model.layers.{layer}");
-    let input_norm_weight = ctx.bf16_vector_buffer(
-        report,
-        &format!("{prefix}.input_layernorm.weight"),
-        "op.weight.input_layernorm",
-    )?;
-    let q_weight = ctx.bf16_matrix_buffer(
-        report,
-        &format!("{prefix}.self_attn.q_proj.weight"),
-        "op.bf16.q_proj",
-    )?;
-    let q_bias = ctx.bf16_vector_buffer(
-        report,
-        &format!("{prefix}.self_attn.q_proj.bias"),
-        "op.bf16.q_proj",
-    )?;
-    let k_weight = ctx.bf16_matrix_buffer(
-        report,
-        &format!("{prefix}.self_attn.k_proj.weight"),
-        "op.bf16.k_proj",
-    )?;
-    let k_bias = ctx.bf16_vector_buffer(
-        report,
-        &format!("{prefix}.self_attn.k_proj.bias"),
-        "op.bf16.k_proj",
-    )?;
-    let v_weight = ctx.bf16_matrix_buffer(
-        report,
-        &format!("{prefix}.self_attn.v_proj.weight"),
-        "op.bf16.v_proj",
-    )?;
-    let v_bias = ctx.bf16_vector_buffer(
-        report,
-        &format!("{prefix}.self_attn.v_proj.bias"),
-        "op.bf16.v_proj",
-    )?;
-    let sinks = ctx.bf16_vector_buffer(
-        report,
-        &format!("{prefix}.self_attn.sinks"),
-        "op.weight.attention_sinks",
-    )?;
-    let o_weight = ctx.bf16_matrix_buffer(
-        report,
-        &format!("{prefix}.self_attn.o_proj.weight"),
-        "op.bf16.o_proj",
-    )?;
-    let o_bias = ctx.bf16_vector_buffer(
-        report,
-        &format!("{prefix}.self_attn.o_proj.bias"),
-        "op.bf16.o_proj",
-    )?;
-    let post_norm_weight = ctx.bf16_vector_buffer(
-        report,
-        &format!("{prefix}.post_attention_layernorm.weight"),
-        "op.weight.post_attention_layernorm",
-    )?;
-    let router_weight = ctx.bf16_matrix_buffer(
-        report,
-        &format!("{prefix}.mlp.router.weight"),
-        "op.bf16.router",
-    )?;
-    let router_bias = ctx.bf16_vector_buffer(
-        report,
-        &format!("{prefix}.mlp.router.bias"),
-        "op.bf16.router",
-    )?;
-
     let layer_cache = kv_cache.layer(layer)?;
-    batch.rms_norm_into(input, &input_norm_weight, &scratch.normed)?;
-    batch.bf16_matrix_matvec_into(&q_weight, &scratch.normed, &q_bias, &scratch.q)?;
-    batch.bf16_matrix_matvec_into(&k_weight, &scratch.normed, &k_bias, &scratch.k)?;
-    batch.bf16_matrix_matvec_into(&v_weight, &scratch.normed, &v_bias, &scratch.v)?;
+    batch.rms_norm_into(input, &weights.input_norm, &scratch.normed)?;
+    batch.bf16_matrix_matvec_into(
+        &weights.attn.q.weight,
+        &scratch.normed,
+        &weights.attn.q.bias,
+        &scratch.q,
+    )?;
+    batch.bf16_matrix_matvec_into(
+        &weights.attn.k.weight,
+        &scratch.normed,
+        &weights.attn.k.bias,
+        &scratch.k,
+    )?;
+    batch.bf16_matrix_matvec_into(
+        &weights.attn.v.weight,
+        &scratch.normed,
+        &weights.attn.v.bias,
+        &scratch.v,
+    )?;
     batch.rope_row_into(&scratch.q, &scratch.q_rope, Q_HEADS, position)?;
     batch.rope_row_into(&scratch.k, &scratch.k_rope, KV_HEADS, position)?;
     batch.write_f32_slot_into(&scratch.k_rope, &layer_cache.k, position, KV_VALUES)?;
@@ -610,16 +547,25 @@ fn resident_decode_layer(
         &scratch.q_rope,
         &layer_cache.k,
         &layer_cache.v,
-        &sinks,
+        &weights.attn.sinks,
         &scratch.attn,
     )?;
-    batch.bf16_matrix_matvec_into(&o_weight, &scratch.attn, &o_bias, &scratch.projected)?;
-    batch.vector_add_into(input, &scratch.projected, &scratch.residual)?;
-    batch.rms_norm_into(&scratch.residual, &post_norm_weight, &scratch.router_input)?;
     batch.bf16_matrix_matvec_into(
-        &router_weight,
+        &weights.attn.o.weight,
+        &scratch.attn,
+        &weights.attn.o.bias,
+        &scratch.projected,
+    )?;
+    batch.vector_add_into(input, &scratch.projected, &scratch.residual)?;
+    batch.rms_norm_into(
+        &scratch.residual,
+        &weights.post_attn_norm,
         &scratch.router_input,
-        &router_bias,
+    )?;
+    batch.bf16_matrix_matvec_into(
+        &weights.sparse_mlp.router.weight,
+        &scratch.router_input,
+        &weights.sparse_mlp.router.bias,
         &scratch.router_logits,
     )?;
     batch.top4_softmax_into(
@@ -629,21 +575,18 @@ fn resident_decode_layer(
         &scratch.router_weights,
     )?;
 
-    let expert_prefix = format!("{prefix}.mlp.experts");
-    let expert_slabs = ctx.mxfp4_layer_expert_slabs(report, &expert_prefix)?;
-
     batch.mxfp4_top4_gate_swiglu_into(
-        &expert_slabs.gate_up_blocks,
-        &expert_slabs.gate_up_scales,
-        &expert_slabs.gate_up_bias,
+        &weights.sparse_mlp.experts.gate_up_blocks,
+        &weights.sparse_mlp.experts.gate_up_scales,
+        &weights.sparse_mlp.experts.gate_up_bias,
         &scratch.router_input,
         &scratch.router_indices,
         &scratch.expert_acts_packed,
     )?;
     batch.mxfp4_top4_down_weighted_into(
-        &expert_slabs.down_blocks,
-        &expert_slabs.down_scales,
-        &expert_slabs.down_bias,
+        &weights.sparse_mlp.experts.down_blocks,
+        &weights.sparse_mlp.experts.down_scales,
+        &weights.sparse_mlp.experts.down_bias,
         &scratch.expert_acts_packed,
         &scratch.router_indices,
         &scratch.router_weights,
