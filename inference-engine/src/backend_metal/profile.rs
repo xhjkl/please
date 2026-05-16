@@ -31,6 +31,41 @@ impl MetalProfileReport {
             format_duration_ns(total_wall_ns)
         ));
         out.push_str("- gpu: Metal command-buffer GPU timestamps where available\n");
+        out.push_str("\nkey metrics:\n");
+        out.push_str(&format!(
+            "- hot token door-to-door: {}\n",
+            render_average_metric(
+                records
+                    .iter()
+                    .find(|record| record.name == "metric.hot_token")
+            )
+            .unwrap_or_else(|| "n/a; generate at least 2 tokens".to_string())
+        ));
+        out.push_str(&format!(
+            "- expert slab page-spill time: {}\n",
+            render_spill_time(
+                records
+                    .iter()
+                    .find(|record| record.name == "metric.expert_slab_page")
+            )
+        ));
+        out.push_str(&format!(
+            "- expert slab page-spills: {}\n",
+            render_spill_count(
+                records
+                    .iter()
+                    .find(|record| record.name == "metric.expert_slab_page")
+            )
+        ));
+        out.push_str(&format!(
+            "- cold inference to first token: {}\n",
+            render_single_metric(
+                records
+                    .iter()
+                    .find(|record| record.name == "metric.cold_start_to_first_token")
+            )
+            .unwrap_or_else(|| "n/a".to_string())
+        ));
         out.push_str("\n");
         out.push_str(
             "pct     wall      gpu       calls  cb     upload    readback  cache       name\n",
@@ -69,6 +104,7 @@ impl MetalProfileReport {
         }
         #[cfg(feature = "metal-stage-profile")]
         if let Some(stage_profile) = &self.stage_profile {
+            out.push_str(&stage_profile.render_hot_token_breakdown());
             out.push_str(&stage_profile.render_for_cli());
         }
         out
@@ -85,6 +121,60 @@ pub struct MetalStageProfileReport {
 
 #[cfg(feature = "metal-stage-profile")]
 impl MetalStageProfileReport {
+    fn render_hot_token_breakdown(&self) -> String {
+        let mut positions = self
+            .token_positions
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+
+        let mut rows = Vec::new();
+        for position in positions {
+            if position == 0 {
+                continue;
+            }
+            let decode_gpu = self.value_at(position - 1, TokenStage::Token);
+            let lm_head_gpu = self.value_at(position, TokenStage::LmHead);
+            if decode_gpu == 0 || lm_head_gpu == 0 {
+                continue;
+            }
+            rows.push((position, decode_gpu, lm_head_gpu));
+        }
+
+        let mut out = String::new();
+        out.push_str("\nhot token stage breakdown:\n");
+        out.push_str("- source: GPU timestamps stitched as decode(previous token) + lm_head(current token)\n\n");
+        if rows.is_empty() {
+            out.push_str("(no full hot-token stage sample; generate at least 2 tokens)\n");
+            return out;
+        }
+
+        out.push_str("token      decode_gpu     lm_head_gpu     gpu_total\n");
+        out.push_str("---------  -------------  --------------  -------------\n");
+        for (position, decode_gpu, lm_head_gpu) in rows {
+            out.push_str(&format!(
+                "{position:>9}  {:>13}  {:>14}  {:>13}\n",
+                format_duration_ns(decode_gpu),
+                format_duration_ns(lm_head_gpu),
+                format_duration_ns(decode_gpu.saturating_add(lm_head_gpu))
+            ));
+        }
+        out
+    }
+
+    fn value_at(&self, token_position: usize, stage: TokenStage) -> u128 {
+        if self.token_positions.is_empty() {
+            return 0;
+        }
+        let slot = token_position % self.token_positions.len();
+        if self.token_positions[slot] != Some(token_position) {
+            return 0;
+        }
+        self.values_ns[slot][stage.index()]
+    }
+
     fn render_for_cli(&self) -> String {
         let mut out = String::new();
         out.push_str("\nmetal token-stage profile:\n");
@@ -252,4 +342,51 @@ fn format_bytes(bytes: usize) -> String {
     } else {
         format!("{bytes}B")
     }
+}
+
+fn render_single_metric(record: Option<&MetalProfileRecord>) -> Option<String> {
+    let record = record?;
+    Some(format_duration_ns(record.wall_ns))
+}
+
+fn render_average_metric(record: Option<&MetalProfileRecord>) -> Option<String> {
+    let record = record?;
+    if record.calls == 0 {
+        return None;
+    }
+    let avg = record.wall_ns / record.calls as u128;
+    Some(format!(
+        "{} avg over {} token{}",
+        format_duration_ns(avg),
+        record.calls,
+        plural_suffix(record.calls)
+    ))
+}
+
+fn render_spill_time(record: Option<&MetalProfileRecord>) -> String {
+    let Some(record) = record else {
+        return "n/a; 0 reloads".to_string();
+    };
+    let spills = spill_count(record);
+    if spills == 0 {
+        return "n/a; 0 reloads".to_string();
+    }
+    let avg = record.wall_ns / spills as u128;
+    format!(
+        "{} avg, {} total",
+        format_duration_ns(avg),
+        format_duration_ns(record.wall_ns)
+    )
+}
+
+fn render_spill_count(record: Option<&MetalProfileRecord>) -> usize {
+    record.map(spill_count).unwrap_or(0)
+}
+
+fn spill_count(record: &MetalProfileRecord) -> usize {
+    record.cache_misses.max(record.calls)
+}
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
 }

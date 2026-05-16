@@ -595,10 +595,15 @@ impl MetalOracleContext {
 
         let blocks_key = (blocks_name.to_string(), blocks_offset, blocks_per_expert);
         let scales_key = (scales_name.to_string(), scales_offset, scales_per_expert);
+        let page_started = Instant::now();
+        let mut page_upload_bytes = 0usize;
+        let mut page_missed = false;
         let mut u8_cache = self.gpu_u8_slices.lock().unwrap();
         if !u8_cache.contains_key(&blocks_key) {
             let blocks =
                 self.u8_tensor_slice(report, blocks_name, blocks_offset, blocks_per_expert)?;
+            page_upload_bytes = page_upload_bytes.saturating_add(blocks.len());
+            page_missed = true;
             self.record_profile(
                 op_name,
                 ProfileDelta {
@@ -621,6 +626,8 @@ impl MetalOracleContext {
         if !u8_cache.contains_key(&scales_key) {
             let scales =
                 self.u8_tensor_slice(report, scales_name, scales_offset, scales_per_expert)?;
+            page_upload_bytes = page_upload_bytes.saturating_add(scales.len());
+            page_missed = true;
             self.record_profile(
                 op_name,
                 ProfileDelta {
@@ -655,6 +662,8 @@ impl MetalOracleContext {
         let mut row_cache = self.gpu_bf16_rows.lock().unwrap();
         if !row_cache.contains_key(&bias_key) {
             let bias = self.bf16_matrix_row(report, bias_name, expert)?;
+            page_upload_bytes = page_upload_bytes.saturating_add(bias.len() * size_of::<f32>());
+            page_missed = true;
             self.record_profile(
                 op_name,
                 ProfileDelta {
@@ -679,6 +688,17 @@ impl MetalOracleContext {
                 "cached MXFP4 bias row is missing for {bias_name} expert {expert}"
             ));
         };
+        if page_missed {
+            self.record_profile(
+                "metric.expert_slab_page",
+                ProfileDelta {
+                    wall: page_started.elapsed(),
+                    upload_bytes: page_upload_bytes,
+                    cache_misses: 1,
+                    ..ProfileDelta::default()
+                },
+            );
+        }
 
         self.record_profile(
             op_name,

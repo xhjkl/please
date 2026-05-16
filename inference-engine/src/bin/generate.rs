@@ -19,13 +19,20 @@ fn main() -> Result<()> {
         .len()
         .checked_add(args.max_new_tokens)
         .ok_or_else(|| eyre!("context capacity overflow"))?;
+    if args.pinned_prefix_len > tokens.len() {
+        return Err(eyre!(
+            "--pinned-prefix {} exceeds rendered prompt length {}",
+            args.pinned_prefix_len,
+            tokens.len()
+        ));
+    }
     let started = Instant::now();
     let engine = MetalEngine::load_canonical_with_layers(args.layers)?;
     let load = started.elapsed();
     let request = EngineRequest {
         prompt: PromptPlan {
             tokens,
-            pinned_prefix_len: 0,
+            pinned_prefix_len: args.pinned_prefix_len,
             context_capacity,
             notices: Vec::new(),
         },
@@ -37,12 +44,18 @@ fn main() -> Result<()> {
         fixture: None,
     };
 
-    let (events, profile) = if args.profile {
-        let (events, profile) = engine.generate_profiled(request)?;
-        (events, Some(profile))
-    } else {
-        (engine.generate(request)?, None)
-    };
+    let mut events = Vec::new();
+    let mut profile = None;
+    for iteration in 0..args.repeat {
+        let is_final = iteration + 1 == args.repeat;
+        if args.profile && is_final {
+            let (next_events, next_profile) = engine.generate_profiled(request.clone())?;
+            events = next_events;
+            profile = Some(next_profile);
+        } else {
+            events = engine.generate(request.clone())?;
+        }
+    }
     let mut text = String::new();
     let mut stop_reason = None;
     for event in events {
@@ -56,6 +69,8 @@ fn main() -> Result<()> {
     println!("inference-engine generate:");
     println!("- layers: {}", args.layers);
     println!("- max new tokens: {}", args.max_new_tokens);
+    println!("- pinned prefix tokens: {}", args.pinned_prefix_len);
+    println!("- repeat: {}", args.repeat);
     println!(
         "- stop_reason: {:?}",
         stop_reason.unwrap_or(StopReason::Cancelled)
@@ -78,6 +93,8 @@ struct Args {
     max_output_bytes: usize,
     sampling: SamplingConfig,
     profile: bool,
+    pinned_prefix_len: usize,
+    repeat: usize,
 }
 
 impl Args {
@@ -91,6 +108,8 @@ impl Args {
             ..SamplingConfig::default()
         };
         let mut profile = false;
+        let mut pinned_prefix_len = 0usize;
+        let mut repeat = 1usize;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -142,6 +161,18 @@ impl Args {
                         .ok_or_else(|| eyre!("--top-p requires a value"))?;
                     sampling.top_p = value.parse()?;
                 }
+                "--pinned-prefix" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| eyre!("--pinned-prefix requires a value"))?;
+                    pinned_prefix_len = value.parse()?;
+                }
+                "--repeat" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| eyre!("--repeat requires a value"))?;
+                    repeat = value.parse()?;
+                }
                 "--profile" => profile = true,
                 _ => return Err(eyre!("unknown argument {arg}")),
             }
@@ -159,6 +190,9 @@ impl Args {
         if !(0.0..=1.0).contains(&sampling.top_p) {
             return Err(eyre!("--top-p must be in 0..=1"));
         }
+        if repeat == 0 {
+            return Err(eyre!("--repeat must be greater than zero"));
+        }
 
         Ok(Self {
             prompt,
@@ -167,6 +201,8 @@ impl Args {
             max_output_bytes,
             sampling,
             profile,
+            pinned_prefix_len,
+            repeat,
         })
     }
 }
