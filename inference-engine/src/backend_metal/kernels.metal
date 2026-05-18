@@ -1835,18 +1835,14 @@ kernel void kv_cache_decode_attention(
     uint kv_start = kv_head * 64u;
 
     if (key_count > 128u) {
-        if (tid != 0u) {
-            return;
-        }
-
-        float max_value = sinks[head];
-        float denom = 1.0f;
+        float local_max = -3.402823466e+38f;
+        float local_denom = 0.0f;
         float values[64];
         for (uint dim = 0u; dim < 64u; dim++) {
             values[dim] = 0.0f;
         }
 
-        for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
+        for (uint key_offset = tid; key_offset < key_count; key_offset += GPTOSS_DECODE_ATTENTION_THREADS) {
             uint key_position = effective_key_start + key_offset;
             uint cache_offset = key_position - cache_start_position;
             uint k_start = cache_offset * 512u + kv_start;
@@ -1856,18 +1852,63 @@ kernel void kv_cache_decode_attention(
                 sum += q[q_start + dim] * k_cache[k_start + dim];
             }
             float score = sum * 0.125f;
-            float next_max = max(max_value, score);
-            float old_scale = exp(max_value - next_max);
+            float next_max = max(local_max, score);
+            float old_scale = exp(local_max - next_max);
             float new_scale = exp(score - next_max);
             for (uint dim = 0u; dim < 64u; dim++) {
                 values[dim] = values[dim] * old_scale + v_cache[v_start + dim] * new_scale;
             }
-            denom = denom * old_scale + new_scale;
-            max_value = next_max;
+            local_denom = local_denom * old_scale + new_scale;
+            local_max = next_max;
         }
 
+        scratch[tid] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = GPTOSS_DECODE_ATTENTION_THREADS / 2u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                scratch[tid] = max(scratch[tid], scratch[tid + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0u) {
+            norm[0] = max(sinks[head], scratch[0]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float max_value = norm[0];
+        float local_scale = local_denom > 0.0f ? exp(local_max - max_value) : 0.0f;
+        scratch[tid] = local_denom * local_scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = GPTOSS_DECODE_ATTENTION_THREADS / 2u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                scratch[tid] += scratch[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0u) {
+            norm[1] = exp(sinks[head] - max_value) + scratch[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         for (uint dim = 0u; dim < 64u; dim++) {
-            out[q_start + dim] = values[dim] / denom;
+            scratch[tid] = values[dim] * local_scale;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = GPTOSS_DECODE_ATTENTION_THREADS / 2u; stride > 0u; stride >>= 1u) {
+                if (tid < stride) {
+                    scratch[tid] += scratch[tid + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (tid == 0u) {
+                out[q_start + dim] = scratch[0] / norm[1];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         return;
     }
