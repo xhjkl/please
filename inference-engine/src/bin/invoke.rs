@@ -2,7 +2,7 @@ use eyre::{Result, eyre};
 #[cfg(feature = "profile")]
 use inference_engine::backend_metal::MetalProfile;
 use inference_engine::{
-    Generated, GenerationStream, HarmonyAdapter, Message, MetalModel, MetalTimings, Role,
+    Generated, GenerationStream, HarmonyAdapter, Message, MetalModel, MetalTimings,
 };
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ fn main() -> Result<()> {
     let harmony = HarmonyAdapter::gpt_oss()?;
     let harmony_load = started.elapsed();
     let started = Instant::now();
-    let messages = [Message::from((Role::User, args.prompt.clone()))];
+    let messages = [Message::user(args.prompt.clone())];
     let tokens = harmony.render_completion_tokens(&messages)?;
     let tokenize = started.elapsed();
     let context_capacity = tokens

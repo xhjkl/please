@@ -6,7 +6,7 @@ pub mod harmony_adapter;
 pub mod model_store;
 
 pub use backend_metal::{MetalModel, MetalTimings, TimedGenerationStream};
-pub use harmony_adapter::{HarmonyAdapter, Message, Role};
+pub use harmony_adapter::{HarmonyAdapter, Message};
 
 // The inference core owns a token tape, a KV cache, and generated token ids.
 // Prompt rendering and text decoding stay above that boundary, which keeps the

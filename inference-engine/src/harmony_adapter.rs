@@ -2,93 +2,61 @@ use eyre::{Result, eyre};
 use openai_harmony::chat::{Author, Message as OpenAiMessage, Role as OpenAiRole};
 use openai_harmony::{HarmonyEncoding, HarmonyEncodingName, load_harmony_encoding};
 
-/// Speaker boundary before text becomes tokens. They matter to
-/// Harmony rendering, but the inference backend never sees them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    User,
-    Assistant,
-    System,
-    Developer,
-    Tool,
-}
-
-/// App-facing prompt unit: plain text most of the time, with just
-/// enough channel/tool metadata to render canonical Harmony tokens.
+/// App-facing prompt unit. Each variant maps to one canonical Harmony shape, so
+/// invalid role/channel/recipient combinations are not representable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Message {
-    pub role: Role,
-    pub content: String,
-    pub name: Option<String>,
-    pub recipient: Option<String>,
-    pub channel: Option<String>,
-    pub content_type: Option<String>,
+pub enum Message {
+    System(String),
+    Developer(String),
+    User(String),
+    AssistantFinal(String),
+    AssistantAnalysis(String),
+    AssistantToolCall {
+        recipient: String,
+        arguments_json: String,
+    },
+    ToolResult {
+        name: String,
+        content: String,
+    },
 }
 
 impl Message {
-    pub fn text((role, content): (Role, String)) -> Self {
-        Self {
-            role,
-            content,
-            name: None,
-            recipient: None,
-            channel: None,
-            content_type: None,
-        }
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::System(content.into())
+    }
+
+    pub fn developer(content: impl Into<String>) -> Self {
+        Self::Developer(content.into())
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::User(content.into())
     }
 
     pub fn assistant_final(content: impl Into<String>) -> Self {
-        Self::text((Role::Assistant, content.into())).with_channel("final")
+        Self::AssistantFinal(content.into())
     }
 
     pub fn assistant_analysis(content: impl Into<String>) -> Self {
-        Self::text((Role::Assistant, content.into())).with_channel("analysis")
+        Self::AssistantAnalysis(content.into())
     }
 
-    pub fn assistant_tool_call(name: impl Into<String>, arguments_json: impl Into<String>) -> Self {
-        Self::text((Role::Assistant, arguments_json.into()))
-            .with_channel("commentary")
-            .with_recipient(name)
-            .with_content_type("<|constrain|>json")
+    pub fn assistant_tool_call(
+        recipient: impl Into<String>,
+        arguments_json: impl Into<String>,
+    ) -> Self {
+        Self::AssistantToolCall {
+            recipient: recipient.into(),
+            arguments_json: arguments_json.into(),
+        }
     }
 
     pub fn tool_result(name: impl Into<String>, content: impl Into<String>) -> Self {
-        Self::text((Role::Tool, content.into()))
-            .with_name(name)
-            .with_channel("commentary")
-            .with_recipient("assistant")
-    }
-
-    pub fn with_name(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
-        self
-    }
-
-    pub fn with_recipient(mut self, recipient: impl Into<String>) -> Self {
-        self.recipient = Some(recipient.into());
-        self
-    }
-
-    pub fn with_channel(mut self, channel: impl Into<String>) -> Self {
-        self.channel = Some(channel.into());
-        self
-    }
-
-    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
-        self.content_type = Some(content_type.into());
-        self
-    }
-}
-
-impl From<(Role, String)> for Message {
-    fn from(value: (Role, String)) -> Self {
-        Self::text(value)
-    }
-}
-
-impl From<(Role, &str)> for Message {
-    fn from((role, content): (Role, &str)) -> Self {
-        Self::text((role, content.to_string()))
+        Self::ToolResult {
+            name: name.into(),
+            content: content.into(),
+        }
     }
 }
 
@@ -131,33 +99,39 @@ impl HarmonyAdapter {
 }
 
 fn to_openai_message(source: &Message) -> OpenAiMessage {
-    let author = if source.role == Role::Tool {
-        let name = source.name.clone().unwrap_or_default();
-        Author::new(OpenAiRole::Tool, name)
-    } else {
-        Author::from(to_openai_role(source.role))
-    };
-
-    let mut message = OpenAiMessage::from_author_and_content(author, source.content.clone());
-    if let Some(recipient) = &source.recipient {
-        message = message.with_recipient(recipient.clone());
-    }
-    if let Some(channel) = &source.channel {
-        message = message.with_channel(channel.clone());
-    }
-    if let Some(content_type) = &source.content_type {
-        message = message.with_content_type(content_type.clone());
-    }
-    message
-}
-
-fn to_openai_role(role: Role) -> OpenAiRole {
-    match role {
-        Role::User => OpenAiRole::User,
-        Role::Assistant => OpenAiRole::Assistant,
-        Role::System => OpenAiRole::System,
-        Role::Developer => OpenAiRole::Developer,
-        Role::Tool => OpenAiRole::Tool,
+    match source {
+        Message::System(content) => {
+            OpenAiMessage::from_author_and_content(Author::from(OpenAiRole::System), content)
+        }
+        Message::Developer(content) => {
+            OpenAiMessage::from_author_and_content(Author::from(OpenAiRole::Developer), content)
+        }
+        Message::User(content) => {
+            OpenAiMessage::from_author_and_content(Author::from(OpenAiRole::User), content)
+        }
+        Message::AssistantFinal(content) => {
+            OpenAiMessage::from_author_and_content(Author::from(OpenAiRole::Assistant), content)
+                .with_channel("final")
+        }
+        Message::AssistantAnalysis(content) => {
+            OpenAiMessage::from_author_and_content(Author::from(OpenAiRole::Assistant), content)
+                .with_channel("analysis")
+        }
+        Message::AssistantToolCall {
+            recipient,
+            arguments_json,
+        } => OpenAiMessage::from_author_and_content(
+            Author::from(OpenAiRole::Assistant),
+            arguments_json,
+        )
+        .with_channel("commentary")
+        .with_recipient(recipient)
+        .with_content_type("<|constrain|>json"),
+        Message::ToolResult { name, content } => {
+            OpenAiMessage::from_author_and_content(Author::new(OpenAiRole::Tool, name), content)
+                .with_channel("commentary")
+                .with_recipient("assistant")
+        }
     }
 }
 
@@ -165,4 +139,47 @@ fn sorted_tokens(tokens: std::collections::HashSet<u32>) -> Vec<u32> {
     let mut tokens = tokens.into_iter().collect::<Vec<_>>();
     tokens.sort_unstable();
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const START_TOKEN: u32 = 200006;
+
+    #[test]
+    fn literal_start_marker_in_user_json_is_content_not_structure() -> Result<()> {
+        let harmony = HarmonyAdapter::gpt_oss()?;
+        let messages = [Message::user(
+            r#"{"literal":"<|start|>","nested":{"still":"content"}}"#,
+        )];
+
+        let tokens = harmony.render_completion_tokens(&messages)?;
+        assert_eq!(count_token(&tokens, START_TOKEN), 2);
+        assert!(
+            !harmony
+                .encoding
+                .tokenizer()
+                .encode_ordinary("<|start|>")
+                .contains(&START_TOKEN)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn literal_start_marker_in_tool_call_json_is_content_not_structure() -> Result<()> {
+        let harmony = HarmonyAdapter::gpt_oss()?;
+        let messages = [Message::assistant_tool_call(
+            "functions.echo",
+            r#"{"argument":"<|start|>"}"#,
+        )];
+
+        let tokens = harmony.render_completion_tokens(&messages)?;
+        assert_eq!(count_token(&tokens, START_TOKEN), 2);
+        Ok(())
+    }
+
+    fn count_token(tokens: &[u32], needle: u32) -> usize {
+        tokens.iter().filter(|token| **token == needle).count()
+    }
 }
