@@ -1,20 +1,29 @@
 #[cfg(feature = "profile")]
 use std::collections::HashMap;
+#[cfg(feature = "profile")]
+use std::fmt;
 use std::time::Duration;
 
 #[cfg(feature = "profile")]
 #[derive(Debug, Clone)]
-pub struct MetalProfileReport {
+pub struct MetalProfile {
     pub records: Vec<MetalProfileRecord>,
     #[cfg(feature = "profile")]
-    pub stage_profile: Option<MetalStageProfileReport>,
+    pub stage_profile: Option<MetalStageProfile>,
     #[cfg(feature = "profile")]
     pub counter_sampling: String,
 }
 
 #[cfg(feature = "profile")]
-impl MetalProfileReport {
-    pub fn render_for_cli(&self) -> String {
+impl fmt::Display for MetalProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.cli_text())
+    }
+}
+
+#[cfg(feature = "profile")]
+impl MetalProfile {
+    fn cli_text(&self) -> String {
         let mut records = self.records.clone();
         records.sort_by(|left, right| {
             right
@@ -129,7 +138,7 @@ impl MetalProfileReport {
         #[cfg(feature = "profile")]
         if let Some(stage_profile) = &self.stage_profile {
             out.push_str(&stage_profile.render_hot_token_breakdown());
-            out.push_str(&stage_profile.render_for_cli());
+            out.push_str(&stage_profile.cli_text());
         }
         out
     }
@@ -137,7 +146,7 @@ impl MetalProfileReport {
 
 #[cfg(feature = "profile")]
 #[derive(Debug, Clone)]
-pub struct MetalStageProfileReport {
+pub struct MetalStageProfile {
     token_positions: Vec<Option<usize>>,
     stage_names: Vec<&'static str>,
     values_ns: Vec<Vec<u128>>,
@@ -146,7 +155,7 @@ pub struct MetalStageProfileReport {
 }
 
 #[cfg(feature = "profile")]
-impl MetalStageProfileReport {
+impl MetalStageProfile {
     fn render_hot_token_breakdown(&self) -> String {
         let mut positions = self
             .token_positions
@@ -295,7 +304,7 @@ impl MetalStageProfileReport {
         self.values_ns[slot][stage.index()]
     }
 
-    fn render_for_cli(&self) -> String {
+    fn cli_text(&self) -> String {
         let mut out = String::new();
         out.push_str("\nmetal token-stage profile:\n");
         out.push_str("- source: per-batch Metal command-buffer GPU timestamps\n");
@@ -364,6 +373,7 @@ pub(crate) struct ProfileState {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) enum TokenStage {
     Token,
     LmHead,
@@ -502,8 +512,8 @@ impl StageProfileState {
             self.gpu_values_ns[slot][stage.index()].saturating_add(ns);
     }
 
-    pub(crate) fn report(&self) -> MetalStageProfileReport {
-        MetalStageProfileReport {
+    pub(crate) fn snapshot(&self) -> MetalStageProfile {
+        MetalStageProfile {
             token_positions: self.token_positions.clone(),
             stage_names: TokenStage::ALL.iter().map(|stage| stage.name()).collect(),
             values_ns: self.values_ns.clone(),

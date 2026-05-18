@@ -1,64 +1,14 @@
 use eyre::{Result, eyre};
 
-use super::{EXPERTS, MXFP4_BYTES_PER_GROUP, MXFP4_GROUPS, MetalRuntime, platform};
-use crate::model_store::{self, SafeTensorMap, SourceModelReport};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-pub(crate) fn bf16_linear_profile_name(weight_name: &str) -> String {
-    for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-        if weight_name.contains(projection) {
-            return format!("op.bf16.{projection}");
-        }
-    }
-    if weight_name.contains(".mlp.router.") {
-        return "op.bf16.router".to_string();
-    }
-    "op.bf16.matvec".to_string()
-}
-
-pub(crate) fn mxfp4_profile_name(bias_name: &str) -> String {
-    if bias_name.contains("gate_up_proj") {
-        "op.mxfp4.gate_up".to_string()
-    } else if bias_name.contains("down_proj") {
-        "op.mxfp4.down".to_string()
-    } else {
-        "op.mxfp4.matvec".to_string()
-    }
-}
-
-pub(crate) fn mxfp4_slab_blocks_len(rows: usize) -> Result<usize> {
-    EXPERTS
-        .checked_mul(rows)
-        .and_then(|value| value.checked_mul(MXFP4_GROUPS))
-        .and_then(|value| value.checked_mul(MXFP4_BYTES_PER_GROUP))
-        .ok_or_else(|| eyre!("MXFP4 expert slab block length overflow"))
-}
-
-pub(crate) fn mxfp4_slab_scales_len(rows: usize) -> Result<usize> {
-    EXPERTS
-        .checked_mul(rows)
-        .and_then(|value| value.checked_mul(MXFP4_GROUPS))
-        .ok_or_else(|| eyre!("MXFP4 expert slab scale length overflow"))
-}
-
-#[derive(Clone)]
-// The resident path currently keeps a full per-layer experts carousel on GPU.
-// Later pageable mode can replace these all-expert slabs with carousel slots
-// addressed through a GPU expert_slot[layer][expert] table.
-pub(crate) struct ExpertsCarouselSlabs {
-    pub(crate) gate_up_blocks: platform::U8Buffer,
-    pub(crate) gate_up_scales: platform::U8Buffer,
-    pub(crate) gate_up_bias: platform::Bf16MatrixBuffer,
-    pub(crate) down_blocks: platform::U8Buffer,
-    pub(crate) down_scales: platform::U8Buffer,
-    pub(crate) down_bias: platform::Bf16MatrixBuffer,
-}
+use super::{MetalRuntime, platform};
+use crate::model_store::gguf::{
+    F32MatrixBytes, F32VectorBytes, GptOss20bGguf, GptOss20bGgufLayer, Q8_0MatrixBytes,
+};
 
 pub(crate) struct GptOssWeights {
-    pub(crate) embed: platform::Bf16MatrixBuffer,
+    pub(crate) embed: platform::Q8_0MatrixBuffer,
     pub(crate) final_norm: platform::F32VectorBuffer,
-    pub(crate) lm_head: platform::Bf16MatrixBuffer,
+    pub(crate) lm_head: platform::Q8_0MatrixBuffer,
     pub(crate) layers: Vec<GptOssLayerWeights>,
 }
 
@@ -70,41 +20,52 @@ pub(crate) struct GptOssLayerWeights {
 }
 
 pub(crate) struct AttentionWeights {
-    pub(crate) q: Bf16Linear,
-    pub(crate) k: Bf16Linear,
-    pub(crate) v: Bf16Linear,
-    pub(crate) o: Bf16Linear,
+    pub(crate) q: Q8_0Linear,
+    pub(crate) k: Q8_0Linear,
+    pub(crate) v: Q8_0Linear,
+    pub(crate) o: Q8_0Linear,
     pub(crate) sinks: platform::F32VectorBuffer,
 }
 
 pub(crate) struct SparseMlpWeights {
-    pub(crate) router: Bf16Linear,
-    pub(crate) experts_carousel: ExpertsCarouselSlabs,
+    pub(crate) router: F32Linear,
+    pub(crate) experts_carousel: ExpertsCarousel,
 }
 
-pub(crate) struct Bf16Linear {
-    pub(crate) weight: platform::Bf16MatrixBuffer,
+pub(crate) struct Q8_0Linear {
+    pub(crate) weight: platform::Q8_0MatrixBuffer,
     pub(crate) bias: platform::F32VectorBuffer,
 }
 
+pub(crate) struct F32Linear {
+    pub(crate) weight: platform::F32MatrixBuffer,
+    pub(crate) bias: platform::F32VectorBuffer,
+}
+
+#[derive(Clone)]
+pub(crate) struct ExpertsCarousel {
+    pub(crate) gate: platform::Mxfp4ExpertTensorBuffer,
+    pub(crate) gate_bias: platform::F32MatrixBuffer,
+    pub(crate) up: platform::Mxfp4ExpertTensorBuffer,
+    pub(crate) up_bias: platform::F32MatrixBuffer,
+    pub(crate) down: platform::Mxfp4ExpertTensorBuffer,
+    pub(crate) down_bias: platform::F32MatrixBuffer,
+}
+
 impl GptOssWeights {
-    pub(crate) fn load(ctx: &MetalRuntime, source: &SafeTensorMap, layers: usize) -> Result<Self> {
-        let Some(lm_head) = ctx.lm_head.clone() else {
-            return Err(eyre!(
-                "Metal lm_head weight is not cached; construct MetalRuntime::with_lm_head"
-            ));
-        };
-        let embed = ctx.bf16_matrix_buffer_from_map(
-            source,
-            "model.embed_tokens.weight",
-            "op.weight.embed_tokens",
-        )?;
+    pub(crate) fn load(
+        ctx: &MetalRuntime,
+        source: &GptOss20bGguf<'_>,
+        layers: usize,
+    ) -> Result<Self> {
+        let embed = ctx.gguf_q8_0_matrix_buffer(source.embedding_bytes()?, "gguf.embed")?;
         let final_norm =
-            ctx.bf16_vector_buffer_from_map(source, "model.norm.weight", "op.weight.final_norm")?;
+            ctx.gguf_f32_vector_buffer(source.final_norm_bytes()?, "gguf.final_norm")?;
+        let lm_head = ctx.gguf_q8_0_matrix_buffer(source.lm_head_bytes()?, "gguf.lm_head")?;
 
         let mut layer_weights = Vec::with_capacity(layers);
         for layer in 0..layers {
-            layer_weights.push(GptOssLayerWeights::load(ctx, source, layer)?);
+            layer_weights.push(GptOssLayerWeights::load(ctx, &source.layer(layer)?)?);
         }
 
         Ok(Self {
@@ -114,72 +75,55 @@ impl GptOssWeights {
             layers: layer_weights,
         })
     }
-
     pub(crate) fn layer(&self, layer: usize) -> Result<&GptOssLayerWeights> {
         self.layers
             .get(layer)
-            .ok_or_else(|| eyre!("typed gpt-oss weights have no layer {layer}"))
+            .ok_or_else(|| eyre!("typed GGUF gpt-oss weights have no layer {layer}"))
     }
 }
 
 impl GptOssLayerWeights {
-    fn load(ctx: &MetalRuntime, source: &SafeTensorMap, layer: usize) -> Result<Self> {
-        let prefix = format!("model.layers.{layer}");
-        let input_norm = ctx.bf16_vector_buffer_from_map(
-            source,
-            &format!("{prefix}.input_layernorm.weight"),
-            "op.weight.input_layernorm",
-        )?;
-        let post_attn_norm = ctx.bf16_vector_buffer_from_map(
-            source,
-            &format!("{prefix}.post_attention_layernorm.weight"),
-            "op.weight.post_attention_layernorm",
+    fn load(ctx: &MetalRuntime, source: &GptOss20bGgufLayer<'_>) -> Result<Self> {
+        let input_norm = ctx.gguf_f32_vector_buffer(source.attn_norm_bytes()?, "gguf.attn_norm")?;
+        let post_attn_norm = ctx.gguf_f32_vector_buffer(
+            source.post_attention_norm_bytes()?,
+            "gguf.post_attention_norm",
         )?;
         let attn = AttentionWeights {
-            q: Bf16Linear::load(
+            q: Q8_0Linear::load(
                 ctx,
-                source,
-                &format!("{prefix}.self_attn.q_proj.weight"),
-                &format!("{prefix}.self_attn.q_proj.bias"),
-                "op.bf16.q_proj",
+                source.q_bytes()?,
+                source.q_bias_bytes()?,
+                "gguf.attn_q",
             )?,
-            k: Bf16Linear::load(
+            k: Q8_0Linear::load(
                 ctx,
-                source,
-                &format!("{prefix}.self_attn.k_proj.weight"),
-                &format!("{prefix}.self_attn.k_proj.bias"),
-                "op.bf16.k_proj",
+                source.k_bytes()?,
+                source.k_bias_bytes()?,
+                "gguf.attn_k",
             )?,
-            v: Bf16Linear::load(
+            v: Q8_0Linear::load(
                 ctx,
-                source,
-                &format!("{prefix}.self_attn.v_proj.weight"),
-                &format!("{prefix}.self_attn.v_proj.bias"),
-                "op.bf16.v_proj",
+                source.v_bytes()?,
+                source.v_bias_bytes()?,
+                "gguf.attn_v",
             )?,
-            o: Bf16Linear::load(
+            o: Q8_0Linear::load(
                 ctx,
-                source,
-                &format!("{prefix}.self_attn.o_proj.weight"),
-                &format!("{prefix}.self_attn.o_proj.bias"),
-                "op.bf16.o_proj",
+                source.o_bytes()?,
+                source.o_bias_bytes()?,
+                "gguf.attn_o",
             )?,
-            sinks: ctx.bf16_vector_buffer_from_map(
-                source,
-                &format!("{prefix}.self_attn.sinks"),
-                "op.weight.attention_sinks",
-            )?,
+            sinks: ctx.gguf_f32_vector_buffer(source.sinks_bytes()?, "gguf.attn_sinks")?,
         };
         let sparse_mlp = SparseMlpWeights {
-            router: Bf16Linear::load(
+            router: F32Linear::load(
                 ctx,
-                source,
-                &format!("{prefix}.mlp.router.weight"),
-                &format!("{prefix}.mlp.router.bias"),
-                "op.bf16.router",
+                source.router_bytes()?,
+                source.router_bias_bytes()?,
+                "gguf.router",
             )?,
-            experts_carousel: ctx
-                .mxfp4_experts_carousel_slabs_from_map(source, &format!("{prefix}.mlp.experts"))?,
+            experts_carousel: ExpertsCarousel::load(ctx, source)?,
         };
         Ok(Self {
             input_norm,
@@ -190,111 +134,48 @@ impl GptOssLayerWeights {
     }
 }
 
-impl Bf16Linear {
+impl Q8_0Linear {
     fn load(
         ctx: &MetalRuntime,
-        source: &SafeTensorMap,
-        weight_name: &str,
-        bias_name: &str,
+        weight: Q8_0MatrixBytes<'_>,
+        bias: F32VectorBytes<'_>,
         op_name: &str,
     ) -> Result<Self> {
         Ok(Self {
-            weight: ctx.bf16_matrix_buffer_from_map(source, weight_name, op_name)?,
-            bias: ctx.bf16_vector_buffer_from_map(source, bias_name, op_name)?,
+            weight: ctx.gguf_q8_0_matrix_buffer(weight, op_name)?,
+            bias: ctx.gguf_f32_vector_buffer(bias, op_name)?,
         })
     }
 }
 
-#[derive(Default)]
-pub(crate) struct WeightCache {
-    bf16_matrices: Mutex<HashMap<String, Arc<model_store::Bf16Matrix>>>,
-    bf16_vectors: Mutex<HashMap<String, Arc<Vec<f32>>>>,
-    bf16_rows: Mutex<HashMap<(String, usize), Arc<Vec<f32>>>>,
-    u8_slices: Mutex<HashMap<(String, usize, usize), Arc<Vec<u8>>>>,
+impl F32Linear {
+    fn load(
+        ctx: &MetalRuntime,
+        weight: F32MatrixBytes<'_>,
+        bias: F32VectorBytes<'_>,
+        op_name: &str,
+    ) -> Result<Self> {
+        Ok(Self {
+            weight: ctx.gguf_f32_matrix_buffer(weight, op_name)?,
+            bias: ctx.gguf_f32_vector_buffer(bias, op_name)?,
+        })
+    }
 }
 
-impl WeightCache {
-    pub(crate) fn bf16_matrix(
-        &self,
-        report: &SourceModelReport,
-        tensor_name: &str,
-    ) -> Result<Arc<model_store::Bf16Matrix>> {
-        if let Some(value) = self.bf16_matrices.lock().unwrap().get(tensor_name).cloned() {
-            return Ok(value);
-        }
-        let value = Arc::new(model_store::read_bf16_matrix(report, tensor_name)?);
-        self.bf16_matrices
-            .lock()
-            .unwrap()
-            .insert(tensor_name.to_string(), value.clone());
-        Ok(value)
-    }
-
-    pub(crate) fn bf16_vector(
-        &self,
-        report: &SourceModelReport,
-        tensor_name: &str,
-    ) -> Result<Arc<Vec<f32>>> {
-        if let Some(value) = self.bf16_vectors.lock().unwrap().get(tensor_name).cloned() {
-            return Ok(value);
-        }
-        let value = Arc::new(model_store::read_bf16_vector(report, tensor_name)?);
-        self.bf16_vectors
-            .lock()
-            .unwrap()
-            .insert(tensor_name.to_string(), value.clone());
-        Ok(value)
-    }
-
-    pub(crate) fn bf16_vector_from_map(
-        &self,
-        source: &SafeTensorMap,
-        tensor_name: &str,
-    ) -> Result<Arc<Vec<f32>>> {
-        if let Some(value) = self.bf16_vectors.lock().unwrap().get(tensor_name).cloned() {
-            return Ok(value);
-        }
-        let value = Arc::new(source.read_bf16_vector(tensor_name)?);
-        self.bf16_vectors
-            .lock()
-            .unwrap()
-            .insert(tensor_name.to_string(), value.clone());
-        Ok(value)
-    }
-
-    pub(crate) fn bf16_matrix_row(
-        &self,
-        report: &SourceModelReport,
-        tensor_name: &str,
-        row: usize,
-    ) -> Result<Arc<Vec<f32>>> {
-        let key = (tensor_name.to_string(), row);
-        if let Some(value) = self.bf16_rows.lock().unwrap().get(&key).cloned() {
-            return Ok(value);
-        }
-        let value = Arc::new(model_store::read_bf16_matrix_row(report, tensor_name, row)?);
-        self.bf16_rows.lock().unwrap().insert(key, value.clone());
-        Ok(value)
-    }
-
-    pub(crate) fn u8_tensor_slice(
-        &self,
-        report: &SourceModelReport,
-        tensor_name: &str,
-        element_offset: usize,
-        element_len: usize,
-    ) -> Result<Arc<Vec<u8>>> {
-        let key = (tensor_name.to_string(), element_offset, element_len);
-        if let Some(value) = self.u8_slices.lock().unwrap().get(&key).cloned() {
-            return Ok(value);
-        }
-        let value = Arc::new(model_store::read_u8_tensor_slice(
-            report,
-            tensor_name,
-            element_offset,
-            element_len,
-        )?);
-        self.u8_slices.lock().unwrap().insert(key, value.clone());
-        Ok(value)
+impl ExpertsCarousel {
+    fn load(ctx: &MetalRuntime, source: &GptOss20bGgufLayer<'_>) -> Result<Self> {
+        Ok(Self {
+            gate: ctx
+                .gguf_mxfp4_expert_tensor_buffer(source.gate_experts_bytes()?, "gguf.mxfp4.gate")?,
+            gate_bias: ctx
+                .gguf_f32_matrix_buffer(source.gate_experts_bias_bytes()?, "gguf.mxfp4.gate")?,
+            up: ctx.gguf_mxfp4_expert_tensor_buffer(source.up_experts_bytes()?, "gguf.mxfp4.up")?,
+            up_bias: ctx
+                .gguf_f32_matrix_buffer(source.up_experts_bias_bytes()?, "gguf.mxfp4.up")?,
+            down: ctx
+                .gguf_mxfp4_expert_tensor_buffer(source.down_experts_bytes()?, "gguf.mxfp4.down")?,
+            down_bias: ctx
+                .gguf_f32_matrix_buffer(source.down_experts_bias_bytes()?, "gguf.mxfp4.down")?,
+        })
     }
 }
