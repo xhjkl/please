@@ -1966,6 +1966,68 @@ kernel void kv_cache_decode_attention(
     }
 }
 
+kernel void kv_cache_decode_attention_serial_probe(
+    device const float* q [[buffer(0)]],
+    device const float* k_cache [[buffer(1)]],
+    device const float* v_cache [[buffer(2)]],
+    device const float* sinks [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint& layer [[buffer(5)]],
+    constant uint& query_position [[buffer(6)]],
+    constant uint& cache_start_position [[buffer(7)]],
+    constant uint& cache_len [[buffer(8)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    if (head >= 64u || tid != 0u) {
+        return;
+    }
+
+    uint effective_key_start = cache_start_position;
+    if ((layer & 1u) == 0u && query_position + 1u > 128u) {
+        effective_key_start = max(effective_key_start, query_position + 1u - 128u);
+    }
+    uint key_count = query_position + 1u - effective_key_start;
+    if (key_count > cache_len) {
+        return;
+    }
+
+    uint kv_head = head / 8u;
+    uint q_start = head * 64u;
+    uint kv_start = kv_head * 64u;
+
+    float max_value = sinks[head];
+    float denom = 1.0f;
+    float values[64];
+    for (uint dim = 0u; dim < 64u; dim++) {
+        values[dim] = 0.0f;
+    }
+
+    for (uint key_offset = 0u; key_offset < key_count; key_offset++) {
+        uint key_position = effective_key_start + key_offset;
+        uint cache_offset = key_position - cache_start_position;
+        uint k_start = cache_offset * 512u + kv_start;
+        uint v_start = cache_offset * 512u + kv_start;
+        float sum = 0.0f;
+        for (uint dim = 0u; dim < 64u; dim++) {
+            sum += q[q_start + dim] * k_cache[k_start + dim];
+        }
+        float score = sum * 0.125f;
+        float next_max = max(max_value, score);
+        float old_scale = exp(max_value - next_max);
+        float new_scale = exp(score - next_max);
+        for (uint dim = 0u; dim < 64u; dim++) {
+            values[dim] = values[dim] * old_scale + v_cache[v_start + dim] * new_scale;
+        }
+        denom = denom * old_scale + new_scale;
+        max_value = next_max;
+    }
+
+    for (uint dim = 0u; dim < 64u; dim++) {
+        out[q_start + dim] = values[dim] / denom;
+    }
+}
+
 kernel void vector_add(
     device const float* left [[buffer(0)]],
     device const float* right [[buffer(1)]],

@@ -134,6 +134,7 @@ mod imp {
         sequence_attention: Retained<MetalComputePipelineState>,
         suffix_sequence_attention: Retained<MetalComputePipelineState>,
         kv_cache_decode_attention: Retained<MetalComputePipelineState>,
+        kv_cache_decode_attention_serial_probe: Retained<MetalComputePipelineState>,
         write_f32_slots_batch: Retained<MetalComputePipelineState>,
         copy_f32_slot: Retained<MetalComputePipelineState>,
         top4_softmax: Retained<MetalComputePipelineState>,
@@ -237,6 +238,11 @@ mod imp {
                     &device,
                     &library,
                     "kv_cache_decode_attention",
+                )?,
+                kv_cache_decode_attention_serial_probe: pipeline(
+                    &device,
+                    &library,
+                    "kv_cache_decode_attention_serial_probe",
                 )?,
                 write_f32_slots_batch: pipeline(&device, &library, "write_f32_slots_batch")?,
                 copy_f32_slot: pipeline(&device, &library, "copy_f32_slot")?,
@@ -453,6 +459,24 @@ mod imp {
             Ok(())
         }
 
+        pub fn write_f32_buffer(&self, buffer: &F32VectorBuffer, values: &[f32]) -> Result<()> {
+            if values.len() > buffer.len {
+                return Err(eyre!(
+                    "f32 buffer write has {} values, capacity {}",
+                    values.len(),
+                    buffer.len
+                ));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    values.as_ptr(),
+                    buffer.buffer.contents().as_ptr().cast::<f32>(),
+                    values.len(),
+                );
+            }
+            Ok(())
+        }
+
         pub fn read_u32_array<const N: usize>(&self, buffer: &U32Buffer) -> Result<[u32; N]> {
             if buffer.len < N {
                 return Err(eyre!(
@@ -461,6 +485,16 @@ mod imp {
                 ));
             }
             Ok(read_buffer_array::<u32, N>(&buffer.buffer))
+        }
+
+        pub fn read_f32_vector(&self, buffer: &F32VectorBuffer) -> Vec<f32> {
+            let values = unsafe {
+                std::slice::from_raw_parts(
+                    buffer.buffer.contents().as_ptr().cast::<f32>(),
+                    buffer.len,
+                )
+            };
+            values.to_vec()
         }
 
         pub fn upload_f32_vector_bytes(
@@ -1742,6 +1776,69 @@ mod imp {
             Ok(())
         }
 
+        pub fn kv_cache_decode_attention_serial_probe_into(
+            &self,
+            layer: usize,
+            query_position: usize,
+            cache_start_position: usize,
+            cache_len: usize,
+            q: &F32VectorBuffer,
+            k_cache: &F32VectorBuffer,
+            v_cache: &F32VectorBuffer,
+            sinks: &F32VectorBuffer,
+            out: &F32VectorBuffer,
+        ) -> Result<()> {
+            if q.len != ATTN_VALUES || out.len != ATTN_VALUES {
+                return Err(eyre!(
+                    "KV-cache serial probe q/out length mismatch: q {}, out {}, expected {ATTN_VALUES}",
+                    q.len,
+                    out.len
+                ));
+            }
+            if k_cache.len != v_cache.len || k_cache.len < cache_len * KV_VALUES {
+                return Err(eyre!(
+                    "KV-cache serial probe K/V length mismatch: k {}, v {}, cache_len {cache_len}",
+                    k_cache.len,
+                    v_cache.len
+                ));
+            }
+            if sinks.len != Q_HEADS {
+                return Err(eyre!(
+                    "KV-cache serial probe sinks has {} values, expected {Q_HEADS}",
+                    sinks.len
+                ));
+            }
+            if cache_start_position > query_position {
+                return Err(eyre!(
+                    "KV-cache serial probe start position {cache_start_position} exceeds query position {query_position}"
+                ));
+            }
+
+            let layer = layer as u32;
+            let query_position = query_position as u32;
+            let cache_start_position = cache_start_position as u32;
+            let cache_len = cache_len as u32;
+
+            let encoder = self.encoder("kv_cache_decode_attention_serial_probe");
+            encoder
+                .set_compute_pipeline_state(&self.context.kv_cache_decode_attention_serial_probe);
+            encoder.set_buffer(0, Some(&q.buffer), 0);
+            encoder.set_buffer(1, Some(&k_cache.buffer), 0);
+            encoder.set_buffer(2, Some(&v_cache.buffer), 0);
+            encoder.set_buffer(3, Some(&sinks.buffer), 0);
+            encoder.set_buffer(4, Some(&out.buffer), 0);
+            self.set_scalar(&encoder, 5, &[layer]);
+            self.set_scalar(&encoder, 6, &[query_position]);
+            self.set_scalar(&encoder, 7, &[cache_start_position]);
+            self.set_scalar(&encoder, 8, &[cache_len]);
+            encoder.dispatch_thread_groups(
+                mtl_size(Q_HEADS as NSUInteger, 1, 1),
+                mtl_size(DECODE_ATTENTION_THREADS_PER_GROUP as NSUInteger, 1, 1),
+            );
+            self.end_encoder(encoder);
+            Ok(())
+        }
+
         pub fn top4_softmax_into(
             &self,
             logits: &F32VectorBuffer,
@@ -2516,8 +2613,16 @@ mod imp {
             Err(eyre!("Metal backend is only available on macOS"))
         }
 
+        pub fn write_f32_buffer(&self, _buffer: &F32VectorBuffer, _values: &[f32]) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
         pub fn read_u32_array<const N: usize>(&self, _buffer: &U32Buffer) -> Result<[u32; N]> {
             Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        pub fn read_f32_vector(&self, _buffer: &F32VectorBuffer) -> Vec<f32> {
+            Vec::new()
         }
 
         pub fn upload_f32_vector_bytes(
@@ -2780,6 +2885,22 @@ mod imp {
 
         #[allow(clippy::too_many_arguments)]
         pub fn kv_cache_decode_attention_into(
+            &self,
+            _layer: usize,
+            _query_position: usize,
+            _cache_start_position: usize,
+            _cache_len: usize,
+            _q: &F32VectorBuffer,
+            _k_cache: &F32VectorBuffer,
+            _v_cache: &F32VectorBuffer,
+            _sinks: &F32VectorBuffer,
+            _out: &F32VectorBuffer,
+        ) -> Result<()> {
+            Err(eyre!("Metal backend is only available on macOS"))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn kv_cache_decode_attention_serial_probe_into(
             &self,
             _layer: usize,
             _query_position: usize,

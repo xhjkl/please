@@ -1,6 +1,7 @@
 use eyre::{Result, eyre};
 #[cfg(feature = "profile")]
 use inference_engine::backend_metal::MetalProfile;
+use inference_engine::backend_metal::run_attention_probe;
 use inference_engine::{
     Generated, GenerationStream, HarmonyAdapter, Message, MetalModel, MetalTimings,
 };
@@ -8,6 +9,17 @@ use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
     let args = Args::parse()?;
+    if args.attention_probe {
+        let report = run_attention_probe()?;
+        print!("{report}");
+        return Ok(());
+    }
+    if args.stage_envelope && !cfg!(feature = "profile") {
+        return Err(eyre!(
+            "--stage-envelope requires `cargo run --features profile`"
+        ));
+    }
+
     let timings_enabled = engine_timings_enabled();
     let started = Instant::now();
     let harmony = HarmonyAdapter::gpt_oss()?;
@@ -103,6 +115,8 @@ struct Args {
     target_prompt_tokens: Option<usize>,
     bench_contexts: Option<Vec<usize>>,
     samples: usize,
+    stage_envelope: bool,
+    attention_probe: bool,
     layers: usize,
     max_new_tokens: usize,
     repeat: usize,
@@ -114,6 +128,8 @@ impl Args {
         let mut target_prompt_tokens = None;
         let mut bench_contexts = None;
         let mut samples = 3usize;
+        let mut stage_envelope = false;
+        let mut attention_probe = false;
         let mut layers = 24usize;
         let mut max_new_tokens = 8usize;
         let mut repeat = 1usize;
@@ -143,6 +159,12 @@ impl Args {
                         .next()
                         .ok_or_else(|| eyre!("--samples requires a value"))?;
                     samples = value.parse()?;
+                }
+                "--stage-envelope" => {
+                    stage_envelope = true;
+                }
+                "--attention-probe" => {
+                    attention_probe = true;
                 }
                 "--layers" => {
                     let value = args
@@ -181,6 +203,8 @@ impl Args {
             target_prompt_tokens,
             bench_contexts,
             samples,
+            stage_envelope,
+            attention_probe,
             layers,
             max_new_tokens,
             repeat,
@@ -269,9 +293,14 @@ fn run_context_bench(
         println!("- context capacity: {context_capacity}");
         println!("- tokenize/render: {}", format_duration(tokenize));
 
+        let mut summaries = Vec::with_capacity(args.samples);
         for sample in 0..args.samples {
             let token_count = episode.token_count();
             episode.splice_tokens(0..token_count, &tokens)?;
+            #[cfg(feature = "profile")]
+            if args.stage_envelope {
+                model.reset_profile();
+            }
             let stream = episode.generate_timed(args.max_new_tokens)?;
             let (stream, timings) = stream.into_parts();
             let generation = render_stream(harmony, stream)?;
@@ -283,10 +312,136 @@ fn run_context_bench(
             println!("- finish: {:?}", generation.finish);
             println!("- tokens: {:?}", generation.tokens);
             print!("{timings}");
+            summaries.push(BenchSample::from_timings(&timings));
+            print_stage_envelope(&model, args, tokens.len(), sample + 1);
         }
+        print_context_summary(tokens.len(), &summaries);
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct BenchSample {
+    hot_wall_ns: u128,
+    hot_gpu_ns: u128,
+    hot_gap_ns: u128,
+    command_buffers_per_token: f64,
+    encoders_per_token: f64,
+    dispatches_per_token: f64,
+    readbacks_per_token: f64,
+}
+
+impl BenchSample {
+    fn from_timings(timings: &MetalTimings) -> Self {
+        let hot_token_count = timings.hot_token_count.max(1);
+        let hot_wall_ns = timings.hot_token_wall.as_nanos() / hot_token_count as u128;
+        let hot_gpu_ns = timings.hot_token_gpu_ns / hot_token_count as u128;
+        Self {
+            hot_wall_ns,
+            hot_gpu_ns,
+            hot_gap_ns: hot_wall_ns.saturating_sub(hot_gpu_ns),
+            command_buffers_per_token: timings.hot_command_buffers as f64 / hot_token_count as f64,
+            encoders_per_token: timings.hot_compute_encoders as f64 / hot_token_count as f64,
+            dispatches_per_token: timings.hot_dispatches as f64 / hot_token_count as f64,
+            readbacks_per_token: timings.hot_readback_calls as f64 / hot_token_count as f64,
+        }
+    }
+}
+
+fn print_context_summary(prompt_tokens: usize, samples: &[BenchSample]) {
+    if samples.is_empty() {
+        return;
+    }
+
+    let wall_values = sorted_values(samples.iter().map(|sample| sample.hot_wall_ns));
+    let gpu_values = sorted_values(samples.iter().map(|sample| sample.hot_gpu_ns));
+    let gap_values = sorted_values(samples.iter().map(|sample| sample.hot_gap_ns));
+    let representative = &samples[samples.len() - 1];
+
+    println!("\ncontext summary:");
+    println!("- prompt tokens: {prompt_tokens}");
+    println!("- samples: {}", samples.len());
+    println!(
+        "- median hot wall: {}",
+        format_duration_ns(median(&wall_values))
+    );
+    println!(
+        "- median hot GPU: {}",
+        format_duration_ns(median(&gpu_values))
+    );
+    println!("- p95 hot wall: {}", format_duration_ns(p95(&wall_values)));
+    println!("- p95 hot GPU: {}", format_duration_ns(p95(&gpu_values)));
+    println!("- min wall/GPU gap: {}", format_duration_ns(gap_values[0]));
+    println!(
+        "- median wall/GPU gap: {}",
+        format_duration_ns(median(&gap_values))
+    );
+    println!(
+        "- command buffers/token: {:.1}",
+        representative.command_buffers_per_token
+    );
+    println!("- encoders/token: {:.1}", representative.encoders_per_token);
+    println!(
+        "- dispatches/token: {:.1}",
+        representative.dispatches_per_token
+    );
+    println!(
+        "- readbacks/token: {:.1}",
+        representative.readbacks_per_token
+    );
+}
+
+fn sorted_values(values: impl Iterator<Item = u128>) -> Vec<u128> {
+    let mut values = values.collect::<Vec<_>>();
+    values.sort_unstable();
+    values
+}
+
+fn median(values: &[u128]) -> u128 {
+    values[values.len() / 2]
+}
+
+fn p95(values: &[u128]) -> u128 {
+    let index = (values.len() * 95).div_ceil(100).saturating_sub(1);
+    values[index]
+}
+
+fn format_duration_ns(ns: u128) -> String {
+    format_duration(Duration::from_nanos(ns.min(u64::MAX as u128) as u64))
+}
+
+fn print_stage_envelope(model: &MetalModel, args: &Args, prompt_tokens: usize, sample: usize) {
+    if !args.stage_envelope {
+        return;
+    }
+
+    #[cfg(not(feature = "profile"))]
+    let _ = (model, prompt_tokens, sample);
+
+    #[cfg(feature = "profile")]
+    {
+        let profile = model.profile_report();
+        let rows = profile.stage_envelope_rows();
+        println!("\nstage envelope:");
+        println!("- prompt tokens: {prompt_tokens}");
+        println!("- sample: {sample}");
+        if rows.is_empty() {
+            println!("- no stage rows; Metal counter samples may be unsupported");
+            return;
+        }
+        println!("- source: profile counter samples; absolute times include observer effect");
+        println!("stage              sampled   pct_of_sample");
+        println!("-----------------  --------  -------------");
+        for row in rows {
+            println!(
+                "{:<17}  {:>8}  {:>12.1}%",
+                row.stage,
+                format_duration_ns(row.average_ns),
+                row.percent_of_token
+            );
+        }
+    }
 }
 
 struct RenderedGeneration {

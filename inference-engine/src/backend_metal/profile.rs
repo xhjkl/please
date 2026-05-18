@@ -15,6 +15,14 @@ pub struct MetalProfile {
 }
 
 #[cfg(feature = "profile")]
+#[derive(Debug, Clone)]
+pub struct MetalStageEnvelopeRow {
+    pub stage: &'static str,
+    pub average_ns: u128,
+    pub percent_of_token: f64,
+}
+
+#[cfg(feature = "profile")]
 impl fmt::Display for MetalProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.cli_text())
@@ -23,6 +31,13 @@ impl fmt::Display for MetalProfile {
 
 #[cfg(feature = "profile")]
 impl MetalProfile {
+    pub fn stage_envelope_rows(&self) -> Vec<MetalStageEnvelopeRow> {
+        let Some(stage_profile) = &self.stage_profile else {
+            return Vec::new();
+        };
+        stage_profile.stage_envelope_rows()
+    }
+
     fn cli_text(&self) -> String {
         let mut records = self.records.clone();
         records.sort_by(|left, right| {
@@ -156,6 +171,52 @@ pub struct MetalStageProfile {
 
 #[cfg(feature = "profile")]
 impl MetalStageProfile {
+    fn stage_envelope_rows(&self) -> Vec<MetalStageEnvelopeRow> {
+        let rows = self
+            .token_positions
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, position)| Some((slot, (*position)?)))
+            .filter(|(slot, _)| self.gpu_values_ns[*slot].iter().any(|ns| *ns != 0))
+            .map(|(slot, _)| slot)
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return Vec::new();
+        }
+
+        let mut totals = vec![0u128; self.gpu_stage_names.len()];
+        for slot in &rows {
+            for (stage, value) in self.gpu_values_ns[*slot].iter().enumerate() {
+                totals[stage] = totals[stage].saturating_add(*value);
+            }
+        }
+
+        let row_count = rows.len() as u128;
+        let total_average = totals
+            .iter()
+            .enumerate()
+            .filter(|(stage, _)| self.gpu_stage_names[*stage] != "other")
+            .map(|(_, total)| total / row_count)
+            .sum::<u128>();
+        if total_average == 0 {
+            return Vec::new();
+        }
+
+        totals
+            .into_iter()
+            .enumerate()
+            .filter(|(stage, total)| self.gpu_stage_names[*stage] != "other" && *total != 0)
+            .map(|(stage, total)| {
+                let average_ns = total / row_count;
+                MetalStageEnvelopeRow {
+                    stage: self.gpu_stage_names[stage],
+                    average_ns,
+                    percent_of_token: average_ns as f64 * 100.0 / total_average as f64,
+                }
+            })
+            .collect()
+    }
+
     fn render_hot_token_breakdown(&self) -> String {
         let mut positions = self
             .token_positions
