@@ -3,9 +3,8 @@ use std::sync::Arc;
 use tokio::net::UnixStream;
 
 use crate::display::Display;
-use crate::harmony::{HarmonyEvent, HarmonyMessageHandler, HarmonyParser};
 use crate::protocol::{Frame, Message, read_frame_from_stream};
-use crate::tools::{all_tools, summarize_patch_for_preview, to_harmony};
+use crate::tools::{all_tools, summarize_patch_for_preview};
 
 use super::connect::obtain_control_stream;
 
@@ -22,11 +21,14 @@ pub async fn attempt_turn_on_stream(
     enum Phase {
         Answering,
         Thinking,
-        ToolCalling,
+    }
+
+    struct PendingToolCall {
+        name: String,
+        arguments: serde_json::Value,
     }
 
     let tools = all_tools();
-    let tool_specs = to_harmony(&tools);
 
     loop {
         let mut spinner = Some(display.start_spinning().await);
@@ -39,16 +41,12 @@ pub async fn attempt_turn_on_stream(
         stream.write_all(&body).await?;
 
         let mut store = Vec::with_capacity(4096);
-        let mut parser = HarmonyParser::new();
-        parser.add_implicit_start();
-        let mut handler = HarmonyMessageHandler::new();
-        let _ = handler.init(&tool_specs, None);
-
         let mut phase = Phase::Answering;
         let mut final_answer = String::new();
         let mut answer = String::new();
         let mut reasoning = String::new();
-        let mut did_send_answer_end = false;
+        let mut calls = Vec::new();
+        let mut tool_parse_error = None;
 
         // Stream frames for this subturn
         loop {
@@ -62,85 +60,37 @@ pub async fn attempt_turn_on_stream(
                     let _ = display.show_log(&line).await;
                 }
                 Frame::Answer(delta) => {
-                    // For display: drive UI phases with the event parser
-                    for ev in parser.add_content(&delta) {
-                        match ev {
-                            HarmonyEvent::HeaderComplete { header } => {
-                                if !header.recipient.is_empty() {
-                                    phase = Phase::ToolCalling;
-                                } else {
-                                    match header.channel.as_str() {
-                                        "analysis" => {
-                                            let _ = display.start_thinking().await;
-                                            phase = Phase::Thinking;
-                                        }
-                                        "commentary" | "final" => {
-                                            let _ = display.end_thinking().await;
-                                            phase = Phase::Answering;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            HarmonyEvent::ContentEmitted { content } => {
-                                match phase {
-                                    Phase::ToolCalling => {
-                                        // Suppress raw tool-call JSON streaming; we'll render a pretty call later.
-                                    }
-                                    Phase::Answering | Phase::Thinking => {
-                                        let _ = display.show_delta(&content).await;
-                                        if matches!(phase, Phase::Answering) {
-                                            final_answer.push_str(&content);
-                                        }
-                                    }
-                                }
-                            }
-                            HarmonyEvent::MessageEnd => {
-                                match phase {
-                                    Phase::Thinking => {
-                                        let _ = display.end_thinking().await;
-                                    }
-                                    Phase::Answering => {
-                                        let _ = display.end_answer().await;
-                                        did_send_answer_end = true;
-                                    }
-                                    Phase::ToolCalling => {}
-                                }
-                                phase = Phase::Answering;
-                            }
-                            HarmonyEvent::MessageStart => {}
-                        }
+                    if matches!(phase, Phase::Thinking) {
+                        let _ = display.end_thinking().await;
                     }
-                    // For tools: feed the same delta into the handler and accumulate parsed content
-                    if let Ok((a, t, _)) = handler.add(&delta, false) {
-                        answer.push_str(&a);
-                        reasoning.push_str(&t);
+                    phase = Phase::Answering;
+                    let _ = display.show_delta(&delta).await;
+                    final_answer.push_str(&delta);
+                    answer.push_str(&delta);
+                }
+                Frame::Thinking(delta) => {
+                    if !matches!(phase, Phase::Thinking) {
+                        let _ = display.start_thinking().await;
                     }
+                    phase = Phase::Thinking;
+                    let _ = display.show_delta(&delta).await;
+                    reasoning.push_str(&delta);
+                }
+                Frame::ToolCall { name, arguments } => {
+                    calls.push(PendingToolCall { name, arguments });
+                }
+                Frame::ToolCallParseError(error) => {
+                    tool_parse_error = Some(error);
                 }
                 Frame::Stop => break,
                 Frame::Request { .. } => {}
             }
         }
 
-        if !did_send_answer_end {
-            let _ = display.end_answer().await;
+        if matches!(phase, Phase::Thinking) {
+            let _ = display.end_thinking().await;
         }
-
-        // Finalize tool calls for this subturn
-        let mut had_tool_parse_error = false;
-        let calls = match handler.add("", true) {
-            Ok((_, _, calls)) => calls,
-            Err(e) => {
-                // Surface parse errors to history so the model can self-correct
-                let payload = serde_json::json!({
-                    "tool": "tool_call_parse_error",
-                    "result": { "error": e },
-                });
-                messages.push(Message::Tool(payload.to_string()));
-                had_tool_parse_error = true;
-                Vec::new()
-            }
-        };
+        let _ = display.end_answer().await;
 
         // If present, preserve reasoning across subturns without displaying it to the user.
         if !reasoning.is_empty() {
@@ -150,19 +100,23 @@ pub async fn attempt_turn_on_stream(
         if !answer.is_empty() {
             messages.push(Message::Assistant(answer));
         }
+        if let Some(error) = tool_parse_error {
+            let payload = serde_json::json!({
+                "tool": "tool_call_parse_error",
+                "result": { "error": error },
+            });
+            messages.push(Message::Tool(payload.to_string()));
+            continue;
+        }
         if calls.is_empty() {
-            if had_tool_parse_error {
-                // No tool executed, but we surfaced an error → continue the loop
-                continue;
-            }
             // The turn is complete, return the final answer.
             return Ok(final_answer);
         }
 
         // Execute tools and append tool results to history, then continue the loop
         for call in calls {
-            let name = call.function.name.clone();
-            let args = call.function.arguments.clone();
+            let name = call.name;
+            let args = call.arguments;
 
             // Show pretty formatted function call
             let _ = display.show_tool_call(&name, &args).await;

@@ -14,9 +14,17 @@ pub enum Message {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Frame {
-    Request { messages: Vec<Message> },
+    Request {
+        messages: Vec<Message>,
+    },
     Log(String),
     Answer(String),
+    Thinking(String),
+    ToolCall {
+        name: String,
+        arguments: serde_json::Value,
+    },
+    ToolCallParseError(String),
     Stop,
 }
 

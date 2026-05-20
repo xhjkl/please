@@ -1,4 +1,4 @@
-//! Command-line entrypoint. Both the Hub and the Probe start here.
+//! Command-line entrypoint. Both the CLI and hub start here.
 use eyre::Result;
 
 pub mod cli;

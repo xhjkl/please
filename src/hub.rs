@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::harmony::{HarmonyAdapter, HarmonyDelta};
 use crate::inference;
 use crate::protocol::Message;
 use crate::protocol::{Frame, read_frame_from_stream, write_frame_to_stream};
@@ -70,32 +71,59 @@ async fn serve_one_turn(
     hub: Arc<Hub>,
     history: &[Message],
 ) -> Result<()> {
-    let (piece_tx, mut piece_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let harmony = HarmonyAdapter::gpt_oss()?;
+    let mut parser = harmony.output_parser()?;
+    let (generated_tx, mut generated_rx) =
+        tokio::sync::mpsc::unbounded_channel::<inference::Generated>();
 
-    // Use the provided chat history directly; template rendering occurs in inference.
     let history = history.to_owned();
     let also_hub = hub.clone();
-    let inference = tokio::spawn(async move {
-        inference::infer_into_stream(&also_hub.backend, &also_hub.model, &history, piece_tx).await
+    let inference = tokio::task::spawn_blocking(move || {
+        inference::generate_tokens_into_stream(
+            &also_hub.backend,
+            &also_hub.model,
+            &history,
+            generated_tx,
+        )
     });
 
-    while let Some(piece) = piece_rx.recv().await {
-        write_frame_to_stream(sink, &Frame::Answer(piece)).await?;
+    while let Some(event) = generated_rx.recv().await {
+        match event {
+            inference::Generated::Token(token) => {
+                let Some(delta) = parser.push_token(token)? else {
+                    continue;
+                };
+                match delta {
+                    HarmonyDelta::Answer(text) => {
+                        write_frame_to_stream(sink, &Frame::Answer(text)).await?;
+                    }
+                    HarmonyDelta::Thinking(text) => {
+                        write_frame_to_stream(sink, &Frame::Thinking(text)).await?;
+                    }
+                }
+            }
+            inference::Generated::Stop => break,
+        }
     }
 
-    // Ensure inference completed
-    let pending = inference.await.map_err(|e| eyre!(e))??;
-
-    // If incomplete UTF-8 remains, emit replacement character once and log.
-    if !pending.is_empty() {
-        tracing::error!(
-            remaining_bytes = pending.len(),
-            ?pending,
-            "hub: incomplete utf-8 at end of stream; emitting replacement char"
-        );
-        write_frame_to_stream(sink, &Frame::Answer("\u{FFFD}".to_string())).await?;
+    inference.await.map_err(|e| eyre!(e))??;
+    match parser.finish() {
+        Ok(calls) => {
+            for call in calls {
+                write_frame_to_stream(
+                    sink,
+                    &Frame::ToolCall {
+                        name: call.name,
+                        arguments: call.arguments,
+                    },
+                )
+                .await?;
+            }
+        }
+        Err(error) => {
+            write_frame_to_stream(sink, &Frame::ToolCallParseError(error.to_string())).await?;
+        }
     }
-
     write_frame_to_stream(sink, &Frame::Stop).await?;
 
     Ok(())

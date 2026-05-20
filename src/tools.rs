@@ -14,18 +14,6 @@ pub use apply_patch::summarize_patch_for_preview;
 /// Exposed tools are represented as a map keyed by function name.
 pub type ExposedTools = HashMap<&'static str, (&'static str, AsyncFn, Vec<Param>)>;
 
-/// Reshape into Harmony tool format.
-pub fn to_harmony(tools: &ExposedTools) -> Vec<crate::harmony::Tool> {
-    tools
-        .keys()
-        .map(|name| crate::harmony::Tool {
-            function: crate::harmony::ToolFunction {
-                name: Some((*name).to_string()),
-            },
-        })
-        .collect()
-}
-
 pub fn all_tools() -> ExposedTools {
     macro_rules! collect_tools {
       ($($module:ident),+ $(,)?) => {{
