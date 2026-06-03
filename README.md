@@ -7,8 +7,6 @@ All inference stays local.
 
 https://github.com/user-attachments/assets/87775557-1197-474e-a987-b5661299e709
 
-<!-- If you use ollama, they will share the weights. -->
-
 # Installation
 
 First, install the tool itself.
