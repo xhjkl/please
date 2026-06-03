@@ -4,11 +4,10 @@ version = "0.1.1"
 edition = "2024"
 
 [dependencies]
-async-trait = { version = "0.1", features = [] }
 atty = { version = "0.2", features = [] }
-crossterm = { version = "0.29", features = ["event-stream"] }
+crossterm = { version = "0.29", features = [] }
 eyre = { version = "0.6", features = [] }
-nix = { version = "0.30", features = ["process"] }
+nix = { version = "0.30", features = ["process", "signal"] }
 openai-harmony = "0.0.8"
 postcard = { version = "1", features = ["use-std"] }
 rustyline = { version = "17", features = [] }
