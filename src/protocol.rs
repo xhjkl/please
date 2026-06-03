@@ -22,7 +22,8 @@ pub enum Frame {
     Thinking(String),
     ToolCall {
         name: String,
-        arguments: serde_json::Value,
+        /// Tool arguments encoded as JSON text because postcard cannot deserialize `serde_json::Value`.
+        arguments_json: String,
     },
     ToolCallParseError(String),
     Stop,

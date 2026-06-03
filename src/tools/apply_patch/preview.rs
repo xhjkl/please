@@ -6,12 +6,15 @@ use super::parsing;
 /// For overwrite mode, returns the full content. For patch mode, returns a
 /// unified diff-style representation across all ops.
 pub fn summarize_patch_for_preview(raw: &str) -> Option<String> {
-    if !parsing::contains_patch_markers(raw) {
+    if !parsing::contains_patch_syntax(raw) {
         // Overwrite mode: show full content as-is
         return Some(raw.to_string());
     }
 
-    let ops = parse_patch_ops(raw).ok()?;
+    let ops = match parse_patch_ops(raw) {
+        Ok(ops) => ops,
+        Err(error) => return Some(format!("Invalid patch: {error}\n\n{raw}")),
+    };
     // Build a full unified-diff-like preview for all ops
     let mut out = String::new();
     for op in ops.iter() {

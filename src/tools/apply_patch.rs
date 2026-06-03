@@ -30,7 +30,7 @@ pub async fn call(
         None => return json!({ "error": "apply_patch requires parameter `patch`" }),
     };
 
-    if !parsing::contains_patch_markers(&content) {
+    if !parsing::contains_patch_syntax(&content) {
         // Overwrite mode: write verbatim to `path`
         let Some(path) = args.path.as_deref() else {
             return json!({ "error": "overwrite mode requires `path`" });

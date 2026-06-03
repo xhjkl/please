@@ -67,13 +67,18 @@ pub fn parse_patch_ops(raw: &str) -> Result<Vec<PatchOp>, String> {
     Ok(ops)
 }
 
-pub(crate) fn contains_patch_markers(s: &str) -> bool {
+pub(crate) fn contains_patch_syntax(s: &str) -> bool {
     let src = normalize_eol(s);
     let lines: Vec<&str> = src.lines().collect();
-    let Some(begin) = find_marker(&lines, 0, Marker::Begin) else {
-        return false;
-    };
-    find_marker(&lines, begin + 1, Marker::End).is_some()
+    find_marker(&lines, 0, Marker::Begin).is_some()
+        || find_marker(&lines, 0, Marker::End).is_some()
+        || lines.iter().any(|line| {
+            let line = line.trim();
+            line.starts_with("***")
+                && (parse_header_path(line, Header::Update).is_some()
+                    || parse_header_path(line, Header::Add).is_some()
+                    || parse_header_path(line, Header::Delete).is_some())
+        })
 }
 
 fn find_marker(lines: &[&str], mut i: usize, which: Marker) -> Option<usize> {

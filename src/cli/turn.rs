@@ -99,8 +99,17 @@ pub async fn attempt_turn_on_stream(
                     let _ = display.show_delta(&delta).await;
                     reasoning.push_str(&delta);
                 }
-                Frame::ToolCall { name, arguments } => {
-                    calls.push(PendingToolCall { name, arguments });
+                Frame::ToolCall {
+                    name,
+                    arguments_json,
+                } => {
+                    match serde_json::from_str(&arguments_json) {
+                        Ok(arguments) => calls.push(PendingToolCall { name, arguments }),
+                        Err(error) => {
+                            tool_parse_error =
+                                Some(format!("error parsing tool call arguments: {error}"));
+                        }
+                    }
                 }
                 Frame::ToolCallParseError(error) => {
                     tool_parse_error = Some(error);

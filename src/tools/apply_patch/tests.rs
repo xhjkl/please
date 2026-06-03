@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use super::applying::{apply_all_hunks, apply_hunk};
 use super::model::{Hunk, PatchOp};
-use super::parsing::parse_patch_ops;
+use super::parsing::{contains_patch_syntax, parse_patch_ops};
 use super::text::set_trailing_newline;
 
 fn execute_patch_ops_in_memory(
@@ -61,6 +61,14 @@ fn execute_patch_ops_in_memory(
 fn pure_parse_missing_markers() {
     let err = parse_patch_ops("*** End Patch").unwrap_err();
     assert!(err.to_lowercase().contains("missing"));
+}
+
+#[test]
+fn incomplete_patch_marker_still_counts_as_patch_syntax() {
+    let patch = "*** Begin Patch\n*** Update File: text.text\n@@\n- a\n+ b\n";
+    assert!(contains_patch_syntax(patch));
+    let err = parse_patch_ops(patch).unwrap_err();
+    assert!(err.contains("*** End Patch"));
 }
 
 #[test]

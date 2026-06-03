@@ -114,7 +114,7 @@ async fn serve_one_turn(
                     sink,
                     &Frame::ToolCall {
                         name: call.name,
-                        arguments: call.arguments,
+                        arguments_json: serde_json::to_string(&call.arguments)?,
                     },
                 )
                 .await?;
