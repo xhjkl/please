@@ -26,7 +26,8 @@ async fn display_spinner() {
     }
 }
 
-/// Guard to keep spinner active while in scope.
+/// Guard that must be stopped once the pending operation finishes.
+#[must_use = "spinner keeps drawing until stop() is called"]
 pub struct Spinner {
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -43,22 +44,38 @@ impl Spinner {
             task: Some(tokio::spawn(display_spinner())),
         }
     }
+
+    /// Stop the spinner before other stderr content is written.
+    pub async fn stop(mut self) {
+        let did_stop = if let Some(task) = self.task.as_mut() {
+            task.abort();
+            let _ = task.await;
+            true
+        } else {
+            false
+        };
+        if did_stop {
+            clear_spinner_line();
+            self.task = None;
+        }
+    }
 }
 
 impl Drop for Spinner {
     fn drop(&mut self) {
-        self.task.take().map(|task| {
-            tokio::spawn(async move {
-                task.abort();
-                let _ = task.await;
-                let _ = crossterm::execute!(
-                    std::io::stderr(),
-                    Clear(ClearType::CurrentLine),
-                    Print("\r"),
-                    ResetColor,
-                    cursor::Show,
-                );
-            })
-        });
+        if let Some(task) = self.task.take() {
+            task.abort();
+            clear_spinner_line();
+        }
     }
+}
+
+fn clear_spinner_line() {
+    let _ = crossterm::execute!(
+        std::io::stderr(),
+        Clear(ClearType::CurrentLine),
+        Print("\r"),
+        ResetColor,
+        cursor::Show,
+    );
 }

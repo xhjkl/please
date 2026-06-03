@@ -56,7 +56,7 @@ impl HarmonyAdapter {
             .map_err(|error| eyre!(error.to_string()))?;
         let stop_tokens = sorted_tokens(
             encoding
-                .stop_tokens()
+                .stop_tokens_for_assistant_actions()
                 .map_err(|error| eyre!(error.to_string()))?,
         );
         Ok(Self {

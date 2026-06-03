@@ -51,7 +51,7 @@ pub async fn run() -> Result<()> {
     // Connect to the hub, maybe starting a new hub process if necessary.
     let little_snake = display.start_spinning().await;
     let stream = obtain_control_stream().await;
-    drop(little_snake);
+    little_snake.stop().await;
 
     // If there are no weights, show the onboarding and exit.
     let mut stream = match stream {
@@ -69,7 +69,11 @@ pub async fn run() -> Result<()> {
     } else {
         // One-shot: append the user turn to the initial history and infer once.
         history.push(Message::User(prompt.to_string()));
-        run_turn(&mut stream, display, history).await?;
+        match run_turn(&mut stream, display, history).await {
+            Ok(_) => {}
+            Err(error) if super::turn::is_cancelled(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        }
     }
 
     Ok(())

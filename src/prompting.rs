@@ -41,10 +41,20 @@ namespace functions {
     max_bytes?: number,
   }) => string | { error: string };
 
-  // Run a command by argv
+  // Run a command by argv. Output is capped; commands still running after 40s are interrupted with SIGINT and return partial output.
   type run_command = (_: {
     argv: string[],
-  }) => { ok: true, status: { code: number | null, success: boolean }, stdout: string, stderr: string } | { error: string };
+  }) => {
+    ok: boolean,
+    status: "finished" | "interrupted",
+    runningFor: string,
+    stdout: string,
+    stdoutBytesOmitted: number,
+    stderr: string,
+    stderrBytesOmitted: number,
+    exitCode?: number | null,
+    timeout?: { after: string, signal: "SIGINT", killedAfterGrace: boolean },
+  } | { error: string };
 
   // Write file content
   type apply_patch = (_: {

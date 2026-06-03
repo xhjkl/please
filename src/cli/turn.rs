@@ -8,6 +8,21 @@ use crate::tools::{all_tools, summarize_patch_for_preview};
 
 use super::connect::obtain_control_stream;
 
+#[derive(Debug)]
+pub struct TurnCancelled;
+
+impl std::fmt::Display for TurnCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "turn cancelled")
+    }
+}
+
+impl std::error::Error for TurnCancelled {}
+
+pub fn is_cancelled(error: &eyre::Report) -> bool {
+    error.downcast_ref::<TurnCancelled>().is_some()
+}
+
 /// Run a single turn attempt, preserving the full message history across reconnects.
 /// Send a prompt to the hub and multiplex streamed frames to display channels.
 /// Returns the final answer string.
@@ -50,11 +65,19 @@ pub async fn attempt_turn_on_stream(
 
         // Stream frames for this subturn
         loop {
-            let frame: Frame = read_frame_from_stream(stream, &mut store, None, None)
-                .await
-                .map_err(|e| eyre!(e))?;
-            // Stop spinner on first received frame if not dropped already
-            let _ = spinner.take().map(drop);
+            let frame: Frame = tokio::select! {
+                frame = read_frame_from_stream(stream, &mut store, None, None) => {
+                    frame.map_err(|error| eyre!(error))?
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    let _ = stream.shutdown().await;
+                    return Err(eyre!(TurnCancelled));
+                }
+            };
+            // Stop spinner before streaming output so its line clear cannot erase the first token.
+            if let Some(spinner) = spinner.take() {
+                spinner.stop().await;
+            }
             match frame {
                 Frame::Log(line) => {
                     let _ = display.show_log(&line).await;
@@ -140,9 +163,15 @@ pub async fn attempt_turn_on_stream(
             };
             let sink = execution_pane.as_ref().map(|pane| pane.sender());
             let streamed = sink.is_some();
-            let result = crate::tools::invoke(&tools, &name, args.clone(), sink)
-                .await
-                .unwrap_or_else(|e| serde_json::json!({ "error": e }));
+            let result = tokio::select! {
+                result = crate::tools::invoke(&tools, &name, args.clone(), sink) => {
+                    result.unwrap_or_else(|error| serde_json::json!({ "error": error }))
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    drop(execution_pane);
+                    return Err(eyre!(TurnCancelled));
+                }
+            };
 
             drop(execution_pane);
 
