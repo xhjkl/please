@@ -4,7 +4,7 @@ use tokio::net::UnixStream;
 
 use crate::display::Display;
 use crate::protocol::{Frame, Message, read_frame_from_stream};
-use crate::tools::{all_tools, summarize_patch_for_preview};
+use crate::tools::{Stride, all_tools, summarize_patch_for_preview};
 
 use super::connect::obtain_control_stream;
 
@@ -30,6 +30,7 @@ pub async fn attempt_turn_on_stream(
     stream: &mut UnixStream,
     display: Arc<Display>,
     messages: &mut Vec<Message>,
+    stride: Stride,
 ) -> Result<String> {
     use tokio::io::AsyncWriteExt;
 
@@ -71,6 +72,7 @@ pub async fn attempt_turn_on_stream(
                 }
                 _ = tokio::signal::ctrl_c() => {
                     let _ = stream.shutdown().await;
+                    stride.kill_running_commands().await;
                     return Err(eyre!(TurnCancelled));
                 }
             };
@@ -102,15 +104,13 @@ pub async fn attempt_turn_on_stream(
                 Frame::ToolCall {
                     name,
                     arguments_json,
-                } => {
-                    match serde_json::from_str(&arguments_json) {
-                        Ok(arguments) => calls.push(PendingToolCall { name, arguments }),
-                        Err(error) => {
-                            tool_parse_error =
-                                Some(format!("error parsing tool call arguments: {error}"));
-                        }
+                } => match serde_json::from_str(&arguments_json) {
+                    Ok(arguments) => calls.push(PendingToolCall { name, arguments }),
+                    Err(error) => {
+                        tool_parse_error =
+                            Some(format!("error parsing tool call arguments: {error}"));
                     }
-                }
+                },
                 Frame::ToolCallParseError(error) => {
                     tool_parse_error = Some(error);
                 }
@@ -142,6 +142,7 @@ pub async fn attempt_turn_on_stream(
         }
         if calls.is_empty() {
             // The turn is complete, return the final answer.
+            stride.kill_running_commands().await;
             return Ok(final_answer);
         }
 
@@ -164,20 +165,26 @@ pub async fn attempt_turn_on_stream(
                 continue;
             }
 
-            // Only `run_command` gets a live output pane for streaming stdout/stderr.
-            let execution_pane = if name == "run_command" {
+            let starts_command = name == "run_command"
+                && args
+                    .get("argv")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|argv| !argv.is_empty());
+            // Only newly-started commands get a live output pane for streaming stdout/stderr.
+            let execution_pane = if starts_command {
                 display.start_executing()
             } else {
                 None
             };
-            let sink = execution_pane.as_ref().map(|pane| pane.sender());
-            let streamed = sink.is_some();
+            let stride = stride.with_live_output(execution_pane.as_ref().map(|pane| pane.sender()));
+            let streamed = starts_command && execution_pane.is_some();
             let result = tokio::select! {
-                result = crate::tools::invoke(&tools, &name, args.clone(), sink) => {
+                result = crate::tools::invoke(&tools, stride.clone(), &name, args.clone()) => {
                     result.unwrap_or_else(|error| serde_json::json!({ "error": error }))
                 }
                 _ = tokio::signal::ctrl_c() => {
                     drop(execution_pane);
+                    stride.kill_running_commands().await;
                     return Err(eyre!(TurnCancelled));
                 }
             };
@@ -228,15 +235,18 @@ pub async fn run_turn(
     let max_attempts = 6;
     let mut attempt = 0;
     let mut messages = messages;
+    let stride = Stride::default();
 
     loop {
-        match attempt_turn_on_stream(stream, display.clone(), &mut messages).await {
+        match attempt_turn_on_stream(stream, display.clone(), &mut messages, stride.clone()).await {
             Ok(s) => return Ok(s),
             Err(e) => {
                 if !is_disconnect(&e) {
+                    stride.kill_running_commands().await;
                     return Err(e);
                 }
                 if attempt >= max_attempts {
+                    stride.kill_running_commands().await;
                     return Err(e);
                 }
 
@@ -263,6 +273,9 @@ async fn gate_risky_if_needed(display: &Display, name: &str, args: &serde_json::
                     .collect()
             })
             .unwrap_or_default();
+        if argv.is_empty() {
+            return true;
+        }
         return display.confirm_run_command_execution(&argv).await;
     }
     if name == "apply_patch" {

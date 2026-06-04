@@ -41,19 +41,19 @@ namespace functions {
     max_bytes?: number,
   }) => string | { error: string };
 
-  // Run a command by argv. Output is capped; commands still running after 40s are interrupted with SIGINT and return partial output.
-  type run_command = (_: {
-    argv: string[],
-  }) => {
+  // Run a command by argv. Output is capped. Commands still running after waitSeconds, default 40, return status="running" with a pid. When that happens, decide whether to call run_command with action="wait" and the pid to wait longer, or action="kill" and the pid to stop it; do not answer final while a command is still running.
+  type run_command = (_: { argv: string[], waitSeconds?: number } | { pid: number, action: "wait" | "kill", waitSeconds?: number }) => {
     ok: boolean,
-    status: "finished" | "interrupted",
+    status: "finished" | "running" | "killed",
     runningFor: string,
     stdout: string,
     stdoutBytesOmitted: number,
     stderr: string,
     stderrBytesOmitted: number,
+    pid?: number,
     exitCode?: number | null,
-    timeout?: { after: string, signal: "SIGINT", killedAfterGrace: boolean },
+    kill?: { signal: "SIGINT", killedAfterGrace: boolean },
+    next?: string,
   } | { error: string };
 
   // Write file content
