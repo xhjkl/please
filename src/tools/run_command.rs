@@ -195,6 +195,26 @@ fn kill_child_group_by_pid(pid: Option<u32>) {
 #[cfg(not(unix))]
 fn kill_child_group_by_pid(_pid: Option<u32>) {}
 
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn armed(pid: u32) -> Self {
+        Self { pid: Some(pid) }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        kill_child_group_by_pid(self.pid);
+    }
+}
+
 async fn drain_or_abort_readers(
     mut stdout_task: JoinHandle<()>,
     mut stderr_task: JoinHandle<()>,
@@ -310,16 +330,9 @@ fn command_result(
 }
 
 async fn finish_command(command: RunningCommand, end: CommandEnd) -> serde_json::Value {
-    let kill_group_if_stuck = match &end {
-        CommandEnd::Killed { .. } => Some(command.pid),
-        CommandEnd::Finished { .. } | CommandEnd::Running { .. } => None,
-    };
-    drain_or_abort_readers(
-        command.stdout_task,
-        command.stderr_task,
-        kill_group_if_stuck,
-    )
-    .await;
+    let pid = command.pid;
+    drain_or_abort_readers(command.stdout_task, command.stderr_task, Some(pid)).await;
+    kill_child_group_by_pid(Some(pid));
     let stdout = snapshot_output(&command.stdout_output);
     let stderr = snapshot_output(&command.stderr_output);
     command_result(command.started, stdout, stderr, end)
@@ -403,18 +416,22 @@ async fn start_command(
         Ok(command) => command,
         Err(error) => return json!({ "error": error.to_string() }),
     };
+    let pid = command.pid;
+    let mut guard = ProcessGroupGuard::armed(pid);
 
     let status = match wait_for_exit(&mut command.child, wait_for).await {
         Ok(status) => status,
         Err(error) => return json!({ "error": error.to_string() }),
     };
     if let Some(status) = status {
-        return finish_command(command, CommandEnd::Finished { status }).await;
+        let output = finish_command(command, CommandEnd::Finished { status }).await;
+        guard.disarm();
+        return output;
     }
 
-    let pid = command.pid;
     let output = running_command_result(&command);
     commands.commands.lock().await.insert(pid, command);
+    guard.disarm();
     output
 }
 
@@ -433,17 +450,21 @@ pub(super) async fn wait_by_pid(
     let Some(mut command) = command else {
         return json!({ "error": format!("unknown pid `{pid}`") });
     };
+    let mut guard = ProcessGroupGuard::armed(command.pid);
 
     let status = match wait_for_exit(&mut command.child, wait_for).await {
         Ok(status) => status,
         Err(error) => return json!({ "error": error.to_string() }),
     };
     if let Some(status) = status {
-        return finish_command(command, CommandEnd::Finished { status }).await;
+        let output = finish_command(command, CommandEnd::Finished { status }).await;
+        guard.disarm();
+        return output;
     }
 
     let output = running_command_result(&command);
     commands.commands.lock().await.insert(pid, command);
+    guard.disarm();
     output
 }
 
@@ -454,10 +475,13 @@ pub(super) async fn kill_by_pid(pid: u32, stride: Stride) -> serde_json::Value {
     let Some(mut command) = command else {
         return json!({ "error": format!("unknown pid `{pid}`") });
     };
+    let mut guard = ProcessGroupGuard::armed(command.pid);
 
     match command.child.try_wait() {
         Ok(Some(status)) => {
-            return finish_command(command, CommandEnd::Finished { status }).await;
+            let output = finish_command(command, CommandEnd::Finished { status }).await;
+            guard.disarm();
+            return output;
         }
         Ok(None) => {}
         Err(error) => return json!({ "error": error.to_string() }),
@@ -476,7 +500,9 @@ pub(super) async fn kill_by_pid(pid: u32, stride: Stride) -> serde_json::Value {
         }
     };
 
-    finish_command(command, CommandEnd::Killed { status, killed }).await
+    let output = finish_command(command, CommandEnd::Killed { status, killed }).await;
+    guard.disarm();
+    output
 }
 
 /// Run a command and optionally stream bounded stdout/stderr chunks to live output.
@@ -519,6 +545,39 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    fn pid_exists(pid: u32) -> bool {
+        let status = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
+    }
+
+    #[cfg(unix)]
+    fn kill_pid(pid: u32) {
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    #[cfg(unix)]
+    async fn eventually_dead(pid: u32) -> bool {
+        for _ in 0..20 {
+            if !pid_exists(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        kill_pid(pid);
+        false
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn captures_command_output_with_shape_for_history() {
         let result = call(
@@ -540,6 +599,70 @@ mod tests {
         assert_eq!(result["stderr"], "problem");
         assert_eq!(result["stdoutBytesOmitted"], 0);
         assert_eq!(result["stderrBytesOmitted"], 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finished_command_cleans_redirected_background_child() {
+        let result = call(
+            Args {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 999 >/dev/null 2>&1 & echo $!".to_string(),
+                ],
+                wait_seconds: None,
+            },
+            Stride::default(),
+        )
+        .await;
+
+        assert_eq!(result["status"], "finished");
+        let pid = result["stdout"].as_str().unwrap().trim().parse().unwrap();
+        assert!(eventually_dead(pid).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_active_command_wait_kills_process_group() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid_path = format!(
+            "/tmp/please-run-command-cancel-{}-{stamp}",
+            std::process::id()
+        );
+        let script = format!("sleep 999 >/dev/null 2>&1 & echo $! > {pid_path}; wait");
+
+        let handle = tokio::spawn(async move {
+            call(
+                Args {
+                    argv: vec!["sh".to_string(), "-c".to_string(), script],
+                    wait_seconds: Some(60.0),
+                },
+                Stride::default(),
+            )
+            .await
+        });
+
+        let mut pid = None;
+        for _ in 0..40 {
+            if let Ok(raw) = std::fs::read_to_string(&pid_path) {
+                pid = raw.trim().parse::<u32>().ok();
+                if pid.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = std::fs::remove_file(&pid_path);
+        let pid = pid.expect("background child pid was written");
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(eventually_dead(pid).await);
     }
 
     #[cfg(unix)]
