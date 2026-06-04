@@ -455,6 +455,14 @@ pub(super) async fn kill_by_pid(pid: u32, stride: Stride) -> serde_json::Value {
         return json!({ "error": format!("unknown pid `{pid}`") });
     };
 
+    match command.child.try_wait() {
+        Ok(Some(status)) => {
+            return finish_command(command, CommandEnd::Finished { status }).await;
+        }
+        Ok(None) => {}
+        Err(error) => return json!({ "error": error.to_string() }),
+    }
+
     interrupt_child(&mut command.child);
     let status = match wait_for_exit(&mut command.child, INTERRUPT_GRACE).await {
         Ok(status) => status,
@@ -563,6 +571,62 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn running_result_includes_partial_output() {
+        let stride = Stride::default();
+        let result = call(
+            Args {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf start; printf err >&2; sleep 999".to_string(),
+                ],
+                wait_seconds: Some(0.02),
+            },
+            stride.clone(),
+        )
+        .await;
+
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["stdout"], "start");
+        assert_eq!(result["stderr"], "err");
+        let pid = result["pid"].as_u64().unwrap() as u32;
+
+        let result = kill_by_pid(pid, stride).await;
+        assert_eq!(result["status"], "killed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_wait_running_result_includes_later_partial_output() {
+        let stride = Stride::default();
+        let result = call(
+            Args {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf one; sleep 0.05; printf two; sleep 999".to_string(),
+                ],
+                wait_seconds: Some(0.01),
+            },
+            stride.clone(),
+        )
+        .await;
+
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["stdout"], "one");
+        let pid = result["pid"].as_u64().unwrap() as u32;
+
+        let result = wait_by_pid(pid, Some(0.1), stride.clone()).await;
+
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["stdout"], "onetwo");
+
+        let result = kill_by_pid(pid, stride).await;
+        assert_eq!(result["status"], "killed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn running_command_can_be_killed_by_pid() {
         let stride = Stride::default();
         let result = call(
@@ -581,5 +645,34 @@ mod tests {
 
         assert_eq!(result["status"], "killed");
         assert_eq!(result["ok"], false);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_reports_finished_if_command_already_exited() {
+        let stride = Stride::default();
+        let result = call(
+            Args {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 0.05; printf after".to_string(),
+                ],
+                wait_seconds: Some(0.01),
+            },
+            stride.clone(),
+        )
+        .await;
+
+        assert_eq!(result["status"], "running");
+        let pid = result["pid"].as_u64().unwrap() as u32;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let result = kill_by_pid(pid, stride).await;
+
+        assert_eq!(result["status"], "finished");
+        assert_eq!(result["exitCode"], 0);
+        assert_eq!(result["stdout"], "after");
     }
 }
