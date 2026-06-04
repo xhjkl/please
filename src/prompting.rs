@@ -111,7 +111,8 @@ namespace functions {
   - Delete a file:
     - `*** Delete File: path/to/file`
 - Trailing newline control:
-  - To produce a file with no trailing newline, end the body with a comment line containing the phrase "No newline at end of file" (backslash prefix tolerated): `\ No newline at end of file`.
+  - To produce a file with no trailing newline, end the add body or final update hunk with the exact marker line: `\ No newline at end of file`.
+  - In update hunks, that marker must immediately follow the final `+` or context line that remains in the resulting file.
 - Fenced blocks:
   - You may wrap update/add bodies with triple backticks. Language tags are allowed but not required.
 

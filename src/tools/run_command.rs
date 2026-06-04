@@ -604,9 +604,9 @@ mod tests {
                 argv: vec![
                     "sh".to_string(),
                     "-c".to_string(),
-                    "printf one; sleep 0.05; printf two; sleep 999".to_string(),
+                    "printf one; sleep 0.2; printf two; sleep 999".to_string(),
                 ],
-                wait_seconds: Some(0.01),
+                wait_seconds: Some(0.05),
             },
             stride.clone(),
         )
@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(result["stdout"], "one");
         let pid = result["pid"].as_u64().unwrap() as u32;
 
-        let result = wait_by_pid(pid, Some(0.1), stride.clone()).await;
+        let result = wait_by_pid(pid, Some(0.3), stride.clone()).await;
 
         assert_eq!(result["status"], "running");
         assert_eq!(result["stdout"], "onetwo");

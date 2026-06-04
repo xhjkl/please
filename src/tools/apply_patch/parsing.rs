@@ -139,6 +139,7 @@ fn parse_update_hunks(
     let mut cur = Hunk::default();
     let mut have_any = false;
     let mut no_newline = false;
+    let mut last_line_survives = false;
 
     while *i < end {
         let t = lines[*i].trim_start();
@@ -156,6 +157,7 @@ fn parse_update_hunks(
                 cur = Hunk::default();
                 have_any = false;
             }
+            last_line_survives = false;
             *i += 1;
             continue;
         }
@@ -164,25 +166,34 @@ fn parse_update_hunks(
         if let Some(line) = raw.strip_prefix("+ ") {
             cur.new_lines.push(line.to_string());
             have_any = true;
+            last_line_survives = true;
         } else if let Some(line) = raw.strip_prefix("- ") {
             cur.old_lines.push(line.to_string());
             have_any = true;
+            last_line_survives = false;
         } else if let Some(line) = raw.strip_prefix('+') {
             cur.new_lines.push(line.to_string());
             have_any = true;
+            last_line_survives = true;
         } else if let Some(line) = raw.strip_prefix('-') {
             cur.old_lines.push(line.to_string());
             have_any = true;
+            last_line_survives = false;
         } else if let Some(line) = raw.strip_prefix(' ') {
             cur.old_lines.push(line.to_string());
             cur.new_lines.push(line.to_string());
             have_any = true;
+            last_line_survives = true;
         } else if is_no_newline_comment_line(raw) {
-            no_newline = true;
+            if last_line_survives {
+                no_newline = true;
+            }
+            last_line_survives = false;
         } else {
             cur.old_lines.push(raw.to_string());
             cur.new_lines.push(raw.to_string());
             have_any = true;
+            last_line_survives = true;
         }
 
         *i += 1;
@@ -238,9 +249,7 @@ fn parse_add_block(lines: &[&str], i: &mut usize, end: usize) -> (String, bool) 
     (out.join("\n"), no_newline)
 }
 
-// Detects commentary indicating that there should be no trailing newline.
-// Tolerant to leading backslash, mixed casing, and minor drift; requires tokens
-// "no", then "new", then "line" to appear in order (substring match).
+// Tolerant marker, with the conventional leading backslash optional.
 fn is_no_newline_comment_line(s: &str) -> bool {
     let mut t = s.trim();
     if let Some(rest) = t.strip_prefix('\\') {
@@ -251,9 +260,7 @@ fn is_no_newline_comment_line(s: &str) -> bool {
     let mut idx = 0usize;
     for term in ["no", "new", "line"] {
         match lower[idx..].find(term) {
-            Some(pos) => {
-                idx += pos + term.len();
-            }
+            Some(pos) => idx += pos + term.len(),
             None => return false,
         }
     }

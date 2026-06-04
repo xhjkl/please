@@ -149,7 +149,7 @@ fn update_pure_insert_at_eof() {
 
 #[test]
 fn update_handles_backslash_commentary() {
-    let patch = "*** Begin Patch\n*** Update File: text.text\n@@\n- a\n\\ No newline at end of file\n+ b\n*** End Patch\n";
+    let patch = "*** Begin Patch\n*** Update File: text.text\n@@\n- a\n+ b\n\\ No newline at end of file\n*** End Patch\n";
     let ops = parse_patch_ops(patch).unwrap();
     let mut files = BTreeMap::from([("text.text".to_string(), "a\n".to_string())]);
     let results = execute_patch_ops_in_memory(&mut files, ops);
@@ -158,8 +158,21 @@ fn update_handles_backslash_commentary() {
             .iter()
             .any(|r| r["op"] == "update" && r["ok"] == true)
     );
-    // We set no_newline=true because the commentary follows an added line
     assert_eq!(files.get("text.text").unwrap(), "b");
+}
+
+#[test]
+fn update_ignores_no_newline_marker_for_removed_line() {
+    let patch = "*** Begin Patch\n*** Update File: text.text\n@@\n- a\n\\ No newline at end of file\n+ b\n*** End Patch\n";
+    let ops = parse_patch_ops(patch).unwrap();
+    let mut files = BTreeMap::from([("text.text".to_string(), "a".to_string())]);
+    let results = execute_patch_ops_in_memory(&mut files, ops);
+    assert!(
+        results
+            .iter()
+            .any(|r| r["op"] == "update" && r["ok"] == true)
+    );
+    assert_eq!(files.get("text.text").unwrap(), "b\n");
 }
 
 #[test]
@@ -188,6 +201,30 @@ fn add_file_no_newline_escape_hatch() {
     let results = execute_patch_ops_in_memory(&mut files, ops);
     assert!(results.iter().any(|r| r["op"] == "add" && r["ok"] == true));
     assert_eq!(files.get("nonewline.text").unwrap(), "hello");
+}
+
+#[test]
+fn no_newline_marker_is_case_and_spacing_tolerant() {
+    let patch =
+        "*** Begin Patch\n*** Add File: nonewline.text\nhello\n\\ NO NEW LINE\n*** End Patch\n";
+    let ops = parse_patch_ops(patch).unwrap();
+    let mut files = BTreeMap::<String, String>::new();
+    let results = execute_patch_ops_in_memory(&mut files, ops);
+    assert!(results.iter().any(|r| r["op"] == "add" && r["ok"] == true));
+    assert_eq!(files.get("nonewline.text").unwrap(), "hello");
+}
+
+#[test]
+fn add_file_keeps_plain_no_newline_words() {
+    let patch = "*** Begin Patch\n*** Add File: notes.text\nnot a marker: no new line\nstill content\n*** End Patch\n";
+    let ops = parse_patch_ops(patch).unwrap();
+    let mut files = BTreeMap::<String, String>::new();
+    let results = execute_patch_ops_in_memory(&mut files, ops);
+    assert!(results.iter().any(|r| r["op"] == "add" && r["ok"] == true));
+    assert_eq!(
+        files.get("notes.text").unwrap(),
+        "not a marker: no new line\nstill content\n"
+    );
 }
 
 #[test]
