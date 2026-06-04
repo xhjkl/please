@@ -92,11 +92,11 @@ namespace functions {
 
 ## Patch mode format
 - Wrap all operations between these markers:
-```
-*** Begin Patch
-... one or more operations ...
-*** End Patch
-```
+
+    *** Begin Patch
+    ... one or more operations ...
+    *** End Patch
+
 - Each operation starts with a header (case-insensitive; optional extra spaces; optional colon):
   - Update an existing file:
     - `*** Update File: path/to/file`
@@ -121,20 +121,20 @@ namespace functions {
   - Provide `patch` as the entire desired file content.
 
 ## Example (update + add)
-```
-*** Begin Patch
-*** Update File: src/lib.rs
-``` 
--fn greet() { println!("hi"); }
-+fn greet() {
-+    println!("hello");
-+}
-```
-*** Add File: README.md
-```
-# My Project
-Hello world!
-```
-*** End Patch
-```
+This is the exact patch text to pass as the `patch` string:
+
+    *** Begin Patch
+    *** Update File: src/lib.rs
+    ```
+    -fn greet() { println!("hi"); }
+    +fn greet() {
+    +    println!("hello");
+    +}
+    ```
+    *** Add File: README.md
+    ```
+    # My Project
+    Hello world!
+    ```
+    *** End Patch
 "#;
