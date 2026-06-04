@@ -15,29 +15,16 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(3);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_LIVE_BYTES: usize = 1024 * 1024;
+pub const NAME: &str = "run_command";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Args {
     /// Argument vector for a new command.
-    #[serde(default)]
     argv: Vec<String>,
-    /// Process id returned by an earlier call.
-    #[serde(default)]
-    pid: Option<u32>,
-    /// Control action for a running command.
-    #[serde(default)]
-    action: Option<CommandAction>,
     /// Seconds to wait before returning control to the model.
     #[serde(default)]
     wait_seconds: Option<f64>,
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum CommandAction {
-    Wait,
-    Kill,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -78,6 +65,14 @@ pub(super) struct RunningCommands {
 }
 
 impl RunningCommands {
+    /// Pids for subprocesses still owned by this turn.
+    pub(super) async fn pids(&self) -> Vec<u32> {
+        let commands = self.commands.lock().await;
+        let mut pids = commands.keys().copied().collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids
+    }
+
     pub(super) async fn kill_all(&self) {
         let commands = std::mem::take(&mut *self.commands.lock().await);
         for (_pid, mut command) in commands {
@@ -291,7 +286,7 @@ fn command_result(
                 output.insert("pid".to_string(), json!(pid));
                 output.insert(
                     "next".to_string(),
-                    json!("call run_command with action=\"wait\" and this pid to wait longer, or action=\"kill\" and this pid to stop it"),
+                    json!("call control_command with action=\"wait\" and this pid to wait longer, or action=\"kill\" and this pid to stop it"),
                 );
             }
             CommandEnd::Killed { status, killed } => {
@@ -423,11 +418,17 @@ async fn start_command(
     output
 }
 
-async fn wait_command(
+/// Keep a carried subprocess moving for another wait slice.
+pub(super) async fn wait_by_pid(
     pid: u32,
-    wait_for: Duration,
-    commands: Arc<RunningCommands>,
+    wait_seconds: Option<f64>,
+    stride: Stride,
 ) -> serde_json::Value {
+    let wait_for = match wait_duration(wait_seconds) {
+        Ok(wait_for) => wait_for,
+        Err(error) => return json!({ "error": error }),
+    };
+    let commands = stride.running_commands();
     let command = commands.commands.lock().await.remove(&pid);
     let Some(mut command) = command else {
         return json!({ "error": format!("unknown pid `{pid}`") });
@@ -446,7 +447,9 @@ async fn wait_command(
     output
 }
 
-async fn kill_command_by_pid(pid: u32, commands: Arc<RunningCommands>) -> serde_json::Value {
+/// Interrupt a carried subprocess, killing after grace.
+pub(super) async fn kill_by_pid(pid: u32, stride: Stride) -> serde_json::Value {
+    let commands = stride.running_commands();
     let command = commands.commands.lock().await.remove(&pid);
     let Some(mut command) = command else {
         return json!({ "error": format!("unknown pid `{pid}`") });
@@ -472,58 +475,26 @@ async fn kill_command_by_pid(pid: u32, commands: Arc<RunningCommands>) -> serde_
 /// The returned JSON includes bounded stdout/stderr plus omitted byte counters.
 pub async fn call(args: Args, stride: Stride) -> serde_json::Value {
     let commands = stride.running_commands();
-    match (args.action, args.pid, args.argv.is_empty()) {
-        (None, None, false) => {
-            let wait_for = match wait_duration(args.wait_seconds) {
-                Ok(wait_for) => wait_for,
-                Err(error) => return json!({ "error": error }),
-            };
-            start_command(args.argv, wait_for, commands, stride.live_output()).await
-        }
-        (None, None, true) => json!({ "error": "argv must be non-empty" }),
-        (None, Some(_), false) => {
-            json!({ "error": "run_command accepts either argv or pid/action, not both" })
-        }
-        (None, Some(_), true) => json!({ "error": "action is required for pid" }),
-        (Some(_), _, false) => {
-            json!({ "error": "run_command accepts either argv or pid/action, not both" })
-        }
-        (Some(action), Some(pid), true) => match action {
-            CommandAction::Wait => {
-                let wait_for = match wait_duration(args.wait_seconds) {
-                    Ok(wait_for) => wait_for,
-                    Err(error) => return json!({ "error": error }),
-                };
-                wait_command(pid, wait_for, commands).await
-            }
-            CommandAction::Kill => kill_command_by_pid(pid, commands).await,
-        },
-        (Some(_), None, true) => json!({ "error": "pid is required for action" }),
+    if args.argv.is_empty() {
+        return json!({ "error": "argv must be non-empty" });
     }
+    let wait_for = match wait_duration(args.wait_seconds) {
+        Ok(wait_for) => wait_for,
+        Err(error) => return json!({ "error": error }),
+    };
+    start_command(args.argv, wait_for, commands, stride.live_output()).await
 }
 
 pub fn spec() -> (&'static str, &'static str, Vec<Param>) {
     (
-        "run_command",
-        "Run a command by argv; output is capped. Commands still running after waitSeconds, default 40, return their pid instead of being interrupted. Use action=wait with pid and optional waitSeconds to wait longer, or action=kill with pid to stop it.",
+        NAME,
+        "Start a command by argv. Output is capped. Commands still running after waitSeconds, default 40, return their pid instead of being interrupted.",
         vec![
             Param {
                 name: "argv",
                 desc: "Argument vector for a new command: [program, ...args]",
                 param_type: ParamType::String,
-                required: false,
-            },
-            Param {
-                name: "pid",
-                desc: "Process id returned by an earlier run_command call",
-                param_type: ParamType::Number,
-                required: false,
-            },
-            Param {
-                name: "action",
-                desc: "Control an existing running command",
-                param_type: ParamType::Choice(&["wait", "kill"]),
-                required: false,
+                required: true,
             },
             Param {
                 name: "waitSeconds",
@@ -549,8 +520,6 @@ mod tests {
                     "-c".to_string(),
                     "printf hello; printf problem >&2".to_string(),
                 ],
-                pid: None,
-                action: None,
                 wait_seconds: None,
             },
             Stride::default(),
@@ -576,8 +545,6 @@ mod tests {
                     "-c".to_string(),
                     "sleep 0.15; printf done".to_string(),
                 ],
-                pid: None,
-                action: None,
                 wait_seconds: Some(0.02),
             },
             stride.clone(),
@@ -587,16 +554,7 @@ mod tests {
         assert_eq!(result["status"], "running");
         let pid = result["pid"].as_u64().unwrap() as u32;
 
-        let result = call(
-            Args {
-                argv: Vec::new(),
-                pid: Some(pid),
-                action: Some(CommandAction::Wait),
-                wait_seconds: Some(0.3),
-            },
-            stride,
-        )
-        .await;
+        let result = wait_by_pid(pid, Some(0.3), stride).await;
 
         assert_eq!(result["status"], "finished");
         assert_eq!(result["exitCode"], 0);
@@ -610,8 +568,6 @@ mod tests {
         let result = call(
             Args {
                 argv: vec!["sh".to_string(), "-c".to_string(), "sleep 999".to_string()],
-                pid: None,
-                action: None,
                 wait_seconds: Some(0.02),
             },
             stride.clone(),
@@ -621,16 +577,7 @@ mod tests {
         assert_eq!(result["status"], "running");
         let pid = result["pid"].as_u64().unwrap() as u32;
 
-        let result = call(
-            Args {
-                argv: Vec::new(),
-                pid: Some(pid),
-                action: Some(CommandAction::Kill),
-                wait_seconds: None,
-            },
-            stride,
-        )
-        .await;
+        let result = kill_by_pid(pid, stride).await;
 
         assert_eq!(result["status"], "killed");
         assert_eq!(result["ok"], false);

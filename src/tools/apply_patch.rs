@@ -12,6 +12,8 @@ use serde_json::json;
 pub use parsing::parse_patch_ops;
 pub use preview::summarize_patch_for_preview;
 
+pub const NAME: &str = "apply_patch";
+
 #[derive(Deserialize)]
 pub struct Args {
     /// Target path for overwrite mode (ignored in patch mode)
@@ -48,7 +50,7 @@ pub async fn call(args: Args, _stride: Stride) -> serde_json::Value {
 
 pub fn spec() -> (&'static str, &'static str, Vec<Param>) {
     (
-        "apply_patch",
+        NAME,
         "Apply edits via OpenAI-style patch markers or overwrite without markers. Patch format: wrap ops between '*** Begin Patch' and '*** End Patch'; each op starts with '*** Update File:', '*** Add File:' or '*** Delete File:'. Update bodies use + / - / space prefixes and optional @@ separators; add bodies are raw file content. Append a 'No newline at end of file' comment line to suppress trailing newline. Without markers, requires `path` and overwrites verbatim.",
         vec![
             Param {

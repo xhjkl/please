@@ -4,7 +4,7 @@ use tokio::net::UnixStream;
 
 use crate::display::Display;
 use crate::protocol::{Frame, Message, read_frame_from_stream};
-use crate::tools::{Stride, all_tools, summarize_patch_for_preview};
+use crate::tools::{Stride, ToolKind, all_tools, kind_of, summarize_patch_for_preview};
 
 use super::connect::obtain_control_stream;
 
@@ -48,10 +48,18 @@ pub async fn attempt_turn_on_stream(
 
     loop {
         let mut spinner = Some(display.start_spinning().await);
+        let running_command_pids = stride.running_command_pids().await;
+        let must_settle_command = !running_command_pids.is_empty();
 
         // Send full structured message history to the hub for this subturn.
+        let mut request_messages = messages.clone();
+        if must_settle_command {
+            request_messages.push(Message::Developer(settle_command_prompt(
+                &running_command_pids,
+            )));
+        }
         let req = Frame::Request {
-            messages: messages.clone(),
+            messages: request_messages,
         };
         let body = postcard::to_allocvec(&req).map_err(|e| eyre!(e))?;
         stream.write_all(&body).await?;
@@ -85,6 +93,11 @@ pub async fn attempt_turn_on_stream(
                     let _ = display.show_log(&line).await;
                 }
                 Frame::Answer(delta) => {
+                    if must_settle_command {
+                        final_answer.push_str(&delta);
+                        answer.push_str(&delta);
+                        continue;
+                    }
                     if matches!(phase, Phase::Thinking) {
                         let _ = display.end_thinking().await;
                     }
@@ -94,6 +107,10 @@ pub async fn attempt_turn_on_stream(
                     answer.push_str(&delta);
                 }
                 Frame::Thinking(delta) => {
+                    if must_settle_command {
+                        reasoning.push_str(&delta);
+                        continue;
+                    }
                     if !matches!(phase, Phase::Thinking) {
                         let _ = display.start_thinking().await;
                     }
@@ -124,12 +141,17 @@ pub async fn attempt_turn_on_stream(
         }
         let _ = display.end_answer().await;
 
+        let missing_required_control = must_settle_command
+            && !calls
+                .iter()
+                .any(|call| kind_of(&call.name).is_control_command());
+
         // If present, preserve reasoning across subturns without displaying it to the user.
-        if !reasoning.is_empty() {
+        if !reasoning.is_empty() && !missing_required_control {
             messages.push(Message::Reasoning(reasoning));
         }
         // Preserve assistant-visible content across subturns.
-        if !answer.is_empty() {
+        if !answer.is_empty() && !must_settle_command {
             messages.push(Message::Assistant(answer));
         }
         if let Some(error) = tool_parse_error {
@@ -138,6 +160,13 @@ pub async fn attempt_turn_on_stream(
                 "result": { "error": error },
             });
             messages.push(Message::Tool(payload.to_string()));
+            continue;
+        }
+        if missing_required_control {
+            messages.push(Message::Developer(format!(
+                "Previous response ignored: {}",
+                settle_command_prompt(&running_command_pids)
+            )));
             continue;
         }
         if calls.is_empty() {
@@ -150,11 +179,22 @@ pub async fn attempt_turn_on_stream(
         for call in calls {
             let name = call.name;
             let args = call.arguments;
+            let kind = kind_of(&name);
 
             // Show pretty formatted function call
             let _ = display.show_tool_call(&name, &args).await;
 
-            let approved = gate_risky_if_needed(&display, &name, &args).await;
+            if must_settle_command && !kind.is_control_command() {
+                let tool_payload = serde_json::json!({
+                    "tool": name,
+                    "arguments": args,
+                    "result": { "error": format!("{} required while a command is running", crate::tools::CONTROL_COMMAND_NAME) }
+                });
+                messages.push(Message::Tool(tool_payload.to_string()));
+                continue;
+            }
+
+            let approved = gate_risky_if_needed(&display, kind, &args).await;
             if !approved {
                 let tool_payload = serde_json::json!({
                     "tool": name,
@@ -165,11 +205,7 @@ pub async fn attempt_turn_on_stream(
                 continue;
             }
 
-            let starts_command = name == "run_command"
-                && args
-                    .get("argv")
-                    .and_then(|value| value.as_array())
-                    .is_some_and(|argv| !argv.is_empty());
+            let starts_command = kind.starts_command(&args);
             // Only newly-started commands get a live output pane for streaming stdout/stderr.
             let execution_pane = if starts_command {
                 display.start_executing()
@@ -191,7 +227,7 @@ pub async fn attempt_turn_on_stream(
 
             drop(execution_pane);
 
-            if !streamed && name == "run_command" {
+            if !streamed && kind.has_command_output() {
                 // For plain display mode, forward stdout/stderr all at once.
                 if let Some(obj) = result.as_object() {
                     let stdout = obj.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
@@ -262,28 +298,42 @@ pub async fn run_turn(
     }
 }
 
-async fn gate_risky_if_needed(display: &Display, name: &str, args: &serde_json::Value) -> bool {
-    if name == "run_command" {
-        let argv: Vec<String> = args
-            .get("argv")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|s| s.as_str().map(|t| t.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if argv.is_empty() {
-            return true;
+fn settle_command_prompt(pids: &[u32]) -> String {
+    let pids = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Command pid(s) {pids} are still running. Call {} now with action=\"wait\" or action=\"kill\"; do not answer final.",
+        crate::tools::CONTROL_COMMAND_NAME
+    )
+}
+
+async fn gate_risky_if_needed(display: &Display, kind: ToolKind, args: &serde_json::Value) -> bool {
+    match kind {
+        ToolKind::RunCommand => {
+            let argv: Vec<String> = args
+                .get("argv")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(|t| t.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if argv.is_empty() {
+                return true;
+            }
+            display.confirm_run_command_execution(&argv).await
         }
-        return display.confirm_run_command_execution(&argv).await;
+        ToolKind::ApplyPatch => {
+            let preview = match args.get("patch").and_then(|v| v.as_str()) {
+                Some(patch) => summarize_patch_for_preview(patch).unwrap_or_default(),
+                None => String::new(),
+            };
+            display.confirm_apply_patch_edits(&preview).await
+        }
+        ToolKind::ControlCommand | ToolKind::Other => true,
     }
-    if name == "apply_patch" {
-        let preview = match args.get("patch").and_then(|v| v.as_str()) {
-            Some(patch) => summarize_patch_for_preview(patch).unwrap_or_default(),
-            None => String::new(),
-        };
-        return display.confirm_apply_patch_edits(&preview).await;
-    }
-    true
 }

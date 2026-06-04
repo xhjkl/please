@@ -32,6 +32,11 @@ impl Stride {
     pub async fn kill_running_commands(&self) {
         self.running_commands.kill_all().await;
     }
+
+    /// Pids for subprocesses still carried by this stride.
+    pub async fn running_command_pids(&self) -> Vec<u32> {
+        self.running_commands.pids().await
+    }
 }
 
 impl Default for Stride {
