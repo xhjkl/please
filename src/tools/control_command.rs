@@ -1,4 +1,4 @@
-use super::common::{Param, ParamType, Stride};
+use super::common::{Param, ParamType, ToolContext};
 use serde::Deserialize;
 
 pub const NAME: &str = "control_command";
@@ -22,10 +22,10 @@ enum Action {
     Kill,
 }
 
-pub async fn call(args: Args, stride: Stride) -> serde_json::Value {
+pub async fn call(args: Args, context: ToolContext) -> serde_json::Value {
     match args.action {
-        Action::Wait => super::run_command::wait_by_pid(args.pid, args.wait_seconds, stride).await,
-        Action::Kill => super::run_command::kill_by_pid(args.pid, stride).await,
+        Action::Wait => super::run_command::wait_by_pid(args.pid, args.wait_seconds, context).await,
+        Action::Kill => super::run_command::kill_by_pid(args.pid, context).await,
     }
 }
 

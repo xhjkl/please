@@ -41,7 +41,7 @@ namespace functions {
     max_bytes?: number,
   }) => string | { error: string };
 
-  // Start a command by argv. Output is capped. Commands still running after waitSeconds, default 40, return status="running" with a pid. When that happens, always call control_command next; do not answer final while a command is still running.
+  // Start a command by argv. Output keeps a bounded tail of each stream; omitted-byte counters count earlier bytes discarded. Redirect output to a file when you need the full log, then inspect it with Unix tools after the command settles. Commands still running after waitSeconds, default 40, return status="running" with a pid. When that happens, always call control_command next; do not answer final while a command is still running.
   type run_command = (_: { argv: string[], waitSeconds?: number }) => {
     ok: boolean,
     status: "finished" | "running",
@@ -55,7 +55,7 @@ namespace functions {
     next?: string,
   } | { error: string };
 
-  // Wait for or stop a command that run_command left running.
+  // Wait for or stop a command that run_command left running. Output is the latest bounded tail, which may overlap earlier results; omitted-byte counters count earlier bytes discarded.
   type control_command = (_: { pid: number, action: "wait" | "kill", waitSeconds?: number }) => {
     ok: boolean,
     status: "finished" | "running" | "killed",

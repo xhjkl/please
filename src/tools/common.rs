@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::{env, io};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// One assistant-turn stride: carry subprocesses forward; attach live output per call.
+/// Shared command state for one assistant turn, with live output scoped to a tool call.
 #[derive(Clone)]
-pub struct Stride {
+pub struct ToolContext {
     running_commands: Arc<super::run_command::RunningCommands>,
     live_output: Option<UnboundedSender<String>>,
 }
 
-impl Stride {
+impl ToolContext {
     pub fn with_live_output(&self, live_output: Option<UnboundedSender<String>>) -> Self {
         Self {
             running_commands: self.running_commands.clone(),
@@ -33,13 +33,13 @@ impl Stride {
         self.running_commands.kill_all().await;
     }
 
-    /// Pids for subprocesses still carried by this stride.
+    /// Pids for subprocesses still owned by this assistant turn.
     pub async fn running_command_pids(&self) -> Vec<u32> {
         self.running_commands.pids().await
     }
 }
 
-impl Default for Stride {
+impl Default for ToolContext {
     fn default() -> Self {
         Self {
             running_commands: Arc::new(super::run_command::RunningCommands::default()),
@@ -67,15 +67,18 @@ pub struct Param {
     pub required: bool,
 }
 
-/// Anything that can be called with a `serde_json::Value` payload and a stride.
+/// Anything that can be called with a `serde_json::Value` payload and a context.
 pub type AsyncFn = Box<
-    dyn Fn(serde_json::Value, Stride) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send>>
+    dyn Fn(
+            serde_json::Value,
+            ToolContext,
+        ) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send>>
         + Send
         + Sync,
 >;
 
-/// Adapt a typed async handler to an LLM/tool-call friendly `Fn(Value, Stride) -> Future<Value>`.
-/// The stride carries shared turn state and optional live output for this call.
+/// Adapt a typed async handler to an LLM/tool-call friendly `Fn(Value, ToolContext) -> Future<Value>`.
+/// The context carries shared turn state and optional live output for this call.
 /// That keeps strongly-typed ergonomics at the edges; the closure is `Arc`-cloned for reuse.
 /// Use this when registering typed tools behind a single uniform entrypoint expected by function-calling runtimes.
 ///
@@ -85,7 +88,7 @@ pub type AsyncFn = Box<
 ///
 /// async fn hello(
 ///     args: Hello,
-///     _stride: Stride,
+///     _context: ToolContext,
 /// ) -> serde_json::Value {
 ///     serde_json::json!({ "hi": args.name })
 /// }
@@ -94,21 +97,21 @@ pub type AsyncFn = Box<
 /// let wrapped = with_args(hello);
 ///
 /// // Invoke with raw JSON like a function-calling payload
-/// let out = wrapped(serde_json::json!({ "name": "Ada" }), Stride::default()).await;
+/// let out = wrapped(serde_json::json!({ "name": "Ada" }), ToolContext::default()).await;
 /// assert_eq!(out, serde_json::json!({ "hi": "Ada" }));
 ///
 /// // Invalid inputs yield a normalized error object
-/// let err = wrapped(serde_json::json!({ "name": 123 }), Stride::default()).await;
+/// let err = wrapped(serde_json::json!({ "name": 123 }), ToolContext::default()).await;
 /// assert!(err.get("error").is_some());
 /// ```
 pub fn with_args<Args, Fut, F>(f: F) -> AsyncFn
 where
     Args: serde::de::DeserializeOwned + Send + 'static,
-    F: Fn(Args, Stride) -> Fut + Send + Sync + 'static,
+    F: Fn(Args, ToolContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = serde_json::Value> + Send + 'static,
 {
     let f = Arc::new(f);
-    Box::new(move |args: serde_json::Value, stride: Stride| {
+    Box::new(move |args: serde_json::Value, context: ToolContext| {
         let args = serde_json::from_value::<Args>(args).map_err(|e| e.to_string());
         let args = match args {
             Ok(args) => args,
@@ -117,7 +120,7 @@ where
             }
         };
         let f = Arc::clone(&f);
-        Box::pin(async move { (f)(args, stride).await })
+        Box::pin(async move { (f)(args, context).await })
     })
 }
 

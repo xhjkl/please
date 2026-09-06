@@ -5,7 +5,7 @@ mod parsing;
 mod preview;
 mod text;
 
-use super::common::{Param, ParamType, Stride};
+use super::common::{Param, ParamType, ToolContext};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -23,7 +23,7 @@ pub struct Args {
     patch: Option<String>,
 }
 
-pub async fn call(args: Args, _stride: Stride) -> serde_json::Value {
+pub async fn call(args: Args, _context: ToolContext) -> serde_json::Value {
     let content = match args.patch {
         Some(s) => s,
         None => return json!({ "error": "apply_patch requires parameter `patch`" }),

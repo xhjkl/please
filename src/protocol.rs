@@ -69,8 +69,8 @@ pub async fn read_frame_from_stream<T: serde::de::DeserializeOwned>(
     per_read_timeout: Option<std::time::Duration>,
     total_timeout: Option<std::time::Duration>,
 ) -> std::result::Result<T, ProtocolError> {
-    use std::time::Instant;
     use tokio::io::AsyncReadExt;
+    use tokio::time::Instant;
 
     let start = Instant::now();
     let per_read_timeout = per_read_timeout.unwrap_or(std::time::Duration::MAX);

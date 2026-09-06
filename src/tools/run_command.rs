@@ -1,7 +1,7 @@
-use super::common::{Param, ParamType, Stride};
+use super::common::{Param, ParamType, ToolContext};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,20 +29,29 @@ pub struct Args {
 
 #[derive(Debug, Default, Clone)]
 struct CapturedOutput {
-    bytes: Vec<u8>,
+    bytes: VecDeque<u8>,
+    /// Bytes discarded from the beginning of the stream.
     omitted: usize,
 }
 
 impl CapturedOutput {
     fn push(&mut self, chunk: &[u8]) {
-        let remaining = MAX_CAPTURE_BYTES.saturating_sub(self.bytes.len());
-        let kept = remaining.min(chunk.len());
-        self.bytes.extend_from_slice(&chunk[..kept]);
-        self.omitted += chunk.len() - kept;
+        let omitted = (self.bytes.len() + chunk.len()).saturating_sub(MAX_CAPTURE_BYTES);
+        self.omitted += omitted;
+        if chunk.len() >= MAX_CAPTURE_BYTES {
+            self.bytes.clear();
+            self.bytes.extend(&chunk[chunk.len() - MAX_CAPTURE_BYTES..]);
+            return;
+        }
+
+        self.bytes.drain(..omitted);
+        self.bytes.extend(chunk);
     }
 
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.bytes).to_string()
+    fn text(&mut self) -> String {
+        // Joining the ring's slices before decoding; a character can cross the wrap.
+        let bytes = self.bytes.make_contiguous();
+        String::from_utf8_lossy(bytes).to_string()
     }
 }
 
@@ -270,14 +279,17 @@ fn wait_duration(wait_seconds: Option<f64>) -> Result<Duration, String> {
 
 fn command_output(
     started: Instant,
-    stdout: CapturedOutput,
-    stderr: CapturedOutput,
+    mut stdout: CapturedOutput,
+    mut stderr: CapturedOutput,
 ) -> serde_json::Value {
+    let running_for = started.elapsed();
+    let stdout_text = stdout.text();
+    let stderr_text = stderr.text();
     json!({
-        "runningFor": format!("{:.1}s", started.elapsed().as_secs_f64()),
-        "stdout": stdout.text(),
+        "runningFor": format!("{:.1}s", running_for.as_secs_f64()),
+        "stdout": stdout_text,
         "stdoutBytesOmitted": stdout.omitted,
-        "stderr": stderr.text(),
+        "stderr": stderr_text,
         "stderrBytesOmitted": stderr.omitted,
     })
 }
@@ -439,13 +451,13 @@ async fn start_command(
 pub(super) async fn wait_by_pid(
     pid: u32,
     wait_seconds: Option<f64>,
-    stride: Stride,
+    context: ToolContext,
 ) -> serde_json::Value {
     let wait_for = match wait_duration(wait_seconds) {
         Ok(wait_for) => wait_for,
         Err(error) => return json!({ "error": error }),
     };
-    let commands = stride.running_commands();
+    let commands = context.running_commands();
     let command = commands.commands.lock().await.remove(&pid);
     let Some(mut command) = command else {
         return json!({ "error": format!("unknown pid `{pid}`") });
@@ -469,8 +481,8 @@ pub(super) async fn wait_by_pid(
 }
 
 /// Interrupt a carried subprocess, killing after grace.
-pub(super) async fn kill_by_pid(pid: u32, stride: Stride) -> serde_json::Value {
-    let commands = stride.running_commands();
+pub(super) async fn kill_by_pid(pid: u32, context: ToolContext) -> serde_json::Value {
+    let commands = context.running_commands();
     let command = commands.commands.lock().await.remove(&pid);
     let Some(mut command) = command else {
         return json!({ "error": format!("unknown pid `{pid}`") });
@@ -506,9 +518,9 @@ pub(super) async fn kill_by_pid(pid: u32, stride: Stride) -> serde_json::Value {
 }
 
 /// Run a command and optionally stream bounded stdout/stderr chunks to live output.
-/// The returned JSON includes bounded stdout/stderr plus omitted byte counters.
-pub async fn call(args: Args, stride: Stride) -> serde_json::Value {
-    let commands = stride.running_commands();
+/// The returned JSON includes each stream's latest bytes and counts of earlier bytes omitted.
+pub async fn call(args: Args, context: ToolContext) -> serde_json::Value {
+    let commands = context.running_commands();
     if args.argv.is_empty() {
         return json!({ "error": "argv must be non-empty" });
     }
@@ -516,13 +528,13 @@ pub async fn call(args: Args, stride: Stride) -> serde_json::Value {
         Ok(wait_for) => wait_for,
         Err(error) => return json!({ "error": error }),
     };
-    start_command(args.argv, wait_for, commands, stride.live_output()).await
+    start_command(args.argv, wait_for, commands, context.live_output()).await
 }
 
 pub fn spec() -> (&'static str, &'static str, Vec<Param>) {
     (
         NAME,
-        "Start a command by argv. Output is capped. Commands still running after waitSeconds, default 40, return their pid instead of being interrupted.",
+        "Start a command by argv. Output keeps each stream's latest bytes, with earlier omitted bytes counted. Commands still running after waitSeconds, default 40, return their pid instead of being interrupted.",
         vec![
             Param {
                 name: "argv",
@@ -541,261 +553,4 @@ pub fn spec() -> (&'static str, &'static str, Vec<Param>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    fn pid_exists(pid: u32) -> bool {
-        let status = std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        matches!(status, Ok(status) if status.success())
-    }
-
-    #[cfg(unix)]
-    fn kill_pid(pid: u32) {
-        let _ = std::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-
-    #[cfg(unix)]
-    async fn eventually_dead(pid: u32) -> bool {
-        for _ in 0..20 {
-            if !pid_exists(pid) {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        kill_pid(pid);
-        false
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn captures_command_output_with_shape_for_history() {
-        let result = call(
-            Args {
-                argv: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "printf hello; printf problem >&2".to_string(),
-                ],
-                wait_seconds: None,
-            },
-            Stride::default(),
-        )
-        .await;
-
-        assert_eq!(result["status"], "finished");
-        assert_eq!(result["exitCode"], 0);
-        assert_eq!(result["stdout"], "hello");
-        assert_eq!(result["stderr"], "problem");
-        assert_eq!(result["stdoutBytesOmitted"], 0);
-        assert_eq!(result["stderrBytesOmitted"], 0);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn finished_command_cleans_redirected_background_child() {
-        let result = call(
-            Args {
-                argv: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "sleep 999 >/dev/null 2>&1 & echo $!".to_string(),
-                ],
-                wait_seconds: None,
-            },
-            Stride::default(),
-        )
-        .await;
-
-        assert_eq!(result["status"], "finished");
-        let pid = result["stdout"].as_str().unwrap().trim().parse().unwrap();
-        assert!(eventually_dead(pid).await);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn cancelling_active_command_wait_kills_process_group() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let pid_path = format!(
-            "/tmp/please-run-command-cancel-{}-{stamp}",
-            std::process::id()
-        );
-        let script = format!("sleep 999 >/dev/null 2>&1 & echo $! > {pid_path}; wait");
-
-        let handle = tokio::spawn(async move {
-            call(
-                Args {
-                    argv: vec!["sh".to_string(), "-c".to_string(), script],
-                    wait_seconds: Some(60.0),
-                },
-                Stride::default(),
-            )
-            .await
-        });
-
-        let mut pid = None;
-        for _ in 0..40 {
-            if let Ok(raw) = std::fs::read_to_string(&pid_path) {
-                pid = raw.trim().parse::<u32>().ok();
-                if pid.is_some() {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        let _ = std::fs::remove_file(&pid_path);
-        let pid = pid.expect("background child pid was written");
-
-        handle.abort();
-        let _ = handle.await;
-
-        assert!(eventually_dead(pid).await);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn long_command_can_be_waited_instead_of_interrupted() {
-        let stride = Stride::default();
-        let result = call(
-            Args {
-                argv: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "sleep 0.15; printf done".to_string(),
-                ],
-                wait_seconds: Some(0.02),
-            },
-            stride.clone(),
-        )
-        .await;
-
-        assert_eq!(result["status"], "running");
-        let pid = result["pid"].as_u64().unwrap() as u32;
-
-        let result = wait_by_pid(pid, Some(0.3), stride).await;
-
-        assert_eq!(result["status"], "finished");
-        assert_eq!(result["exitCode"], 0);
-        assert_eq!(result["stdout"], "done");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn running_result_includes_partial_output() {
-        let stride = Stride::default();
-        let result = call(
-            Args {
-                argv: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "printf start; printf err >&2; sleep 999".to_string(),
-                ],
-                wait_seconds: Some(0.02),
-            },
-            stride.clone(),
-        )
-        .await;
-
-        assert_eq!(result["status"], "running");
-        assert_eq!(result["stdout"], "start");
-        assert_eq!(result["stderr"], "err");
-        let pid = result["pid"].as_u64().unwrap() as u32;
-
-        let result = kill_by_pid(pid, stride).await;
-        assert_eq!(result["status"], "killed");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn control_wait_running_result_includes_later_partial_output() {
-        let stride = Stride::default();
-        let result = call(
-            Args {
-                argv: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "printf one; sleep 0.2; printf two; sleep 999".to_string(),
-                ],
-                wait_seconds: Some(0.05),
-            },
-            stride.clone(),
-        )
-        .await;
-
-        assert_eq!(result["status"], "running");
-        assert_eq!(result["stdout"], "one");
-        let pid = result["pid"].as_u64().unwrap() as u32;
-
-        let result = wait_by_pid(pid, Some(0.3), stride.clone()).await;
-
-        assert_eq!(result["status"], "running");
-        assert_eq!(result["stdout"], "onetwo");
-
-        let result = kill_by_pid(pid, stride).await;
-        assert_eq!(result["status"], "killed");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn running_command_can_be_killed_by_pid() {
-        let stride = Stride::default();
-        let result = call(
-            Args {
-                argv: vec!["sh".to_string(), "-c".to_string(), "sleep 999".to_string()],
-                wait_seconds: Some(0.02),
-            },
-            stride.clone(),
-        )
-        .await;
-
-        assert_eq!(result["status"], "running");
-        let pid = result["pid"].as_u64().unwrap() as u32;
-
-        let result = kill_by_pid(pid, stride).await;
-
-        assert_eq!(result["status"], "killed");
-        assert_eq!(result["ok"], false);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn kill_reports_finished_if_command_already_exited() {
-        let stride = Stride::default();
-        let result = call(
-            Args {
-                argv: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "sleep 0.05; printf after".to_string(),
-                ],
-                wait_seconds: Some(0.01),
-            },
-            stride.clone(),
-        )
-        .await;
-
-        assert_eq!(result["status"], "running");
-        let pid = result["pid"].as_u64().unwrap() as u32;
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let result = kill_by_pid(pid, stride).await;
-
-        assert_eq!(result["status"], "finished");
-        assert_eq!(result["exitCode"], 0);
-        assert_eq!(result["stdout"], "after");
-    }
-}
+mod tests;

@@ -9,7 +9,7 @@ mod list_files;
 mod read_file;
 mod run_command;
 
-pub use self::common::Stride;
+pub use self::common::ToolContext;
 pub use apply_patch::summarize_patch_for_preview;
 
 /// Exposed tools are represented as a map keyed by function name.
@@ -81,12 +81,12 @@ pub fn all_tools() -> ExposedTools {
 /// Invoke a tool with services scoped to this tool call.
 pub async fn invoke(
     tools: &ExposedTools,
-    stride: Stride,
+    context: ToolContext,
     name: &str,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let Some((_, work, _)) = tools.get(name) else {
         return Err("No such function".to_string());
     };
-    Ok(work(args, stride).await)
+    Ok(work(args, context).await)
 }

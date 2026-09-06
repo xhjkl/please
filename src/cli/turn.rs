@@ -4,7 +4,7 @@ use tokio::net::UnixStream;
 
 use crate::display::Display;
 use crate::protocol::{Frame, Message, read_frame_from_stream};
-use crate::tools::{Stride, ToolKind, all_tools, kind_of, summarize_patch_for_preview};
+use crate::tools::{ToolContext, ToolKind, all_tools, kind_of, summarize_patch_for_preview};
 
 use super::connect::obtain_control_stream;
 
@@ -23,14 +23,15 @@ pub fn is_cancelled(error: &eyre::Report) -> bool {
     error.downcast_ref::<TurnCancelled>().is_some()
 }
 
-/// Run a single turn attempt, preserving the full message history across reconnects.
-/// Send a prompt to the hub and multiplex streamed frames to display channels.
-/// Returns the final answer string.
+/// Run model and tool subturns on a connection, preserving history and command state.
+/// A complete model response resets the reconnect budget; a partial response does not.
+/// Return the final answer once all commands have settled.
 pub async fn attempt_turn_on_stream(
-    stream: &mut UnixStream,
-    display: Arc<Display>,
     messages: &mut Vec<Message>,
-    stride: Stride,
+    context: ToolContext,
+    stream: &mut UnixStream,
+    reconnect_attempts: &mut u32,
+    display: Arc<Display>,
 ) -> Result<String> {
     use tokio::io::AsyncWriteExt;
 
@@ -48,7 +49,7 @@ pub async fn attempt_turn_on_stream(
 
     loop {
         let mut spinner = Some(display.start_spinning().await);
-        let running_command_pids = stride.running_command_pids().await;
+        let running_command_pids = context.running_command_pids().await;
         let must_settle_command = !running_command_pids.is_empty();
 
         // Send full structured message history to the hub for this subturn.
@@ -80,7 +81,7 @@ pub async fn attempt_turn_on_stream(
                 }
                 _ = tokio::signal::ctrl_c() => {
                     let _ = stream.shutdown().await;
-                    stride.kill_running_commands().await;
+                    context.kill_running_commands().await;
                     return Err(eyre!(TurnCancelled));
                 }
             };
@@ -131,7 +132,10 @@ pub async fn attempt_turn_on_stream(
                 Frame::ToolCallParseError(error) => {
                     tool_parse_error = Some(error);
                 }
-                Frame::Stop => break,
+                Frame::Stop => {
+                    *reconnect_attempts = 0;
+                    break;
+                }
                 Frame::Request { .. } => {}
             }
         }
@@ -171,7 +175,7 @@ pub async fn attempt_turn_on_stream(
         }
         if calls.is_empty() {
             // The turn is complete, return the final answer.
-            stride.kill_running_commands().await;
+            context.kill_running_commands().await;
             return Ok(final_answer);
         }
 
@@ -212,15 +216,16 @@ pub async fn attempt_turn_on_stream(
             } else {
                 None
             };
-            let stride = stride.with_live_output(execution_pane.as_ref().map(|pane| pane.sender()));
+            let context =
+                context.with_live_output(execution_pane.as_ref().map(|pane| pane.sender()));
             let streamed = starts_command && execution_pane.is_some();
             let result = tokio::select! {
-                result = crate::tools::invoke(&tools, stride.clone(), &name, args.clone()) => {
+                result = crate::tools::invoke(&tools, context.clone(), &name, args.clone()) => {
                     result.unwrap_or_else(|error| serde_json::json!({ "error": error }))
                 }
                 _ = tokio::signal::ctrl_c() => {
                     drop(execution_pane);
-                    stride.kill_running_commands().await;
+                    context.kill_running_commands().await;
                     return Err(eyre!(TurnCancelled));
                 }
             };
@@ -268,32 +273,39 @@ pub async fn run_turn(
         false
     }
 
-    let max_attempts = 6;
-    let mut attempt = 0;
+    let max_reconnect_attempts = 6;
+    let mut reconnect_attempts = 0;
     let mut messages = messages;
-    let stride = Stride::default();
+    let context = ToolContext::default();
 
     loop {
-        match attempt_turn_on_stream(stream, display.clone(), &mut messages, stride.clone()).await {
-            Ok(s) => return Ok(s),
+        let result = attempt_turn_on_stream(
+            &mut messages,
+            context.clone(),
+            stream,
+            &mut reconnect_attempts,
+            display.clone(),
+        )
+        .await;
+        match result {
             Err(e) => {
                 if !is_disconnect(&e) {
-                    stride.kill_running_commands().await;
+                    context.kill_running_commands().await;
                     return Err(e);
                 }
-                if attempt >= max_attempts {
-                    stride.kill_running_commands().await;
+                if reconnect_attempts >= max_reconnect_attempts {
+                    context.kill_running_commands().await;
                     return Err(e);
                 }
 
-                tokio::time::sleep(Duration::from_millis(1u64 << attempt.min(6))).await;
+                tokio::time::sleep(Duration::from_millis(1u64 << reconnect_attempts)).await;
 
                 let mut new_stream = obtain_control_stream().await?;
                 std::mem::swap(stream, &mut new_stream);
 
-                attempt += 1;
-                continue;
+                reconnect_attempts += 1;
             }
+            Ok(s) => return Ok(s),
         }
     }
 }
@@ -337,3 +349,6 @@ async fn gate_risky_if_needed(display: &Display, kind: ToolKind, args: &serde_js
         ToolKind::ControlCommand | ToolKind::Other => true,
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -2,13 +2,13 @@
 use eyre::{Result, eyre};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::harmony::{HarmonyAdapter, HarmonyDelta};
 use crate::inference;
 use crate::protocol::Message;
-use crate::protocol::{Frame, read_frame_from_stream, write_frame_to_stream};
+use crate::protocol::{Frame, ProtocolError, read_frame_from_stream, write_frame_to_stream};
 
 /// Loaded backend and model; shared across connections.
 struct Hub {
@@ -129,23 +129,39 @@ async fn serve_one_turn(
     Ok(())
 }
 
-/// Serve a long-lived client connection, handling multiple turns per session.
-async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Hub>) -> Result<()> {
-    // Apply conservative read timeouts to make slow or stuck probes go away.
+/// Read a request, allowing established clients to run tools between requests.
+async fn read_request(
+    stream: &mut UnixStream,
+    store: &mut Vec<u8>,
+    first_request: bool,
+) -> std::result::Result<Frame, ProtocolError> {
+    if !first_request && store.is_empty() {
+        // Starting the frame deadline only after data arrives; tool waits can be arbitrarily long.
+        let mut byte = [0];
+        let read = stream.read(&mut byte).await.map_err(ProtocolError::Io)?;
+        if read == 0 {
+            return Err(ProtocolError::Disconnect);
+        }
+        store.extend_from_slice(&byte);
+    }
+
     let per_read_timeout = Some(Duration::from_millis(250));
     let total_timeout = Some(Duration::from_secs(30));
+    read_frame_from_stream(stream, store, per_read_timeout, total_timeout).await
+}
 
+/// Serve a long-lived client connection, handling multiple turns per session.
+async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Hub>) -> Result<()> {
     tracing::info!("hub: connection accepted");
 
     let mut store = Vec::with_capacity(4096);
+    let mut first_request = true;
 
     loop {
-        // Wait for the next request; keep the connection alive between turns.
-        let req: std::result::Result<Frame, crate::protocol::ProtocolError> =
-            read_frame_from_stream(stream, &mut store, per_read_timeout, total_timeout).await;
+        let req = read_request(stream, &mut store, first_request).await;
 
         let req = match req {
-            Err(crate::protocol::ProtocolError::Disconnect) => {
+            Err(ProtocolError::Disconnect) => {
                 // Normal end of session
                 break;
             }
@@ -161,8 +177,7 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Hub>) -> Res
         };
 
         serve_one_turn(stream, hub.clone(), &history).await?;
-
-        // Roll over to the next turn
+        first_request = false;
     }
     Ok(())
 }
@@ -222,3 +237,6 @@ pub async fn spawn() -> Result<UnixStream> {
 
     Ok(probe_end)
 }
+
+#[cfg(test)]
+mod tests;

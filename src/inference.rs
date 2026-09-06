@@ -46,7 +46,6 @@ pub fn generate_tokens_into_stream(
     generated: GenerationSender,
 ) -> Result<()> {
     let harmony = HarmonyAdapter::gpt_oss()?;
-    let prompt_token_ids = harmony.render_protocol_tokens(history)?;
 
     let num_threads = std::thread::available_parallelism()
         .ok()
@@ -67,6 +66,8 @@ pub fn generate_tokens_into_stream(
     let ctx_cap = ctx.n_ctx() as usize;
 
     let preamble_len = compute_preamble_len(&harmony, history, ctx_cap)?;
+    let tail_budget = ctx_cap.saturating_sub(1 + preamble_len);
+    let prompt_token_ids = harmony.render_protocol_tokens_with_tail_budget(history, tail_budget)?;
     let prompt_tokens = clip_to_ctx(prompt_token_ids, preamble_len, ctx_cap)
         .into_iter()
         .map(token_to_llama)
@@ -254,3 +255,6 @@ fn rebuild_kv_with_sliding_window(
 
     Ok((compact, new_pos, logits_idx))
 }
+
+#[cfg(test)]
+mod tests;

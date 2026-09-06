@@ -77,6 +77,56 @@ impl HarmonyAdapter {
         self.render_completion_tokens(&messages)
     }
 
+    /// Fit the latest command result into the context tail before rendering history.
+    /// Older history remains subject to the inference boundary's sliding window.
+    pub fn render_protocol_tokens_with_tail_budget(
+        &self,
+        history: &[Message],
+        tail_budget: usize,
+    ) -> Result<Vec<u32>> {
+        let mut messages = protocol_to_harmony(history)?;
+        let latest = messages.iter().rposition(|message| {
+            !matches!(
+                message,
+                HarmonyMessage::System(_) | HarmonyMessage::Developer(_)
+            )
+        });
+        let Some(latest) = latest else {
+            return self.render_completion_tokens(&messages);
+        };
+        let HarmonyMessage::ToolResult { name, content } = &messages[latest] else {
+            return self.render_completion_tokens(&messages);
+        };
+        if !crate::tools::kind_of(name).has_command_output() {
+            return self.render_completion_tokens(&messages);
+        }
+        let mut result = serde_json::from_str::<Value>(content)?;
+
+        // Reserving half the tail for nearby context and continuation; trimming
+        // strings before encoding keeps command metadata and Harmony framing whole.
+        loop {
+            let suffix = self.render_completion_tokens(&messages[latest..])?;
+            if suffix.len() <= tail_budget / 2 {
+                break;
+            }
+            let dropped = trim_command_stream(&mut result);
+            if dropped == 0 {
+                if suffix.len() > tail_budget {
+                    return Err(eyre!("command result metadata exceeds available context"));
+                }
+                break;
+            }
+            let content = serde_json::to_string(&result)?;
+            if let HarmonyMessage::ToolResult {
+                content: target, ..
+            } = &mut messages[latest]
+            {
+                *target = content;
+            }
+        }
+        self.render_completion_tokens(&messages)
+    }
+
     pub fn stop_tokens(&self) -> &[u32] {
         &self.stop_tokens
     }
@@ -88,6 +138,32 @@ impl HarmonyAdapter {
     pub fn output_parser(&self) -> Result<HarmonyOutputParser> {
         HarmonyOutputParser::new(self.encoding.clone())
     }
+}
+
+fn trim_command_stream(result: &mut Value) -> usize {
+    let length = |stream| {
+        result
+            .get(stream)
+            .and_then(Value::as_str)
+            .map_or(0, str::len)
+    };
+    // Reducing the longer stream first; short diagnostics in the other remain visible.
+    let (stream, counter) = if length("stdout") >= length("stderr") {
+        ("stdout", "stdoutBytesOmitted")
+    } else {
+        ("stderr", "stderrBytesOmitted")
+    };
+    let Some(Value::String(output)) = result.get_mut(stream) else {
+        return 0;
+    };
+    let mut start = output.len().div_ceil(2);
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    output.drain(..start);
+    let omitted = result.get(counter).and_then(Value::as_u64).unwrap_or(0);
+    result[counter] = Value::from(omitted.saturating_add(start as u64));
+    start
 }
 
 pub struct HarmonyOutputParser {
@@ -262,44 +338,4 @@ fn sorted_tokens(tokens: std::collections::HashSet<u32>) -> Vec<u32> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const START_TOKEN: u32 = 200006;
-
-    #[test]
-    fn literal_start_marker_in_user_json_is_content_not_structure() -> Result<()> {
-        let harmony = HarmonyAdapter::gpt_oss()?;
-        let messages = [HarmonyMessage::User(
-            r#"{"literal":"<|start|>","nested":{"still":"content"}}"#.to_string(),
-        )];
-
-        let tokens = harmony.render_completion_tokens(&messages)?;
-        assert_eq!(count_token(&tokens, START_TOKEN), 2);
-        assert!(
-            !harmony
-                .encoding
-                .tokenizer()
-                .encode_ordinary("<|start|>")
-                .contains(&START_TOKEN)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn literal_start_marker_in_tool_call_json_is_content_not_structure() -> Result<()> {
-        let harmony = HarmonyAdapter::gpt_oss()?;
-        let messages = [HarmonyMessage::AssistantToolCall {
-            recipient: "functions.echo".to_string(),
-            arguments_json: r#"{"argument":"<|start|>"}"#.to_string(),
-        }];
-
-        let tokens = harmony.render_completion_tokens(&messages)?;
-        assert_eq!(count_token(&tokens, START_TOKEN), 2);
-        Ok(())
-    }
-
-    fn count_token(tokens: &[u32], needle: u32) -> usize {
-        tokens.iter().filter(|token| **token == needle).count()
-    }
-}
+mod tests;
