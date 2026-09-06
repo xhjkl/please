@@ -30,7 +30,7 @@ pub async fn attempt_turn_on_stream(
     messages: &mut Vec<Message>,
     context: ToolContext,
     stream: &mut UnixStream,
-    reconnect_attempts: &mut u32,
+    reconnect_attempts: &mut usize,
     display: Arc<Display>,
 ) -> Result<String> {
     use tokio::io::AsyncWriteExt;

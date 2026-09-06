@@ -129,13 +129,22 @@ async fn serve_one_turn(
     Ok(())
 }
 
-/// Read a request, allowing established clients to run tools between requests.
+/// Read a complete request within the frame deadline.
 async fn read_request(
     stream: &mut UnixStream,
     store: &mut Vec<u8>,
-    first_request: bool,
 ) -> std::result::Result<Frame, ProtocolError> {
-    if !first_request && store.is_empty() {
+    let per_read_timeout = Some(Duration::from_millis(250));
+    let total_timeout = Some(Duration::from_secs(30));
+    read_frame_from_stream(stream, store, per_read_timeout, total_timeout).await
+}
+
+/// Wait for another request, allowing the client to run tools before sending it.
+async fn wait_for_request(
+    stream: &mut UnixStream,
+    store: &mut Vec<u8>,
+) -> std::result::Result<Frame, ProtocolError> {
+    if store.is_empty() {
         // Starting the frame deadline only after data arrives; tool waits can be arbitrarily long.
         let mut byte = [0];
         let read = stream.read(&mut byte).await.map_err(ProtocolError::Io)?;
@@ -145,9 +154,7 @@ async fn read_request(
         store.extend_from_slice(&byte);
     }
 
-    let per_read_timeout = Some(Duration::from_millis(250));
-    let total_timeout = Some(Duration::from_secs(30));
-    read_frame_from_stream(stream, store, per_read_timeout, total_timeout).await
+    read_request(stream, store).await
 }
 
 /// Serve a long-lived client connection, handling multiple turns per session.
@@ -155,31 +162,25 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Hub>) -> Res
     tracing::info!("hub: connection accepted");
 
     let mut store = Vec::with_capacity(4096);
-    let mut first_request = true;
+    let mut request = read_request(stream, &mut store).await;
 
     loop {
-        let req = read_request(stream, &mut store, first_request).await;
-
-        let req = match req {
-            Err(ProtocolError::Disconnect) => {
-                // Normal end of session
-                break;
-            }
+        let frame = match request {
+            Err(ProtocolError::Disconnect) => return Ok(()),
             Err(e) => return Err(eyre!(e)),
             Ok(frame) => frame,
         };
 
         tracing::info!("hub: received inference request");
 
-        let history = match req {
+        let history = match frame {
             Frame::Request { messages } => messages,
-            _ => return Err(eyre!("bad request: {req:?}")),
+            _ => return Err(eyre!("bad request: {frame:?}")),
         };
 
         serve_one_turn(stream, hub.clone(), &history).await?;
-        first_request = false;
+        request = wait_for_request(stream, &mut store).await;
     }
-    Ok(())
 }
 
 /// Hub main loop: bind socket, load model once, accept clients forever.
