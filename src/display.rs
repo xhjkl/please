@@ -1,7 +1,6 @@
 mod pane;
 mod spinner;
 
-pub use pane::ExecutionPane;
 pub use spinner::Spinner;
 
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};

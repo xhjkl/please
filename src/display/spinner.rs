@@ -34,12 +34,12 @@ pub struct Spinner {
 
 impl Spinner {
     /// For compatibility, make a spinner that does nothing.
-    pub(super) fn start_empty() -> Self {
+    pub fn start_empty() -> Self {
         Spinner { task: None }
     }
 
     /// Immediately start a task that will show a spinner until dropped.
-    pub(super) fn start() -> Self {
+    pub fn start() -> Self {
         Spinner {
             task: Some(tokio::spawn(display_spinner())),
         }

@@ -1,9 +1,14 @@
 use eyre::{Result, eyre};
-use futures_util::{StreamExt, future::try_join_all};
+use futures_util::{
+    StreamExt,
+    future::{join_all, try_join_all},
+};
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
+
+use crate::intuition;
 
 /// Return the local directory where model weight files are stored.
 fn weights_dir() -> std::path::PathBuf {
@@ -26,24 +31,95 @@ fn ensure_dir(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Pick the appropriate repository and shard list based on a user-friendly alias.
-fn pick_repository(which: Option<&str>) -> (&'static str, &'static [&'static str]) {
-    let key = which.map(|s| s.trim()).unwrap_or("20b");
-    let key = key
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-        .to_ascii_lowercase();
+fn choose_best(models: &[(u64, &[&str])]) -> Result<Vec<String>> {
+    let memory_bytes = intuition::available_memory_bytes()?;
+    let budget_bytes = memory_bytes.saturating_mul(4) / 5;
 
-    match key.as_str() {
-        "120b" | "120" | "big" | "large" => (
-            "ggml-org/gpt-oss-120b-GGUF",
+    for &(model_bytes, urls) in models {
+        if model_bytes <= budget_bytes {
+            return Ok(urls.iter().map(|url| (*url).to_string()).collect());
+        }
+    }
+
+    Err(eyre!(
+        "no supported model fits the {} byte memory budget",
+        budget_bytes
+    ))
+}
+
+fn choose_best_qwen_urls() -> Result<Vec<String>> {
+    const QWEN_MODELS: &[(u64, &[&str])] = &[
+        (
+            244_093_630_912,
             &[
-                "gpt-oss-120b-mxfp4-00001-of-00003.gguf",
-                "gpt-oss-120b-mxfp4-00002-of-00003.gguf",
-                "gpt-oss-120b-mxfp4-00003-of-00003.gguf",
+                "https://huggingface.co/unsloth/Qwen3.5-397B-A17B-GGUF/resolve/main/Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00001-of-00006.gguf",
+                "https://huggingface.co/unsloth/Qwen3.5-397B-A17B-GGUF/resolve/main/Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00002-of-00006.gguf",
+                "https://huggingface.co/unsloth/Qwen3.5-397B-A17B-GGUF/resolve/main/Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00003-of-00006.gguf",
+                "https://huggingface.co/unsloth/Qwen3.5-397B-A17B-GGUF/resolve/main/Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00004-of-00006.gguf",
+                "https://huggingface.co/unsloth/Qwen3.5-397B-A17B-GGUF/resolve/main/Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00005-of-00006.gguf",
+                "https://huggingface.co/unsloth/Qwen3.5-397B-A17B-GGUF/resolve/main/Q4_K_M/Qwen3.5-397B-A17B-Q4_K_M-00006-of-00006.gguf",
             ],
         ),
-        _ => ("ggml-org/gpt-oss-20b-GGUF", &["gpt-oss-20b-mxfp4.gguf"]),
-    }
+        (
+            76_536_964_608,
+            &[
+                "https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF/resolve/main/Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf",
+                "https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF/resolve/main/Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00002-of-00003.gguf",
+                "https://huggingface.co/unsloth/Qwen3.5-122B-A10B-GGUF/resolve/main/Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00003-of-00003.gguf",
+            ],
+        ),
+        (
+            22_016_023_168,
+            &[
+                "https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/Qwen3.5-35B-A3B-Q4_K_M.gguf",
+            ],
+        ),
+        (
+            16_740_812_704,
+            &[
+                "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf",
+            ],
+        ),
+        (
+            5_680_522_464,
+            &["https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf"],
+        ),
+        (
+            2_740_937_888,
+            &["https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf"],
+        ),
+        (
+            1_280_835_840,
+            &["https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf"],
+        ),
+        (
+            532_517_120,
+            &[
+                "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
+            ],
+        ),
+    ];
+
+    choose_best(QWEN_MODELS)
+}
+
+fn choose_best_gpt_urls() -> Result<Vec<String>> {
+    const GPT_MODELS: &[(u64, &[&str])] = &[
+        (
+            63_387_346_208,
+            &[
+                "https://huggingface.co/ggml-org/gpt-oss-120b-GGUF/resolve/main/gpt-oss-120b-MXFP4.gguf",
+            ],
+        ),
+        (
+            12_109_566_624,
+            &[
+                "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf",
+            ],
+        ),
+    ];
+
+    choose_best(GPT_MODELS)
 }
 
 /// Build a configured HTTP client with a descriptive User-Agent.
@@ -58,10 +134,6 @@ fn build_http_client() -> Result<reqwest::Client> {
         .tls_backend_rustls()
         .build()?;
     Ok(client)
-}
-
-fn shard_url(repository: &str, shard: &str) -> String {
-    format!("https://huggingface.co/{repository}/resolve/main/{shard}")
 }
 
 /// Parsed view of a Content-Range header.
@@ -199,7 +271,7 @@ async fn get(client: &reqwest::Client, url: &str) -> Result<reqwest::Response> {
 
 /// Download a remote file to `target_path`, resuming from a local partial file when possible.
 /// Robustly handles servers that ignore ranges or respond with 416, and verifies final size when known.
-async fn download_with_resume(
+async fn download_one(
     client: reqwest::Client,
     url: String,
     target_path: std::path::PathBuf,
@@ -354,141 +426,114 @@ async fn download_with_resume(
     Ok(())
 }
 
-async fn stitch_shards(
-    target_path: &std::path::Path,
-    shard_paths: &[std::path::PathBuf],
-) -> Result<()> {
+async fn download_many(urls: Vec<String>) -> Result<Vec<std::path::PathBuf>> {
+    let weights_directory_path = weights_dir();
+    ensure_dir(&weights_directory_path)?;
+    let client = build_http_client()?;
+
+    let shard_jobs = urls
+        .into_iter()
+        .map(|url| {
+            let file_name = url
+                .rsplit('/')
+                .next()
+                .filter(|file_name| !file_name.is_empty())
+                .ok_or_else(|| eyre!("model shard URL has no file name: {url}"))?;
+            let path = weights_directory_path.join(file_name);
+            Ok((url, path))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let head_requests = shard_jobs.iter().map(|(url, _)| {
+        let client = client.clone();
+        async move {
+            let response = client.head(url).send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)?
+                .to_str()
+                .ok()?
+                .parse::<u64>()
+                .ok()
+        }
+    });
+    let content_lengths = join_all(head_requests).await;
+    let total_bytes = content_lengths.into_iter().sum::<Option<u64>>();
+
+    let progress = Arc::new(Progress::new(total_bytes));
+    let downloads = shard_jobs.iter().map(|(url, path)| {
+        let client = client.clone();
+        let url = url.clone();
+        let path = path.clone();
+        let progress = Arc::clone(&progress);
+        async move { download_one(client, url, path, progress).await }
+    });
+    try_join_all(downloads).await?;
+
+    Ok(shard_jobs.into_iter().map(|(_, path)| path).collect())
+}
+
+async fn stitch_shards(shard_paths: Vec<std::path::PathBuf>) -> Result<std::path::PathBuf> {
+    let Some(first_shard_path) = shard_paths.first() else {
+        return Err(eyre!("model has no shards"));
+    };
+    if shard_paths.len() == 1 {
+        return Ok(first_shard_path.clone());
+    }
+
+    let first_shard_name = first_shard_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            eyre!(
+                "model shard has no file name: {}",
+                first_shard_path.display()
+            )
+        })?;
+    let target_name = derive_multishard_target_name(first_shard_name);
+    let target_path = first_shard_path.with_file_name(target_name);
     let mut final_file = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(target_path)
+        .open(&target_path)
         .await?;
 
-    for shard_path in shard_paths {
+    for shard_path in &shard_paths {
         let mut shard_file = tokio::fs::File::open(shard_path).await?;
         tokio::io::copy(&mut shard_file, &mut final_file).await?;
     }
 
     final_file.flush().await?;
-    Ok(())
-}
+    drop(final_file);
 
-/// Entry point: resolve repository, download shards in parallel, and stitch them into the final file.
-pub async fn run_load(which: Option<&str>) -> Result<()> {
-    let (repository, shards) = pick_repository(which);
-    let weights_directory_path = weights_dir();
-    ensure_dir(&weights_directory_path)?;
-    let client = build_http_client()?;
-
-    let shard_count = shards.len();
-    let first_shard = shards[0];
-    let final_name = if shard_count == 1 {
-        first_shard.to_string()
-    } else {
-        derive_multishard_target_name(first_shard)
-    };
-    let target_path = weights_directory_path.join(&final_name);
-    let shard_jobs: Vec<(String, std::path::PathBuf)> = if shard_count == 1 {
-        vec![(shard_url(repository, first_shard), target_path.clone())]
-    } else {
-        shards
-            .iter()
-            .map(|shard| {
-                (
-                    shard_url(repository, shard),
-                    weights_directory_path.join(shard),
-                )
-            })
-            .collect()
-    };
-
-    let final_name = target_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    let final_dir = {
-        let dir = target_path
-            .parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".".to_string());
-        if let Ok(home) = std::env::var("HOME") {
-            if dir == home {
-                "~".to_string()
-            } else if dir.starts_with(&home) && dir.as_bytes().get(home.len()) == Some(&b'/') {
-                format!("~{}", &dir[home.len()..])
-            } else {
-                dir
-            }
-        } else {
-            dir
+    for shard_path in &shard_paths {
+        let removed = tokio::fs::remove_file(shard_path).await;
+        if let Err(error) = removed {
+            eprintln!(
+                "please load: failed to remove {}: {error}",
+                shard_path.display()
+            );
         }
-    };
-    eprintln!(
-        "please load: downloading `{}` into `{}`",
-        final_name, final_dir
-    );
-
-    let total_bytes = {
-        let mut total = Some(0u64);
-        for (url, _) in &shard_jobs {
-            match client.head(url).send().await {
-                Ok(head) if head.status().is_success() => {
-                    if let Some(len) = head
-                        .headers()
-                        .get(reqwest::header::CONTENT_LENGTH)
-                        .and_then(|h| h.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        if let Some(acc) = &mut total {
-                            *acc += len;
-                        }
-                    } else {
-                        total = None;
-                        break;
-                    }
-                }
-                _ => {
-                    total = None;
-                    break;
-                }
-            }
-        }
-        total
-    };
-
-    let progress = Arc::new(Progress::new(total_bytes));
-
-    let download_tasks = shard_jobs.iter().map(|(url, path)| {
-        let client = client.clone();
-        let url = url.clone();
-        let path = path.clone();
-        let progress = Arc::clone(&progress);
-        async move { download_with_resume(client, url, path, progress).await }
-    });
-
-    try_join_all(download_tasks).await?;
-
-    if shard_count > 1 {
-        let shard_paths: Vec<std::path::PathBuf> =
-            shard_jobs.iter().map(|(_, path)| path.clone()).collect();
-        stitch_shards(&target_path, &shard_paths).await?;
-        for shard_path in &shard_paths {
-            if let Err(e) = tokio::fs::remove_file(shard_path).await {
-                eprintln!(
-                    "please load: failed to remove {}: {e}",
-                    shard_path.display()
-                );
-            }
-        }
-        eprintln!(
-            "please load: stitched {} shards into {}",
-            shard_count,
-            target_path.display()
-        );
     }
 
-    eprintln!("please load: done");
+    Ok(target_path)
+}
+
+/// Select and download the greatest supported model that fits this machine.
+pub async fn run_download(which: Option<&str>) -> Result<()> {
+    let which = which.map(str::to_ascii_lowercase);
+    let urls = if which.is_some_and(|which| which.starts_with("gpt")) {
+        choose_best_gpt_urls()?
+    } else {
+        choose_best_qwen_urls()?
+    };
+    let shards = download_many(urls).await?;
+    let model_path = stitch_shards(shards).await?;
+    eprintln!("please load: done: {}", model_path.display());
     Ok(())
 }
 

@@ -1,12 +1,10 @@
-pub mod connect;
-pub mod discovery;
-pub mod io;
-pub mod repl;
-pub mod run;
-pub mod specials;
-pub mod turn;
+mod connect;
+mod discovery;
+mod io;
+mod repl;
+mod run;
+mod specials;
+mod turn;
 
-pub use connect::obtain_control_stream;
-pub use repl::interact_forever;
+pub use discovery::{choose_best_gpt, choose_best_qwen};
 pub use run::run;
-pub use turn::run_turn;

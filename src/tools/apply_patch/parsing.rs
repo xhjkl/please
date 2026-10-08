@@ -67,7 +67,7 @@ pub fn parse_patch_ops(raw: &str) -> Result<Vec<PatchOp>, String> {
     Ok(ops)
 }
 
-pub(crate) fn contains_patch_syntax(s: &str) -> bool {
+pub fn contains_patch_syntax(s: &str) -> bool {
     let src = normalize_eol(s);
     let lines: Vec<&str> = src.lines().collect();
     find_marker(&lines, 0, Marker::Begin).is_some()

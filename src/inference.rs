@@ -15,10 +15,8 @@ use gg::token::LlamaToken;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::harmony::HarmonyAdapter;
+use crate::intuition::{available_memory_bytes, pick_n_ctx};
 use crate::protocol::Message;
-
-mod intuition;
-use intuition::{pick_n_ctx_by_vram, vram_free_bytes};
 
 const USE_MIROSTAT: bool = true;
 
@@ -53,9 +51,10 @@ pub fn generate_tokens_into_stream(
         .unwrap_or(1);
 
     let batch_size = 512;
-    let n_ctx = vram_free_bytes()
-        .map(|free| pick_n_ctx_by_vram(model, free))
-        .unwrap_or_else(|| std::num::NonZeroU32::new(8_192.min(model.n_ctx_train())).unwrap());
+    let memory_bytes = available_memory_bytes();
+    let n_ctx = memory_bytes
+        .map(|memory_bytes| pick_n_ctx(model, memory_bytes))
+        .unwrap_or_else(|_| std::num::NonZeroU32::new(8_192.min(model.n_ctx_train())).unwrap());
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(Some(n_ctx))
         .with_n_threads(num_threads as i32)

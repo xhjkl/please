@@ -21,11 +21,11 @@ impl ToolContext {
         }
     }
 
-    pub(super) fn live_output(&self) -> Option<UnboundedSender<String>> {
+    pub fn live_output(&self) -> Option<UnboundedSender<String>> {
         self.live_output.clone()
     }
 
-    pub(super) fn running_commands(&self) -> Arc<super::run_command::RunningCommands> {
+    pub fn running_commands(&self) -> Arc<super::run_command::RunningCommands> {
         self.running_commands.clone()
     }
 

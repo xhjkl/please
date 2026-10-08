@@ -127,10 +127,6 @@ impl HarmonyAdapter {
         self.render_completion_tokens(&messages)
     }
 
-    pub fn stop_tokens(&self) -> &[u32] {
-        &self.stop_tokens
-    }
-
     pub fn is_stop_token(&self, token: u32) -> bool {
         self.stop_tokens.binary_search(&token).is_ok()
     }

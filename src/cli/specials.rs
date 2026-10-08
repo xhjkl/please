@@ -1,6 +1,6 @@
 use eyre::Result;
 
-mod load;
+mod download;
 
 /// Handle special one-shot CLI commands like `--help`, `--version`, or `load`.
 /// Returns true if a special action was handled and the program should exit.
@@ -54,7 +54,7 @@ pub async fn handle_specials_if_needed() -> Result<bool> {
 
     if matches!(arg.as_str(), "load" | "download") {
         let which = args.next();
-        load::run_load(which.as_deref()).await?;
+        download::run_download(which.as_deref()).await?;
         return Ok(true);
     }
 

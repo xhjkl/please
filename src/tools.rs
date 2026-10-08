@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-pub mod common;
+mod common;
 use self::common::{AsyncFn, Param, with_args};
 
 mod apply_patch;

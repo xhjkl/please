@@ -69,20 +69,20 @@ struct RunningCommand {
 }
 
 #[derive(Default)]
-pub(super) struct RunningCommands {
+pub struct RunningCommands {
     commands: AsyncMutex<HashMap<u32, RunningCommand>>,
 }
 
 impl RunningCommands {
     /// Pids for subprocesses still owned by this turn.
-    pub(super) async fn pids(&self) -> Vec<u32> {
+    pub async fn pids(&self) -> Vec<u32> {
         let commands = self.commands.lock().await;
         let mut pids = commands.keys().copied().collect::<Vec<_>>();
         pids.sort_unstable();
         pids
     }
 
-    pub(super) async fn kill_all(&self) {
+    pub async fn kill_all(&self) {
         let commands = std::mem::take(&mut *self.commands.lock().await);
         for (_pid, mut command) in commands {
             kill_child(&mut command.child);
@@ -448,7 +448,7 @@ async fn start_command(
 }
 
 /// Keep a carried subprocess moving for another wait slice.
-pub(super) async fn wait_by_pid(
+pub async fn wait_by_pid(
     pid: u32,
     wait_seconds: Option<f64>,
     context: ToolContext,
@@ -481,7 +481,7 @@ pub(super) async fn wait_by_pid(
 }
 
 /// Interrupt a carried subprocess, killing after grace.
-pub(super) async fn kill_by_pid(pid: u32, context: ToolContext) -> serde_json::Value {
+pub async fn kill_by_pid(pid: u32, context: ToolContext) -> serde_json::Value {
     let commands = context.running_commands();
     let command = commands.commands.lock().await.remove(&pid);
     let Some(mut command) = command else {

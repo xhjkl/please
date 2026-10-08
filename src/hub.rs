@@ -193,7 +193,12 @@ pub async fn run() -> Result<()> {
     tracing::info!("hub: listening at {}", socket_path.display());
 
     // Load model once and accept connections in a loop.
-    let Some(model_path) = crate::cli::discovery::choose_best_model_path() else {
+    let model_path = crate::cli::choose_best_qwen();
+    let model_path = match model_path {
+        Some(model_path) => Some(model_path),
+        None => crate::cli::choose_best_gpt(),
+    };
+    let Some(model_path) = model_path else {
         return Err(eyre!("hub: no model found"));
     };
     let model_path = model_path.to_string_lossy().to_string();
@@ -219,7 +224,12 @@ pub async fn run() -> Result<()> {
 /// Convenience for in-process use: serve a single client over a UnixStream pair.
 pub async fn spawn() -> Result<UnixStream> {
     // Load model once and serve a single request over an in-process stream pair.
-    let Some(model_path) = crate::cli::discovery::choose_best_model_path() else {
+    let model_path = crate::cli::choose_best_qwen();
+    let model_path = match model_path {
+        Some(model_path) => Some(model_path),
+        None => crate::cli::choose_best_gpt(),
+    };
+    let Some(model_path) = model_path else {
         return Err(eyre!("hub: no model found"));
     };
     tracing::info!(model_path=%model_path.display(), "hub: selected model");
