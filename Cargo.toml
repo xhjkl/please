@@ -10,7 +10,7 @@ eyre = { version = "0.6", features = [] }
 nix = { version = "0.31", features = ["process", "signal"] }
 openai-harmony = "0.0.8"
 postcard = { version = "1", features = ["use-std"] }
-rustyline = { version = "18", features = [] }
+rustyline = { version = "19", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = "0.3"
