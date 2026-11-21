@@ -1,6 +1,29 @@
 use super::*;
 
 #[cfg(unix)]
+use crate::test_support::TempDir;
+
+#[cfg(unix)]
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+async fn wait_for_stdout(context: &ToolContext, pid: u32, suffix: &str) -> serde_json::Value {
+    let started = Instant::now();
+    loop {
+        let result = wait_by_pid(pid, Some(0.02), context.clone()).await;
+        let elapsed = started.elapsed();
+        if result["status"] != "running"
+            || result["stdout"]
+                .as_str()
+                .is_some_and(|stdout| stdout.ends_with(suffix))
+            || elapsed >= TEST_TIMEOUT
+        {
+            return result;
+        }
+    }
+}
+
+#[cfg(unix)]
 fn pid_exists(pid: u32) -> bool {
     let status = std::process::Command::new("kill")
         .arg("-0")
@@ -115,9 +138,9 @@ async fn carried_command_retains_progress_after_output_overflows() {
     let progress = "LATER_PROGRESS";
     let script = format!(
         "head -c {MAX_CAPTURE_BYTES} /dev/zero | tr '\\000' x; \
-         printf '{progress}'; sleep 999"
+         printf '{progress}'; exec sleep 999"
     );
-    let mut result = call(
+    let result = call(
         Args {
             argv: vec!["sh".to_string(), "-c".to_string(), script],
             wait_seconds: Some(0.0),
@@ -127,15 +150,7 @@ async fn carried_command_retains_progress_after_output_overflows() {
     .await;
     let pid = result["pid"].as_u64().unwrap() as u32;
 
-    for _ in 0..40 {
-        result = wait_by_pid(pid, Some(0.05), context.clone()).await;
-        if result["stdout"]
-            .as_str()
-            .is_some_and(|output| output.ends_with(progress))
-        {
-            break;
-        }
-    }
+    let result = wait_for_stdout(&context, pid, progress).await;
     let killed = kill_by_pid(pid, context).await;
 
     assert_eq!(result["status"], "running");
@@ -215,83 +230,112 @@ async fn cancelling_active_command_wait_kills_process_group() {
 #[tokio::test]
 async fn long_command_can_be_waited_instead_of_interrupted() {
     let context = ToolContext::default();
-    let result = call(
+    let directory = TempDir::new().unwrap();
+    let release = directory.0.join("finish");
+    let started = call(
         Args {
             argv: vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "sleep 0.15; printf done".to_string(),
+                "while [ ! -f \"$1\" ]; do sleep 0.01; done; printf done".to_string(),
+                "sh".to_string(),
+                release.to_str().unwrap().to_string(),
             ],
-            wait_seconds: Some(0.02),
+            wait_seconds: Some(0.0),
         },
         context.clone(),
     )
     .await;
+    let pid = started["pid"].as_u64().unwrap() as u32;
 
-    assert_eq!(result["status"], "running");
-    let pid = result["pid"].as_u64().unwrap() as u32;
+    let wait = wait_by_pid(pid, Some(TEST_TIMEOUT.as_secs_f64()), context.clone());
+    let release = tokio::fs::write(release, []);
+    let (result, released) = tokio::join!(biased; wait, release);
+    context.kill_running_commands().await;
 
-    let result = wait_by_pid(pid, Some(0.3), context).await;
-
+    released.unwrap();
+    assert_eq!(started["status"], "running");
     assert_eq!(result["status"], "finished");
     assert_eq!(result["exitCode"], 0);
     assert_eq!(result["stdout"], "done");
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn running_result_includes_partial_output() {
-    let context = ToolContext::default();
-    let result = call(
+    let (live_output, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let context = ToolContext::default().with_live_output(Some(live_output));
+    let command = call(
         Args {
             argv: vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "printf start; printf err >&2; sleep 999".to_string(),
+                "printf o; printf e >&2; exec sleep 999".to_string(),
             ],
             wait_seconds: Some(0.02),
         },
         context.clone(),
-    )
+    );
+    tokio::pin!(command);
+
+    // Holding the call at its first wait; live output confirms both bytes were captured.
+    let started =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(command.as_mut().poll(cx))).await;
+    assert!(started.is_pending());
+    tokio::time::resume();
+
+    let captured = tokio::time::timeout(TEST_TIMEOUT, async {
+        let _ = observed.recv().await;
+        let _ = observed.recv().await;
+    })
     .await;
+    captured.expect("command did not emit both streams");
+
+    let result = command.await;
+    let pid = result["pid"].as_u64().unwrap() as u32;
+    let killed = kill_by_pid(pid, context).await;
 
     assert_eq!(result["status"], "running");
-    assert_eq!(result["stdout"], "start");
-    assert_eq!(result["stderr"], "err");
-    let pid = result["pid"].as_u64().unwrap() as u32;
-
-    let result = kill_by_pid(pid, context).await;
-    assert_eq!(result["status"], "killed");
+    assert_eq!(result["stdout"], "o");
+    assert_eq!(result["stderr"], "e");
+    assert_eq!(killed["status"], "killed");
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn control_wait_running_result_includes_later_partial_output() {
     let context = ToolContext::default();
-    let result = call(
+    let directory = TempDir::new().unwrap();
+    let release = directory.0.join("write-two");
+    let script = "printf one; while [ ! -f \"$1\" ]; do sleep 0.01; done; \
+                  printf two; exec sleep 999";
+    let started = call(
         Args {
             argv: vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "printf one; sleep 0.2; printf two; sleep 999".to_string(),
+                script.to_string(),
+                "sh".to_string(),
+                release.to_str().unwrap().to_string(),
             ],
-            wait_seconds: Some(0.05),
+            wait_seconds: Some(0.0),
         },
         context.clone(),
     )
     .await;
+    let pid = started["pid"].as_u64().unwrap() as u32;
 
-    assert_eq!(result["status"], "running");
-    assert_eq!(result["stdout"], "one");
-    let pid = result["pid"].as_u64().unwrap() as u32;
+    let first = wait_for_stdout(&context, pid, "one").await;
+    std::fs::write(release, []).unwrap();
+    let later = wait_for_stdout(&context, pid, "onetwo").await;
+    let killed = kill_by_pid(pid, context).await;
 
-    let result = wait_by_pid(pid, Some(0.3), context.clone()).await;
-
-    assert_eq!(result["status"], "running");
-    assert_eq!(result["stdout"], "onetwo");
-
-    let result = kill_by_pid(pid, context).await;
-    assert_eq!(result["status"], "killed");
+    assert_eq!(started["status"], "running");
+    assert_eq!(first["status"], "running");
+    assert_eq!(first["stdout"], "one");
+    assert_eq!(later["status"], "running");
+    assert_eq!(later["stdout"], "onetwo");
+    assert_eq!(killed["status"], "killed");
 }
 
 #[cfg(unix)]
