@@ -1,16 +1,21 @@
 name: Release
 
 on:
-  push:
-    branches: [ main ]
-    paths: [ Cargo.toml ]
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        required: true
 
 concurrency:
   group: publish-please
   queue: max
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-linux-x86_64:
@@ -92,22 +97,13 @@ jobs:
     name: publish release
     needs: [build-linux-x86_64, build-linux-arm64, build-macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-      - name: Read release version
-        id: release_info
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=$(cargo metadata --no-deps --locked --format-version=1 |
-            jq -er '.packages[] | select(.name == "please") | .version')
-          month=$(date -u +%y%m)
-          if [[ ! $version =~ ^${month}\.0\.[1-9][0-9]*$ ]]; then
-            echo "::error::Cargo.toml version $version must use $month.0.n (UTC month, zero minor, positive patch)"
-            exit 1
-          fi
-          printf 'version=%s.%s\n' "$month" "${version##*.}" >> "$GITHUB_OUTPUT"
 
       - name: Download Linux artifact
         uses: actions/download-artifact@v8
@@ -146,7 +142,6 @@ jobs:
       - name: Render Homebrew formula
         shell: bash
         env:
-          RELEASE_VERSION: ${{ steps.release_info.outputs.version }}
           DARWIN_ARM64_SHA: ${{ steps.sums.outputs.sha_darwin_arm64 }}
           LINUX_X86_64_SHA: ${{ steps.sums.outputs.sha_linux_x86_64 }}
           LINUX_ARM64_SHA: ${{ steps.sums.outputs.sha_linux_arm64 }}
@@ -161,23 +156,34 @@ jobs:
             homebrew/Formula/please.rb > tap/Formula/please.rb
 
       - name: Create GitHub release
+        id: publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ steps.release_info.outputs.version }}
         run: |
           set -euo pipefail
           tag="v$RELEASE_VERSION"
+          # Checks can finish out of order. Latest and Homebrew follow the newer version.
+          latest_tag=$(gh api graphql -f owner="${GITHUB_REPOSITORY%/*}" -f name="${GITHUB_REPOSITORY#*/}" -f query='
+            query($owner: String!, $name: String!) {
+              repository(owner: $owner, name: $name) { latestRelease { tagName } }
+            }' --jq '.data.repository.latestRelease.tagName // empty')
+          newest_tag=$(printf '%s\n' "$tag" "$latest_tag" |
+            grep -E '^v[0-9]{4}\.[1-9][0-9]*$' | sort -V | tail -n 1)
+          make_latest=false
+          if [[ "$tag" == "$newest_tag" ]]; then
+            make_latest=true
+          fi
           # Binding the tag first keeps retries on the same commit.
           git push origin "$GITHUB_SHA:refs/tags/$tag"
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "$RELEASE_VERSION" --notes "" --latest \
+            --title "$RELEASE_VERSION" --notes "" --latest="$make_latest" \
             dist/please-darwin-arm64 dist/please-linux-x86_64 dist/please-linux-arm64
+          printf 'latest=%s\n' "$make_latest" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push tap update
+        if: steps.publish.outputs.latest == 'true'
         shell: bash
-        env:
-          RELEASE_VERSION: ${{ steps.release_info.outputs.version }}
         run: |
           set -euo pipefail
           git -C tap config user.name "github-actions[bot]"

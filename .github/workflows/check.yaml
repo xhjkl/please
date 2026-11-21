@@ -5,9 +5,14 @@ on:
     branches: [ main ]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   check:
     name: check (${{ matrix.os }})
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     strategy:
       matrix:
         os: [ ubuntu-latest, xcode-27 ]
@@ -16,6 +21,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -34,3 +41,46 @@ jobs:
 
       - name: Smoke check
         run: cargo run --locked -- --version
+
+      - name: Validate changed package version
+        if: >-
+          runner.os == 'Linux' && (github.base_ref == 'main' ||
+          (github.event_name == 'push' && !github.event.created && !github.event.deleted))
+        id: version
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          package_version() {
+            python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["package"]["version"])'
+          }
+          previous_version=$(git show "$BASE_SHA:Cargo.toml" | package_version)
+          version=$(package_version < Cargo.toml)
+          if [[ "$version" == "$previous_version" ]]; then
+            exit 0
+          fi
+
+          month=$(date -u +%y%m)
+          if [[ ! "$version" =~ ^${month}\.0\.([1-9][0-9]*)$ ]]; then
+            echo "::error::Cargo.toml version $version must use $month.0.n (UTC month, zero minor, positive patch)"
+            exit 1
+          fi
+          release_version="$month.${BASH_REMATCH[1]}"
+          tagged_commit=$(git for-each-ref --format='%(objectname)' "refs/tags/v$release_version")
+          if [[ -n "$tagged_commit" && "$tagged_commit" != "$GITHUB_SHA" ]]; then
+            echo "::error::Release tag v$release_version already exists on another commit"
+            exit 1
+          fi
+          printf 'version=%s\n' "$release_version" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Release
+    needs: check
+    if: github.event_name == 'push' && needs.check.outputs.version != ''
+    uses: ./.github/workflows/release.yaml
+    permissions:
+      contents: write
+    with:
+      version: ${{ needs.check.outputs.version }}
+    secrets:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
