@@ -6,13 +6,13 @@ class Please < Formula
 
   livecheck do
     url :url
-    regex(/\Av(\d{4}\.[1-9]\d*)\z/)
+    regex(/\A(\d{4}\.[1-9]\d*)\z/)
     strategy :github_latest
   end
 
   on_macos do
     on_arm do
-      url "https://github.com/xhjkl/please/releases/download/v#{version}/please-darwin-arm64", using: :nounzip
+      url "https://github.com/xhjkl/please/releases/download/#{version}/please-darwin-arm64", using: :nounzip
       sha256 "¶sha256_darwin_arm64"
     end
 
@@ -23,12 +23,12 @@ class Please < Formula
 
   on_linux do
     on_intel do
-      url "https://github.com/xhjkl/please/releases/download/v#{version}/please-linux-x86_64", using: :nounzip
+      url "https://github.com/xhjkl/please/releases/download/#{version}/please-linux-x86_64", using: :nounzip
       sha256 "¶sha256_linux_x86_64"
     end
 
     on_arm do
-      url "https://github.com/xhjkl/please/releases/download/v#{version}/please-linux-arm64", using: :nounzip
+      url "https://github.com/xhjkl/please/releases/download/#{version}/please-linux-arm64", using: :nounzip
       sha256 "¶sha256_linux_arm64"
     end
   end

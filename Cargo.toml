@@ -1,6 +1,6 @@
 [package]
 name = "please"
-# Use `YYMM.0.n` for Cargo and `vYYMM.n` for release tags.
+# Use `YYMM.0.n` for Cargo and `YYMM.n` for release tags.
 version = "2611.0.1"
 edition = "2024"
 rust-version = "1.99"

@@ -162,21 +162,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="v$RELEASE_VERSION"
           # Checks can finish out of order. Latest and Homebrew follow the newer version.
           latest_tag=$(gh api graphql -f owner="${GITHUB_REPOSITORY%/*}" -f name="${GITHUB_REPOSITORY#*/}" -f query='
             query($owner: String!, $name: String!) {
               repository(owner: $owner, name: $name) { latestRelease { tagName } }
             }' --jq '.data.repository.latestRelease.tagName // empty')
-          newest_tag=$(printf '%s\n' "$tag" "$latest_tag" |
-            grep -E '^v[0-9]{4}\.[1-9][0-9]*$' | sort -V | tail -n 1)
+          newest_version=$(printf '%s\n' "$RELEASE_VERSION" "$latest_tag" |
+            grep -E '^[0-9]{4}\.[1-9][0-9]*$' | sort -V | tail -n 1)
           make_latest=false
-          if [[ "$tag" == "$newest_tag" ]]; then
+          if [[ "$RELEASE_VERSION" == "$newest_version" ]]; then
             make_latest=true
           fi
           # Binding the tag first keeps retries on the same commit.
-          git push origin "$GITHUB_SHA:refs/tags/$tag"
-          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag \
+          git push origin "$GITHUB_SHA:refs/tags/$RELEASE_VERSION"
+          gh release create "$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "$RELEASE_VERSION" --notes "" --latest="$make_latest" \
             dist/please-darwin-arm64 dist/please-linux-x86_64 dist/please-linux-arm64
           printf 'latest=%s\n' "$make_latest" >> "$GITHUB_OUTPUT"

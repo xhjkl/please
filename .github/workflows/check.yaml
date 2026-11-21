@@ -66,9 +66,9 @@ jobs:
             exit 1
           fi
           release_version="$month.${BASH_REMATCH[1]}"
-          tagged_commit=$(git for-each-ref --format='%(objectname)' "refs/tags/v$release_version")
+          tagged_commit=$(git for-each-ref --format='%(objectname)' "refs/tags/$release_version")
           if [[ -n "$tagged_commit" && "$tagged_commit" != "$GITHUB_SHA" ]]; then
-            echo "::error::Release tag v$release_version already exists on another commit"
+            echo "::error::Release tag $release_version already exists on another commit"
             exit 1
           fi
           printf 'version=%s\n' "$release_version" >> "$GITHUB_OUTPUT"
