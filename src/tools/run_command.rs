@@ -145,20 +145,15 @@ async fn wait_for_exit(
     child: &mut tokio::process::Child,
     duration: Duration,
 ) -> std::io::Result<Option<ExitStatus>> {
-    let started = Instant::now();
+    if duration.is_zero() {
+        return child.try_wait();
+    }
 
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-
-        let elapsed = started.elapsed();
-        if elapsed >= duration {
-            return Ok(None);
-        }
-
-        let remaining = duration.saturating_sub(elapsed);
-        tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+    let status = tokio::time::timeout(duration, child.wait()).await;
+    match status {
+        // The child can exit before Tokio delivers its readiness notification.
+        Err(_) => child.try_wait(),
+        Ok(status) => status.map(Some),
     }
 }
 

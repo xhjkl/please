@@ -320,23 +320,18 @@ async fn running_command_can_be_killed_by_pid() {
 #[tokio::test]
 async fn kill_reports_finished_if_command_already_exited() {
     let context = ToolContext::default();
-    let result = call(
-        Args {
-            argv: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "sleep 0.05; printf after".to_string(),
-            ],
-            wait_seconds: Some(0.01),
-        },
-        context.clone(),
-    )
-    .await;
+    let argv = [
+        "sh".to_string(),
+        "-c".to_string(),
+        "printf after".to_string(),
+    ];
+    let mut command = spawn_command(&argv, None).await.unwrap();
+    let pid = command.pid;
+    let status = tokio::time::timeout(Duration::from_secs(5), command.child.wait()).await;
+    assert!(status.expect("child did not exit").unwrap().success());
 
-    assert_eq!(result["status"], "running");
-    let pid = result["pid"].as_u64().unwrap() as u32;
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let commands = context.running_commands();
+    commands.commands.lock().await.insert(pid, command);
 
     let result = kill_by_pid(pid, context).await;
 
