@@ -6,7 +6,8 @@ All inference stays local.
 *The name is chosen so that the invocation reads like a natural-language phrase.*
 
 <picture>
-  <source media="(max-width: 900px)" srcset="./assets/please-demo-narrow.webp">
+  <source media="(max-width: 900px)" srcset="./assets/please-demo-narrow.webp 3x">
+  <source srcset="./assets/please-demo.webp 2x">
   <img src="./assets/please-demo.webp" alt="Please writes a commit message from a staged Git diff, creates a Bun script, and finds a server setting.">
 </picture>
 
