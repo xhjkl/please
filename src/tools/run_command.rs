@@ -378,8 +378,7 @@ async fn spawn_command(
 
     let mut child = cmd.spawn()?;
     let Some(pid) = child.id() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "spawned command did not expose a pid",
         ));
     };
@@ -499,7 +498,7 @@ pub async fn kill_by_pid(pid: u32, context: ToolContext) -> serde_json::Value {
         Err(error) => return json!({ "error": error.to_string() }),
     }
 
-    interrupt_child(&mut command.child);
+    interrupt_child(&command.child);
     let status = match wait_for_exit(&mut command.child, INTERRUPT_GRACE).await {
         Ok(status) => status,
         Err(error) => return json!({ "error": error.to_string() }),
@@ -531,26 +530,24 @@ pub async fn call(args: Args, context: ToolContext) -> serde_json::Value {
     start_command(args.argv, wait_for, commands, context.live_output()).await
 }
 
-pub fn spec() -> (&'static str, &'static str, Vec<Param>) {
-    (
-        NAME,
-        "Start a command by argv. Output keeps each stream's latest bytes, with earlier omitted bytes counted. Commands still running after waitSeconds, default 40, return their pid instead of being interrupted.",
-        vec![
-            Param {
-                name: "argv",
-                desc: "Argument vector for a new command: [program, ...args]",
-                param_type: ParamType::String,
-                required: true,
-            },
-            Param {
-                name: "waitSeconds",
-                desc: "Seconds to wait before returning control to the model; defaults to 40",
-                param_type: ParamType::Number,
-                required: false,
-            },
-        ],
-    )
-}
+pub const SPEC: (&str, &str, &[Param]) = (
+    NAME,
+    "Start a command by argv. Output keeps each stream's latest bytes, with earlier omitted bytes counted. Commands still running after waitSeconds, default 40, return their pid instead of being interrupted.",
+    &[
+        Param {
+            name: "argv",
+            desc: "Argument vector for a new command: [program, ...args]",
+            param_type: ParamType::StringArray,
+            required: true,
+        },
+        Param {
+            name: "waitSeconds",
+            desc: "Seconds to wait before returning control to the model; defaults to 40",
+            param_type: ParamType::Number,
+            required: false,
+        },
+    ],
+);
 
 #[cfg(test)]
 mod tests;

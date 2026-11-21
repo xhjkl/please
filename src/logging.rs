@@ -27,12 +27,14 @@ async fn pump(
 
 /// Route tracing logs into the display renderer.
 pub fn setup_tracing_display_logger(display: Arc<crate::display::Display>) {
-    gg::send_logs_to_tracing(gg::LogOptions::default().with_logs_enabled(true));
-
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     tokio::spawn(pump(rx, display));
 
+    // Showing info by default; RUST_LOG can raise it, e.g. `please=debug` for session reuse.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
         .with_ansi(false)
         .without_time()
         .with_file(false)

@@ -1,20 +1,15 @@
-//! The hub is a background process that hosts the inference engine and accepts requests from the CLI.
-use eyre::{Result, eyre};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+//! Own model selection, loading, framing, and inference behind the socket protocol.
+//! The probe executes tools; even an embedded hub serves it over a Unix socket pair.
+//! Only Apple Silicon builds carry a hub; others are probes for a forwarded one.
 
-use crate::harmony::{HarmonyAdapter, HarmonyDelta};
-use crate::inference;
-use crate::protocol::Message;
-use crate::protocol::{Frame, ProtocolError, read_frame_from_stream, write_frame_to_stream};
+/// Why a probe-only build cannot do what needs a local hub.
+pub const UNSUPPORTED: &str =
+    "local inference requires Apple Silicon macOS; connect to a forwarded please hub";
 
-/// Loaded backend and model; shared across connections.
-struct Hub {
-    backend: gg::llama_backend::LlamaBackend,
-    model: gg::model::LlamaModel,
-}
+/// No usable checkpoint is installed; the probe answers it with onboarding.
+#[derive(Debug, thiserror::Error)]
+#[error("no supported local weights found; run `please load`")]
+pub struct NoWeights;
 
 /// Default UNIX socket location under `~/.please/socket`.
 pub fn socket_path() -> std::path::PathBuf {
@@ -22,232 +17,50 @@ pub fn socket_path() -> std::path::PathBuf {
     std::path::Path::new(&home).join(".please").join("socket")
 }
 
-/// Ensure the socket directory exists and is private (0700 on Unix).
-pub fn ensure_socket_dir(path: &std::path::Path) -> Result<()> {
-    use std::fs;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(dir)?.permissions();
-            perms.set_mode(0o700);
-            fs::set_permissions(dir, perms)?;
-        }
-    }
-    Ok(())
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod benchmark;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod dialect;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod discovery;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod download;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod inference;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod intuition;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod local;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod occupancy;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod preamble;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use benchmark::run as benchmark;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use discovery::weights_dir;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use download::run_download as load_weights;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use local::{run, spawn};
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub async fn run() -> eyre::Result<()> {
+    Err(eyre::eyre!(UNSUPPORTED))
 }
 
-/// Remove a pre-existing socket file, erroring if a non-socket exists there.
-pub fn cleanup_stale_socket(path: &std::path::Path) -> Result<()> {
-    use std::fs;
-    match fs::symlink_metadata(path) {
-        Ok(meta) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::FileTypeExt;
-                if meta.file_type().is_socket() {
-                    let _ = fs::remove_file(path);
-                } else {
-                    return Err(eyre!(
-                        "hub: path exists but is not a socket: {}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        Err(err) => {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                return Err(err.into());
-            }
-        }
-    }
-    Ok(())
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub async fn spawn(_model_path: Option<&str>) -> eyre::Result<tokio::net::UnixStream> {
+    Err(eyre::eyre!(UNSUPPORTED))
 }
 
-/// Run streaming inference and forward deltas to the sink.
-async fn serve_one_turn(
-    sink: &mut (impl AsyncWriteExt + Unpin),
-    hub: Arc<Hub>,
-    history: &[Message],
-) -> Result<()> {
-    let harmony = HarmonyAdapter::gpt_oss()?;
-    let mut parser = harmony.output_parser()?;
-    let (generated_tx, mut generated_rx) =
-        tokio::sync::mpsc::unbounded_channel::<inference::Generated>();
-
-    let history = history.to_owned();
-    let also_hub = hub.clone();
-    let inference = tokio::task::spawn_blocking(move || {
-        inference::generate_tokens_into_stream(
-            &also_hub.backend,
-            &also_hub.model,
-            &history,
-            generated_tx,
-        )
-    });
-
-    while let Some(event) = generated_rx.recv().await {
-        match event {
-            inference::Generated::Token(token) => {
-                let Some(delta) = parser.push_token(token)? else {
-                    continue;
-                };
-                match delta {
-                    HarmonyDelta::Answer(text) => {
-                        write_frame_to_stream(sink, &Frame::Answer(text)).await?;
-                    }
-                    HarmonyDelta::Thinking(text) => {
-                        write_frame_to_stream(sink, &Frame::Thinking(text)).await?;
-                    }
-                }
-            }
-            inference::Generated::Stop => break,
-        }
-    }
-
-    inference.await.map_err(|e| eyre!(e))??;
-    match parser.finish() {
-        Ok(calls) => {
-            for call in calls {
-                write_frame_to_stream(
-                    sink,
-                    &Frame::ToolCall {
-                        name: call.name,
-                        arguments_json: serde_json::to_string(&call.arguments)?,
-                    },
-                )
-                .await?;
-            }
-        }
-        Err(error) => {
-            write_frame_to_stream(sink, &Frame::ToolCallParseError(error.to_string())).await?;
-        }
-    }
-    write_frame_to_stream(sink, &Frame::Stop).await?;
-
-    Ok(())
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub async fn benchmark(_model_path: &str, _cases_path: &str) -> eyre::Result<()> {
+    Err(eyre::eyre!(UNSUPPORTED))
 }
 
-/// Read a complete request within the frame deadline.
-async fn read_request(
-    stream: &mut UnixStream,
-    store: &mut Vec<u8>,
-) -> std::result::Result<Frame, ProtocolError> {
-    let per_read_timeout = Some(Duration::from_millis(250));
-    let total_timeout = Some(Duration::from_secs(30));
-    read_frame_from_stream(stream, store, per_read_timeout, total_timeout).await
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub async fn load_weights(_which: Option<&str>) -> eyre::Result<()> {
+    Err(eyre::eyre!(UNSUPPORTED))
 }
-
-/// Wait for another request, allowing the client to run tools before sending it.
-async fn wait_for_request(
-    stream: &mut UnixStream,
-    store: &mut Vec<u8>,
-) -> std::result::Result<Frame, ProtocolError> {
-    if store.is_empty() {
-        // Starting the frame deadline only after data arrives; tool waits can be arbitrarily long.
-        let mut byte = [0];
-        let read = stream.read(&mut byte).await.map_err(ProtocolError::Io)?;
-        if read == 0 {
-            return Err(ProtocolError::Disconnect);
-        }
-        store.extend_from_slice(&byte);
-    }
-
-    read_request(stream, store).await
-}
-
-/// Serve a long-lived client connection, handling multiple turns per session.
-async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Hub>) -> Result<()> {
-    tracing::info!("hub: connection accepted");
-
-    let mut store = Vec::with_capacity(4096);
-    let mut request = read_request(stream, &mut store).await;
-
-    loop {
-        let frame = match request {
-            Err(ProtocolError::Disconnect) => return Ok(()),
-            Err(e) => return Err(eyre!(e)),
-            Ok(frame) => frame,
-        };
-
-        tracing::info!("hub: received inference request");
-
-        let history = match frame {
-            Frame::Request { messages } => messages,
-            _ => return Err(eyre!("bad request: {frame:?}")),
-        };
-
-        serve_one_turn(stream, hub.clone(), &history).await?;
-        request = wait_for_request(stream, &mut store).await;
-    }
-}
-
-/// Hub main loop: bind socket, load model once, accept clients forever.
-pub async fn run() -> Result<()> {
-    let socket_path = socket_path();
-    ensure_socket_dir(&socket_path)?;
-    cleanup_stale_socket(&socket_path)?;
-
-    let listener = UnixListener::bind(&socket_path)?;
-    tracing::info!("hub: listening at {}", socket_path.display());
-
-    // Load model once and accept connections in a loop.
-    let model_path = crate::cli::choose_best_qwen();
-    let model_path = match model_path {
-        Some(model_path) => Some(model_path),
-        None => crate::cli::choose_best_gpt(),
-    };
-    let Some(model_path) = model_path else {
-        return Err(eyre!("hub: no model found"));
-    };
-    let model_path = model_path.to_string_lossy().to_string();
-    tracing::info!(%model_path, "hub: selected model");
-    let (backend, model) = crate::inference::load_model(&model_path)?;
-    let hub = Arc::new(Hub { backend, model });
-
-    tracing::info!("hub: model loaded");
-
-    loop {
-        let (mut stream, _addr) = listener.accept().await?;
-        let hub = hub.clone();
-        tokio::spawn(async move {
-            let served = accept_and_serve_request(&mut stream, hub).await;
-            if let Err(e) = served {
-                let _ = stream.shutdown().await;
-                tracing::error!("hub: connection error: {e}");
-            }
-        });
-    }
-}
-
-/// Convenience for in-process use: serve a single client over a UnixStream pair.
-pub async fn spawn() -> Result<UnixStream> {
-    // Load model once and serve a single request over an in-process stream pair.
-    let model_path = crate::cli::choose_best_qwen();
-    let model_path = match model_path {
-        Some(model_path) => Some(model_path),
-        None => crate::cli::choose_best_gpt(),
-    };
-    let Some(model_path) = model_path else {
-        return Err(eyre!("hub: no model found"));
-    };
-    tracing::info!(model_path=%model_path.display(), "hub: selected model");
-    let model_path = model_path.to_string_lossy().to_string();
-    let (backend, model) = crate::inference::load_model(&model_path)?;
-    let hub = Hub { backend, model };
-
-    let (probe_end, mut hub_end) = UnixStream::pair()?;
-    tokio::spawn(async move {
-        let served = accept_and_serve_request(&mut hub_end, Arc::new(hub)).await;
-        if let Err(e) = served {
-            let _ = hub_end.shutdown().await;
-            tracing::error!("hub: connection error: {e}");
-        }
-    });
-
-    Ok(probe_end)
-}
-
-#[cfg(test)]
-mod tests;

@@ -48,17 +48,22 @@ impl Default for ToolContext {
     }
 }
 
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone)]
 pub enum ParamType {
     String,
-    #[allow(dead_code)]
+    StringArray,
     Choice(&'static [&'static str]),
-    #[allow(dead_code)]
     Number,
-    #[allow(dead_code)]
-    Boolean,
 }
 
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 #[derive(Clone)]
 pub struct Param {
     pub name: &'static str,

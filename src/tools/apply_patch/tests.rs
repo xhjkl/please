@@ -83,7 +83,7 @@ fn pure_parse_and_apply_update() {
         } => {
             assert_eq!(path, "text.text");
             assert!(!no_newline);
-            let out = apply_all_hunks("a\n", &hunks).unwrap();
+            let out = apply_all_hunks("a\n", hunks).unwrap();
             assert_eq!(out, "b\n");
         }
         _ => panic!("expected update"),

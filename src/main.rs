@@ -3,14 +3,12 @@ use eyre::Result;
 
 mod cli;
 mod display;
-mod harmony;
 mod history;
 mod hub;
-mod inference;
-mod intuition;
 mod logging;
-mod prompting;
 mod protocol;
+#[cfg(test)]
+mod test_support;
 mod tools;
 
 #[tokio::main]

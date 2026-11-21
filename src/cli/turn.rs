@@ -8,16 +8,9 @@ use crate::tools::{ToolContext, ToolKind, all_tools, kind_of, summarize_patch_fo
 
 use super::connect::obtain_control_stream;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("turn cancelled")]
 pub struct TurnCancelled;
-
-impl std::fmt::Display for TurnCancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "turn cancelled")
-    }
-}
-
-impl std::error::Error for TurnCancelled {}
 
 pub fn is_cancelled(error: &eyre::Report) -> bool {
     error.downcast_ref::<TurnCancelled>().is_some()
@@ -52,15 +45,18 @@ pub async fn attempt_turn_on_stream(
         let running_command_pids = context.running_command_pids().await;
         let must_settle_command = !running_command_pids.is_empty();
 
-        // Send full structured message history to the hub for this subturn.
-        let mut request_messages = messages.clone();
+        // Recording the reminder keeps history append-only, so the hub's session stays reusable;
+        // a retried subturn finds it already recorded.
         if must_settle_command {
-            request_messages.push(Message::Developer(settle_command_prompt(
-                &running_command_pids,
-            )));
+            let reminder = settle_command_prompt(&running_command_pids);
+            let recorded =
+                matches!(messages.last(), Some(Message::Developer(text)) if *text == reminder);
+            if !recorded {
+                messages.push(Message::Developer(reminder));
+            }
         }
         let req = Frame::Request {
-            messages: request_messages,
+            messages: messages.clone(),
         };
         let body = postcard::to_allocvec(&req).map_err(|e| eyre!(e))?;
         stream.write_all(&body).await?;
@@ -136,14 +132,27 @@ pub async fn attempt_turn_on_stream(
                     *reconnect_attempts = 0;
                     break;
                 }
-                Frame::Request { .. } => {}
+                Frame::Error(error) => return Err(eyre!(error)),
+                Frame::Request { .. }
+                | Frame::ModelInfoRequest
+                | Frame::ModelInfo { .. }
+                | Frame::BenchmarkRequest { .. }
+                | Frame::BenchmarkResult(_)
+                | Frame::Hello { .. }
+                | Frame::Welcome
+                | Frame::Busy => {
+                    return Err(eyre!("unexpected hub frame: {frame:?}"));
+                }
             }
         }
 
         if matches!(phase, Phase::Thinking) {
             let _ = display.end_thinking().await;
         }
-        let _ = display.end_answer().await;
+        // Ending only a streamed answer keeps tool-only subturns from adding blank stdout lines.
+        if !answer.is_empty() && !must_settle_command {
+            let _ = display.end_answer().await;
+        }
 
         let missing_required_control = must_settle_command
             && !calls
@@ -252,11 +261,12 @@ pub async fn attempt_turn_on_stream(
 /// Run a single turn while tapping the answer stream to collect a full string.
 /// Send a prompt to the hub and multiplex streamed frames to display channels.
 /// This may reconnect to the hub if the connection is lost.
-/// Returns the final answer string.
+/// Reasoning, tool exchanges, and the answer are appended to `messages`, so the next turn's
+/// history extends exactly what the hub already consumed. Returns the final answer string.
 pub async fn run_turn(
     stream: &mut UnixStream,
     display: Arc<Display>,
-    messages: Vec<Message>,
+    messages: &mut Vec<Message>,
 ) -> Result<String> {
     use std::time::Duration;
     fn is_disconnect(e: &eyre::Report) -> bool {
@@ -275,12 +285,11 @@ pub async fn run_turn(
 
     let max_reconnect_attempts = 6;
     let mut reconnect_attempts = 0;
-    let mut messages = messages;
     let context = ToolContext::default();
 
     loop {
         let result = attempt_turn_on_stream(
-            &mut messages,
+            messages,
             context.clone(),
             stream,
             &mut reconnect_attempts,
@@ -317,7 +326,7 @@ fn settle_command_prompt(pids: &[u32]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "Command pid(s) {pids} are still running. Call {} now with action=\"wait\" or action=\"kill\"; do not answer final.",
+        "Command pid(s) {pids} are still running. Call {} now with action=\"wait\" or action=\"kill\"; do not answer the user yet.",
         crate::tools::CONTROL_COMMAND_NAME
     )
 }

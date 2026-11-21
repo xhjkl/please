@@ -28,8 +28,8 @@ $ please load
 
 And, optionally, verify them:
 ```
-$ sha256sum ~/.please/weights/gpt-oss-20b-mxfp4.gguf
-be37a636aca0fc1aae0d32325f82f6b4d21495f06823b5fbc1898ae0303e9935
+$ (cd ~/.please/weights && sha256sum Qwen3.8-27B-Q4_0.gguf)
+ede16c7b36e578ca87a8c70e011e4b4633a32c831c0ce76d0f474582384e671d  Qwen3.8-27B-Q4_0.gguf
 ```
 
 # Usage

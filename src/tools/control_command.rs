@@ -29,29 +29,27 @@ pub async fn call(args: Args, context: ToolContext) -> serde_json::Value {
     }
 }
 
-pub fn spec() -> (&'static str, &'static str, Vec<Param>) {
-    (
-        NAME,
-        "Control a command that run_command left running.",
-        vec![
-            Param {
-                name: "pid",
-                desc: "Process id returned by run_command",
-                param_type: ParamType::Number,
-                required: true,
-            },
-            Param {
-                name: "action",
-                desc: "Whether to wait longer or stop the command",
-                param_type: ParamType::Choice(&["wait", "kill"]),
-                required: true,
-            },
-            Param {
-                name: "waitSeconds",
-                desc: "Seconds to wait before returning control to the model; defaults to 40",
-                param_type: ParamType::Number,
-                required: false,
-            },
-        ],
-    )
-}
+pub const SPEC: (&str, &str, &[Param]) = (
+    NAME,
+    "Control a command that run_command left running.",
+    &[
+        Param {
+            name: "pid",
+            desc: "Process id returned by run_command",
+            param_type: ParamType::Number,
+            required: true,
+        },
+        Param {
+            name: "action",
+            desc: "Whether to wait longer or stop the command",
+            param_type: ParamType::Choice(&["wait", "kill"]),
+            required: true,
+        },
+        Param {
+            name: "waitSeconds",
+            desc: "Seconds to wait before returning control to the model; defaults to 40",
+            param_type: ParamType::Number,
+            required: false,
+        },
+    ],
+);

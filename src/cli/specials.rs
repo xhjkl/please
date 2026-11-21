@@ -1,7 +1,5 @@
 use eyre::Result;
 
-mod download;
-
 /// Handle special one-shot CLI commands like `--help`, `--version`, or `load`.
 /// Returns true if a special action was handled and the program should exit.
 pub async fn handle_specials_if_needed() -> Result<bool> {
@@ -19,11 +17,23 @@ pub async fn handle_specials_if_needed() -> Result<bool> {
                 "  $ please fix all clippy diagnostics\n"
             )
         );
+        println!(
+            "  $ please load       Download the largest dense Qwen that fits\n  $ please version    Show the engine and weights\n"
+        );
         return Ok(true);
     }
 
     if matches!(arg.as_str(), "version" | "--version" | "-V" | "-v") {
         println!("{}", env!("CARGO_PKG_VERSION"));
+        print_model().await?;
+        return Ok(true);
+    }
+
+    if matches!(arg.as_str(), "bench") {
+        let (Some(model), Some(cases), None) = (args.next(), args.next(), args.next()) else {
+            eyre::bail!("usage: please bench MODEL.gguf CASES.json");
+        };
+        crate::hub::benchmark(&model, &cases).await?;
         return Ok(true);
     }
 
@@ -54,10 +64,89 @@ pub async fn handle_specials_if_needed() -> Result<bool> {
 
     if matches!(arg.as_str(), "load" | "download") {
         let which = args.next();
-        download::run_download(which.as_deref()).await?;
+        if args.next().is_some() {
+            eyre::bail!("usage: please load [qwen]");
+        }
+        crate::hub::load_weights(which.as_deref()).await?;
         return Ok(true);
     }
 
     // Otherwise, not a special
     Ok(false)
+}
+
+/// Report a connected hub's actual checkpoint; without one, say where a new hub would look,
+/// without opening Metal or reading any checkpoint.
+async fn print_model() -> Result<()> {
+    use crate::protocol::{Frame, read_frame_from_stream, write_frame_to_stream};
+    let socket = crate::hub::socket_path();
+    let connected = super::connect::try_connect_to_hub(&socket).await;
+    match connected {
+        Err(
+            super::connect::ConnectError::Missing { .. }
+            | super::connect::ConnectError::NoListener { .. },
+        ) => {}
+        Err(error) => return Err(error.into()),
+        Ok(mut stream) => {
+            write_frame_to_stream(&mut stream, &Frame::ModelInfoRequest).await?;
+            let mut buffer = Vec::new();
+            let response = read_frame_from_stream::<Frame>(
+                &mut stream,
+                &mut buffer,
+                Some(std::time::Duration::from_millis(250)),
+                Some(std::time::Duration::from_secs(2)),
+            )
+            .await;
+            match response {
+                Ok(Frame::ModelInfo { engine, path }) => {
+                    println!("Engine: {engine}\nWeights (running hub): {path}")
+                }
+                _ => println!(
+                    "Weights: connected hub does not report its model; restart it with this version of please"
+                ),
+            }
+            return Ok(());
+        }
+    }
+    print_local_selection(&socket);
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn print_local_selection(_socket: &std::path::Path) {
+    println!("Engine: Oco");
+    if let Some(path) = std::env::var_os("PLEASE_MODEL") {
+        println!(
+            "Weights (PLEASE_MODEL): {}",
+            std::path::Path::new(&path).display()
+        );
+        return;
+    }
+    let directory = crate::hub::weights_dir();
+    let mut names: Vec<_> = std::fs::read_dir(&directory)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".gguf"))
+        .collect();
+    names.sort();
+    match names.is_empty() {
+        true => println!(
+            "Weights: none in {}; run `please load`",
+            directory.display()
+        ),
+        false => println!(
+            "Weights in {}: {}\nA new hub loads the largest dense Qwen that fits, else gpt-oss.",
+            directory.display(),
+            names.join(", ")
+        ),
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn print_local_selection(socket: &std::path::Path) {
+    println!(
+        "Engine: none in this build; no hub is listening at {}",
+        socket.display()
+    );
 }

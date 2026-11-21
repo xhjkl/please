@@ -57,14 +57,14 @@ pub fn summarize_patch_for_preview(raw: &str) -> Option<String> {
                             out.push('\n');
                         }
                     }
-                    for i in n..h.old_lines.len() {
+                    for line in &h.old_lines[n..] {
                         out.push('-');
-                        out.push_str(&h.old_lines[i]);
+                        out.push_str(line);
                         out.push('\n');
                     }
-                    for i in n..h.new_lines.len() {
+                    for line in &h.new_lines[n..] {
                         out.push('+');
-                        out.push_str(&h.new_lines[i]);
+                        out.push_str(line);
                         out.push('\n');
                     }
                     out.push('\n');

@@ -81,23 +81,21 @@ pub async fn call(args: Args, _context: ToolContext) -> serde_json::Value {
     serde_json::json!(out)
 }
 
-pub fn spec() -> (&'static str, &'static str, Vec<Param>) {
-    (
-        "list_files",
-        "List files under a path recursively with optional depth",
-        vec![
-            Param {
-                name: "path",
-                desc: "Root path; defaults to current directory",
-                param_type: ParamType::String,
-                required: false,
-            },
-            Param {
-                name: "max_depth",
-                desc: "Max recursion depth; default 0, just the given directory",
-                param_type: ParamType::Number,
-                required: false,
-            },
-        ],
-    )
-}
+pub const SPEC: (&str, &str, &[Param]) = (
+    "list_files",
+    "List files under a path recursively with optional depth",
+    &[
+        Param {
+            name: "path",
+            desc: "Root path; defaults to current directory",
+            param_type: ParamType::String,
+            required: false,
+        },
+        Param {
+            name: "max_depth",
+            desc: "Max recursion depth; default 0, just the given directory",
+            param_type: ParamType::Number,
+            required: false,
+        },
+    ],
+);

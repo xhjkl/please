@@ -48,26 +48,24 @@ pub async fn call(args: Args, _context: ToolContext) -> serde_json::Value {
     }
 }
 
-pub fn spec() -> (&'static str, &'static str, Vec<Param>) {
-    (
-        NAME,
-        "Apply edits via OpenAI-style patch markers or overwrite without markers. Patch format: wrap ops between '*** Begin Patch' and '*** End Patch'; each op starts with '*** Update File:', '*** Add File:' or '*** Delete File:'. Update bodies use + / - / space prefixes and optional @@ separators; add bodies are raw file content. Append a 'No newline at end of file' comment line to suppress trailing newline. Without markers, requires `path` and overwrites verbatim.",
-        vec![
-            Param {
-                name: "path",
-                desc: "Target file path for simple overwrite (ignored for patch mode)",
-                param_type: ParamType::String,
-                required: false,
-            },
-            Param {
-                name: "patch",
-                desc: "Either raw content (overwrite) or an OpenAI patch",
-                param_type: ParamType::String,
-                required: true,
-            },
-        ],
-    )
-}
+pub const SPEC: (&str, &str, &[Param]) = (
+    NAME,
+    "Apply edits via OpenAI-style patch markers or overwrite without markers. Patch format: wrap ops between '*** Begin Patch' and '*** End Patch'; each op starts with '*** Update File:', '*** Add File:' or '*** Delete File:'. Update bodies use + / - / space prefixes and optional @@ separators; add bodies are raw file content. Append a 'No newline at end of file' comment line to suppress trailing newline. Without markers, requires `path` and overwrites verbatim.",
+    &[
+        Param {
+            name: "path",
+            desc: "Target file path for simple overwrite (ignored for patch mode)",
+            param_type: ParamType::String,
+            required: false,
+        },
+        Param {
+            name: "patch",
+            desc: "Either raw content (overwrite) or an OpenAI patch",
+            param_type: ParamType::String,
+            required: true,
+        },
+    ],
+);
 
 #[cfg(test)]
 mod tests;

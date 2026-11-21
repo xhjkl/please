@@ -1,6 +1,50 @@
 use super::*;
 use tokio::io::AsyncWriteExt;
 
+#[tokio::test]
+async fn starting_hub_preserves_a_live_forwarding_socket() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let directory = crate::test_support::TempDir::new()?;
+    let path = directory.0.join("socket");
+    let listener = UnixListener::bind(&path)?;
+    let original = std::fs::metadata(&path)?;
+
+    let bound = bind_listener(&path).await;
+    assert!(bound.is_err());
+    let current = std::fs::metadata(&path)?;
+    assert_eq!(current.ino(), original.ino());
+    let _probe = UnixStream::connect(&path).await?;
+    let _connection = listener.accept().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn socket_lock_excludes_second_hub_and_allows_stale_recovery() -> Result<()> {
+    let directory = crate::test_support::TempDir::new()?;
+    let path = directory.0.join("socket");
+    let first = bind_listener(&path).await?;
+    let second = bind_listener(&path).await;
+    assert!(second.is_err());
+    drop(first);
+
+    let (listener, _lock) = bind_listener(&path).await?;
+    let _probe = UnixStream::connect(&path).await?;
+    let _connection = listener.accept().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn starting_hub_preserves_a_regular_file_at_the_socket_path() -> Result<()> {
+    let directory = crate::test_support::TempDir::new()?;
+    let path = directory.0.join("socket");
+    std::fs::write(&path, "keep this file")?;
+    let bound = bind_listener(&path).await;
+    assert!(bound.is_err());
+    let content = std::fs::read_to_string(path)?;
+    assert_eq!(content, "keep this file");
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn established_connection_survives_long_tool_waits() {
     let (mut client, mut server) = UnixStream::pair().unwrap();

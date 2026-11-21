@@ -3,6 +3,11 @@ name: Release
 on:
   push:
     branches: [ main ]
+    paths: [ Cargo.toml ]
+
+concurrency:
+  group: publish-please
+  queue: max
 
 permissions:
   contents: write
@@ -14,10 +19,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # - name: Setup CUDA
-      #   uses: Jimver/cuda-toolkit@v0.2.28
-      #   with:
-      #     cuda: '12.2.0'
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -66,13 +67,15 @@ jobs:
 
   build-macos:
     name: macos
-    runs-on: macos-latest
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+      - name: Install Metal toolchain
+        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
       - name: Build
         run: cargo build --release --locked
       - name: Prepare artifact
@@ -92,6 +95,20 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+      - name: Read release version
+        id: release_info
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --locked --format-version=1 |
+            jq -er '.packages[] | select(.name == "please") | .version')
+          month=$(date -u +%y%m)
+          if [[ ! $version =~ ^${month}\.0\.[1-9][0-9]*$ ]]; then
+            echo "::error::Cargo.toml version $version must use $month.0.n (UTC month, zero minor, positive patch)"
+            exit 1
+          fi
+          printf 'version=%s.%s\n' "$month" "${version##*.}" >> "$GITHUB_OUTPUT"
+
       - name: Download Linux artifact
         uses: actions/download-artifact@v8
         with:
@@ -107,24 +124,6 @@ jobs:
         with:
           name: please-darwin-arm64
           path: dist
-      - name: Compute ephemeral tag
-        id: tag
-        run: |
-          echo "tag=ci-$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
-
-      - name: Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: Latest
-          prerelease: false
-          make_latest: true
-          files: |
-            dist/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Compute artifact checksums
         id: sums
         shell: bash
@@ -146,19 +145,39 @@ jobs:
 
       - name: Render Homebrew formula
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release_info.outputs.version }}
+          DARWIN_ARM64_SHA: ${{ steps.sums.outputs.sha_darwin_arm64 }}
+          LINUX_X86_64_SHA: ${{ steps.sums.outputs.sha_linux_x86_64 }}
+          LINUX_ARM64_SHA: ${{ steps.sums.outputs.sha_linux_arm64 }}
         run: |
           set -euo pipefail
           mkdir -p tap/Formula
-          cp homebrew/Formula/please.rb tap/Formula/please.rb
-          # Substitute pilcrow tokens
-          sed -i \
-            -e "s|¶version|${{ steps.tag.outputs.tag }}|g" \
-            -e "s|¶sha256_darwin_arm64|${{ steps.sums.outputs.sha_darwin_arm64 }}|g" \
-            -e "s|¶sha256_linux_x86_64|${{ steps.sums.outputs.sha_linux_x86_64 }}|g" \
-            -e "s|¶sha256_linux_arm64|${{ steps.sums.outputs.sha_linux_arm64 }}|g" tap/Formula/please.rb
+          sed \
+            -e "s|¶version|$RELEASE_VERSION|g" \
+            -e "s|¶sha256_darwin_arm64|$DARWIN_ARM64_SHA|g" \
+            -e "s|¶sha256_linux_x86_64|$LINUX_X86_64_SHA|g" \
+            -e "s|¶sha256_linux_arm64|$LINUX_ARM64_SHA|g" \
+            homebrew/Formula/please.rb > tap/Formula/please.rb
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.release_info.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$RELEASE_VERSION"
+          # Binding the tag first keeps retries on the same commit.
+          git push origin "$GITHUB_SHA:refs/tags/$tag"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$RELEASE_VERSION" --notes "" --latest \
+            dist/please-darwin-arm64 dist/please-linux-x86_64 dist/please-linux-arm64
 
       - name: Commit and push tap update
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.release_info.outputs.version }}
         run: |
           set -euo pipefail
           git -C tap config user.name "github-actions[bot]"
@@ -168,5 +187,5 @@ jobs:
             echo "No changes to commit"
             exit 0
           fi
-          git -C tap commit -m "please: bump to ${{ steps.tag.outputs.tag }}"
-          git -C tap push origin HEAD:main --force-with-lease
+          git -C tap commit -m "please: bump to $RELEASE_VERSION"
+          git -C tap push origin HEAD:main

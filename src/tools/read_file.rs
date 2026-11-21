@@ -29,23 +29,21 @@ pub async fn call(args: Args, _context: ToolContext) -> serde_json::Value {
     }
 }
 
-pub fn spec() -> (&'static str, &'static str, Vec<Param>) {
-    (
-        "read_file",
-        "Read a file's content with a byte limit",
-        vec![
-            Param {
-                name: "path",
-                desc: "Absolute or relative path to file",
-                param_type: ParamType::String,
-                required: true,
-            },
-            Param {
-                name: "max_bytes",
-                desc: "Maximum number of bytes to read; default 524288",
-                param_type: ParamType::Number,
-                required: false,
-            },
-        ],
-    )
-}
+pub const SPEC: (&str, &str, &[Param]) = (
+    "read_file",
+    "Read a file's content with a byte limit",
+    &[
+        Param {
+            name: "path",
+            desc: "Absolute or relative path to file",
+            param_type: ParamType::String,
+            required: true,
+        },
+        Param {
+            name: "max_bytes",
+            desc: "Maximum number of bytes to read; default 524288",
+            param_type: ParamType::Number,
+            required: false,
+        },
+    ],
+);

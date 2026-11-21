@@ -5,11 +5,14 @@ use crate::cli::io;
 use crate::cli::specials;
 use crate::display;
 use crate::history;
-use crate::protocol::Message;
+use crate::protocol::{HubBusy, Message};
 
 use super::connect::obtain_control_stream;
 use super::repl::interact_forever;
 use super::turn::run_turn;
+
+/// sysexits' temporary failure: the user is invited to retry later.
+const EX_TEMPFAIL: i32 = 75;
 
 /// Initialize the UI pipeline and spawn the renderer.
 /// Returns channels the rest of the app can use to stream status and content.
@@ -37,7 +40,7 @@ pub async fn run() -> Result<()> {
     let stdout_redirection_path =
         (!stdout_is_tty).then(|| io::stdout_redirection_path().unwrap_or_default());
     let stdin_content = io::read_whole_stdin()?;
-    let mut history = history::make_history(stdin_content, stdout_redirection_path);
+    let history = history::make_history(stdin_content, stdout_redirection_path);
 
     // Build prompt from positional CLI args; if none provided, leave empty to enable REPL.
     // Collect positional args into a single prompt. If none provided, drop into REPL.
@@ -48,28 +51,45 @@ pub async fn run() -> Result<()> {
         collected
     };
 
-    // Connect to the hub, maybe starting a new hub process if necessary.
+    // Step into interactive mode only when both stdout and stderr are teletype devices and the user provided no prompt.
+    let interactive = stdout_is_tty && stderr_is_tty && stdin_is_tty && prompt.is_empty();
+    match converse(display, history, prompt, interactive).await {
+        // Stepping aside for the probe the hub serves: nothing changes until that one exits.
+        Err(error) if error.downcast_ref::<HubBusy>().is_some() => {
+            eprintln!("please: {error}");
+            std::process::exit(EX_TEMPFAIL);
+        }
+        conversed => conversed,
+    }
+}
+
+/// Connect to the hub, maybe starting a new hub process, and hold the conversation.
+async fn converse(
+    display: Arc<display::Display>,
+    mut history: Vec<Message>,
+    prompt: String,
+    interactive: bool,
+) -> Result<()> {
     let little_snake = display.start_spinning().await;
     let stream = obtain_control_stream().await;
     little_snake.stop().await;
 
     // If there are no weights, show the onboarding and exit.
     let mut stream = match stream {
-        Err(_) => {
+        Err(error) if error.downcast_ref::<crate::hub::NoWeights>().is_some() => {
             display.show_onboarding().await;
-            return Ok(());
+            return Err(error);
         }
+        Err(error) => return Err(error),
         Ok(stream) => stream,
     };
 
-    // Choose between interactive and batch mode.
-    // Step into interactive mode only when both stdout and stderr are teletype devices and the user provided no prompt.
-    if stdout_is_tty && stderr_is_tty && stdin_is_tty && prompt.is_empty() {
+    if interactive {
         interact_forever(&mut stream, display, history).await?
     } else {
         // One-shot: append the user turn to the initial history and infer once.
-        history.push(Message::User(prompt.to_string()));
-        match run_turn(&mut stream, display, history).await {
+        history.push(Message::User(prompt));
+        match run_turn(&mut stream, display, &mut history).await {
             Ok(_) => {}
             Err(error) if super::turn::is_cancelled(&error) => return Ok(()),
             Err(error) => return Err(error),

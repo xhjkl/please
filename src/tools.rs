@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 mod common;
-use self::common::{AsyncFn, Param, with_args};
+pub use self::common::Param;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use self::common::ParamType;
+use self::common::{AsyncFn, with_args};
 
 mod apply_patch;
 mod control_command;
@@ -13,7 +16,7 @@ pub use self::common::ToolContext;
 pub use apply_patch::summarize_patch_for_preview;
 
 /// Exposed tools are represented as a map keyed by function name.
-pub type ExposedTools = HashMap<&'static str, (&'static str, AsyncFn, Vec<Param>)>;
+pub type ExposedTools = HashMap<&'static str, (&'static str, AsyncFn, &'static [Param])>;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum ToolKind {
@@ -61,7 +64,7 @@ pub fn all_tools() -> ExposedTools {
       ($($module:ident),+ $(,)?) => {{
         let mut map: ExposedTools = HashMap::new();
         $(
-            let (name, desc, params) = $module::spec();
+            let (name, desc, params) = $module::SPEC;
             let call: AsyncFn = with_args::<$module::Args, _, _>($module::call);
             map.insert(name, (desc, call, params));
         )+
