@@ -5,7 +5,10 @@ All inference stays local.
 
 *The name is chosen so that the invocation reads like a natural-language phrase.*
 
-https://github.com/user-attachments/assets/87775557-1197-474e-a987-b5661299e709
+<picture>
+  <source media="(max-width: 900px)" srcset="./assets/please-demo-narrow.webp">
+  <img src="./assets/please-demo.webp" alt="Please writes a commit message from a staged Git diff, creates a Bun script, and finds a server setting.">
+</picture>
 
 # Installation
 
