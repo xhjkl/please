@@ -9,7 +9,7 @@ rust-version = "1.99"
 atty = "0.2"
 crossterm = "0.29"
 eyre = "0.6"
-nix = { version = "0.31", features = ["fs", "process", "signal"] }
+nix = { version = "0.32", features = ["fs", "process", "signal"] }
 postcard = { version = "1", features = ["use-std"] }
 rustyline = "19"
 serde = { version = "1", features = ["derive"] }
