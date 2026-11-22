@@ -8,7 +8,8 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::display::{Approval, Display};
 use crate::protocol::{
-    Frame, Message, ProtocolError, read_frame_from_stream, write_frame_to_stream,
+    Frame, Message, Note, Place, ProtocolError, Setting, ToolResult, read_frame_from_stream,
+    write_frame_to_stream,
 };
 use crate::tools::{
     Commands, ExposedTools, ToolContext, ToolKind, all_tools, kind_of, summarize_patch_for_preview,
@@ -29,10 +30,37 @@ struct PendingToolCall {
     arguments: Value,
 }
 
-/// Run model and tool subturns on a connection, preserving history and command state.
+/// Where and how a turn happens: the hub keeps the conversation of `place`.
+#[derive(Clone, Copy)]
+pub struct Scene<'a> {
+    pub place: &'a Place,
+    pub setting: &'a Setting,
+}
+
+/// What the next request carries, under an ID that stays the same when a reconnect retries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    pub id: u64,
+    pub messages: Vec<Message>,
+}
+
+impl Pending {
+    pub fn new(messages: Vec<Message>) -> Self {
+        use std::hash::BuildHasher;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = std::hash::RandomState::new().hash_one((count, std::process::id()));
+        Self { id, messages }
+    }
+}
+
+/// Run model and tool subturns on a connection, sending the hub only what is new: first the
+/// turn's request, then each step's tool results. `pending` stays what the next request carries
+/// until a response completes, so a retry after a reconnect resends it, under the same ID.
 /// A complete model response resets the reconnect budget; a partial response does not.
 async fn attempt_turn_on_stream(
-    messages: &mut Vec<Message>,
+    scene: Scene<'_>,
+    pending: &mut Pending,
     commands: &Commands,
     stream: &mut UnixStream,
     reconnect_attempts: &mut usize,
@@ -42,25 +70,27 @@ async fn attempt_turn_on_stream(
 
     loop {
         let command_ids = commands.pending_ids();
-        if !command_ids.is_empty() {
-            let reminder = pending_command_prompt(&command_ids);
-            // A retried subturn finds the same reminder already recorded in history.
-            if !matches!(messages.last(), Some(Message::Developer(text)) if *text == reminder) {
-                messages.push(Message::Developer(reminder));
-            }
+        let mut messages = pending.messages.clone();
+        let set_aside = messages
+            .iter()
+            .any(|message| matches!(message, Message::Note(Note::AnswerSetAside(_))));
+        if !command_ids.is_empty() && !set_aside {
+            messages.push(Message::Note(Note::Pending(command_ids.clone())));
         }
         let mut spinner = Some(display.start_spinning().await);
         let req = Frame::Request {
-            messages: messages.clone(),
+            place: scene.place.clone(),
+            setting: scene.setting.clone(),
+            id: pending.id,
+            messages,
         };
         write_frame_to_stream(stream, &req).await?;
 
         let mut store = Vec::with_capacity(4096);
         let mut thinking = None;
         let mut answer = String::new();
-        let mut reasoning = String::new();
         let mut calls = Vec::new();
-        let mut tool_parse_error = None;
+        let mut malformed = Vec::new();
 
         loop {
             let frame = read_frame_from_stream(stream, &mut store, None, None).await?;
@@ -70,6 +100,11 @@ async fn attempt_turn_on_stream(
             }
             match frame {
                 Frame::Log(line) => display.show_log(&line).await,
+                // Shown apart from the answer, which may be going to a file.
+                Frame::Restarted(summary) => {
+                    thinking = None;
+                    eprintln!("[the conversation restarted from this message]\n{summary}\n");
+                }
                 Frame::Answer(delta) => {
                     if command_ids.is_empty() {
                         thinking = None;
@@ -84,25 +119,19 @@ async fn attempt_turn_on_stream(
                     if let Some(line) = &thinking {
                         line.show(&delta);
                     }
-                    reasoning.push_str(&delta);
                 }
                 Frame::ToolCall {
                     name,
                     arguments_json,
                 } => {
-                    let arguments = serde_json::from_str::<Value>(&arguments_json);
-                    match arguments {
-                        Err(error) => {
-                            tool_parse_error =
-                                Some(format!("error parsing tool call arguments: {error}"))
+                    // Only an object reaches a tool: approval reads the same fields the tool does.
+                    match serde_json::from_str::<Value>(&arguments_json) {
+                        Ok(arguments) if arguments.is_object() => {
+                            calls.push(PendingToolCall { name, arguments })
                         }
-                        Ok(arguments) if !arguments.is_object() => {
-                            tool_parse_error = Some("tool call arguments must be an object".into());
-                        }
-                        Ok(arguments) => calls.push(PendingToolCall { name, arguments }),
+                        _ => malformed.push(name),
                     }
                 }
-                Frame::ToolCallParseError(error) => tool_parse_error = Some(error),
                 Frame::Stop => {
                     *reconnect_attempts = 0;
                     break;
@@ -117,40 +146,30 @@ async fn attempt_turn_on_stream(
             display.end_answer();
         }
 
-        if tool_parse_error.is_none() && calls.is_empty() && !command_ids.is_empty() {
-            messages.push(Message::Developer(format!(
-                "Previous answer ignored. {}",
-                pending_command_prompt(&command_ids)
-            )));
+        let refused = malformed.into_iter().map(|name| {
+            let content = json!({ "error": "tool call arguments must be a JSON object" });
+            Message::Result(ToolResult {
+                name,
+                content: content.to_string(),
+            })
+        });
+        let refused: Vec<_> = refused.collect();
+        if calls.is_empty() && refused.is_empty() && !command_ids.is_empty() {
+            *pending = Pending::new(vec![Message::Note(Note::AnswerSetAside(command_ids))]);
             continue;
         }
 
-        if !command_ids.is_empty() {
-            if calls.is_empty() {
-                answer.clear();
-            } else if !answer.is_empty() {
-                // While jobs are pending, visible text alongside calls is progress on stderr.
-                eprintln!("{answer}");
-            }
+        if !command_ids.is_empty() && !answer.is_empty() && !calls.is_empty() {
+            // While jobs are pending, visible text alongside calls is progress on stderr.
+            eprintln!("{answer}");
         }
-
-        // Recording empty reasoning gives a tool-only response its own assistant step.
-        if !reasoning.is_empty() || answer.is_empty() && !calls.is_empty() {
-            messages.push(Message::Reasoning(reasoning));
-        }
-        if !answer.is_empty() {
-            messages.push(Message::Assistant(answer.clone()));
-        }
-        if let Some(error) = tool_parse_error {
-            let payload = json!({ "tool": "tool_call_parse_error", "result": { "error": error } });
-            messages.push(Message::Tool(payload.to_string()));
-            continue;
-        }
-        if calls.is_empty() {
+        if calls.is_empty() && refused.is_empty() {
             return Ok(answer);
         }
 
-        execute_calls(&calls, &tools, commands, display, messages).await;
+        let mut results = refused;
+        results.extend(execute_calls(&calls, &tools, commands, display).await);
+        *pending = Pending::new(results);
     }
 }
 
@@ -161,8 +180,8 @@ async fn execute_calls(
     tools: &ExposedTools,
     commands: &Commands,
     display: &Display,
-    messages: &mut Vec<Message>,
-) {
+) -> Vec<Message> {
+    let mut messages = Vec::with_capacity(calls.len());
     for batch in calls.chunk_by(|left, right| {
         kind_of(&left.name).has_command_output() && kind_of(&right.name).has_command_output()
     }) {
@@ -212,11 +231,13 @@ async fn execute_calls(
             {
                 eprintln!("command {id} running (PID {})", result["pid"]);
             }
-            let payload =
-                json!({ "tool": call.name, "arguments": call.arguments, "result": result });
-            messages.push(Message::Tool(payload.to_string()));
+            messages.push(Message::Result(ToolResult {
+                name: call.name.clone(),
+                content: result.to_string(),
+            }));
         }
     }
+    messages
 }
 
 async fn invoke_batch(
@@ -272,30 +293,20 @@ async fn approve_call(display: &Display, call: &PendingToolCall) -> Approval {
     }
 }
 
-fn pending_command_prompt(ids: &[u64]) -> String {
-    let ids = ids
-        .iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "Pending commandId values: {ids}. You can continue other work. Before answering, collect a final result for each with {} and action=\"wait\" or action=\"kill\".",
-        crate::tools::CONTROL_COMMAND_NAME
-    )
-}
-
 /// Cancel the whole conversation turn on SIGINT, including approval, reconnects, and tool waits.
 pub async fn run_turn(
     stream: &mut Option<UnixStream>,
     display: &Display,
-    messages: &mut Vec<Message>,
+    scene: Scene<'_>,
+    request: Vec<Message>,
 ) -> Result<String> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let commands = Commands::default();
+    let mut pending = Pending::new(request);
     let result = tokio::select! {
         biased;
         _ = interrupt.recv() => Err(TurnCancelled.into()),
-        result = run_with_reconnect(stream, display, messages, &commands) => result,
+        result = run_with_reconnect(stream, display, scene, &mut pending, &commands) => result,
     };
     if result.is_err() {
         // Closing the socket stops the hub's request and leaves the REPL free to reconnect.
@@ -309,7 +320,8 @@ pub async fn run_turn(
 async fn run_with_reconnect(
     stream: &mut Option<UnixStream>,
     display: &Display,
-    messages: &mut Vec<Message>,
+    scene: Scene<'_>,
+    pending: &mut Pending,
     commands: &Commands,
 ) -> Result<String> {
     let mut reconnect_attempts = 0;
@@ -319,7 +331,8 @@ async fn run_with_reconnect(
             None => stream.insert(obtain_control_stream().await?),
         };
         let result = attempt_turn_on_stream(
-            messages,
+            scene,
+            pending,
             commands,
             connection,
             &mut reconnect_attempts,
@@ -336,6 +349,59 @@ async fn run_with_reconnect(
         tokio::time::sleep(Duration::from_millis(1u64 << reconnect_attempts)).await;
         reconnect_attempts += 1;
     }
+}
+
+/// Restart the scene's conversation on the hub, from a summary of it or from nothing, showing
+/// what the hub reports.
+pub async fn restart(
+    stream: &mut Option<UnixStream>,
+    display: &Display,
+    scene: Scene<'_>,
+    summarize: bool,
+) -> Result<()> {
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let restarted = async {
+        let connection = match stream {
+            Some(connection) => connection,
+            None => stream.insert(obtain_control_stream().await?),
+        };
+        let request = Frame::Restart {
+            place: scene.place.clone(),
+            setting: scene.setting.clone(),
+            summarize,
+        };
+        write_frame_to_stream(connection, &request).await?;
+        let spinner = display.start_spinning().await;
+        let mut store = Vec::new();
+        let mut answered = false;
+        loop {
+            match read_frame_from_stream(connection, &mut store, None, None).await? {
+                Frame::Log(line) => display.show_log(&line).await,
+                // Asked for, the summary is the answer.
+                Frame::Restarted(text) => {
+                    answered = true;
+                    display.show_answer(&text);
+                }
+                Frame::Stop => break,
+                Frame::Error(error) => return Err(eyre!(error)),
+                frame => return Err(eyre!("unexpected hub frame: {frame:?}")),
+            }
+        }
+        spinner.stop().await;
+        if answered {
+            display.end_answer();
+        }
+        Ok(())
+    };
+    let result = tokio::select! {
+        biased;
+        _ = interrupt.recv() => Err(TurnCancelled.into()),
+        result = restarted => result,
+    };
+    if result.is_err() {
+        drop(stream.take());
+    }
+    result
 }
 
 fn is_disconnect(error: &eyre::Report) -> bool {

@@ -20,7 +20,11 @@ pub fn socket_path() -> std::path::PathBuf {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod benchmark;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod chats;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod dialect;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod digest;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod discovery;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -35,6 +39,10 @@ mod local;
 mod occupancy;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod preamble;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod transcript;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod turn;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use benchmark::run as benchmark;

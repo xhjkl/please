@@ -7,12 +7,12 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::cli::io;
 use crate::cli::specials;
 use crate::display;
-use crate::history;
 use crate::protocol::{HubBusy, Message};
 
+use super::commands::{self, Command};
 use super::connect::obtain_control_stream;
 use super::repl::interact_forever;
-use super::turn::{TurnCancelled, is_cancelled, run_turn};
+use super::turn::{Scene, TurnCancelled, is_cancelled, restart, run_turn};
 
 /// sysexits' temporary failure: the user is invited to retry later.
 const EX_TEMPFAIL: u8 = 75;
@@ -49,7 +49,12 @@ pub async fn run() -> Result<ExitCode> {
     let stdout_redirection_path =
         (!stdout_is_tty).then(|| io::stdout_redirection_path().unwrap_or_default());
     let stdin_content = io::read_whole_stdin()?;
-    let history = history::make_history(stdin_content, stdout_redirection_path);
+    let setting = crate::setting::current(stdout_redirection_path);
+    let place = crate::place::here()?;
+    // Piped data opens the request it came with, as the person's material.
+    let input = stdin_content
+        .filter(|data| !data.trim().is_empty())
+        .map(Message::Input);
 
     // Build prompt from positional CLI args; if none provided, leave empty to enable REPL.
     // Collect positional args into a single prompt. If none provided, drop into REPL.
@@ -65,7 +70,11 @@ pub async fn run() -> Result<ExitCode> {
     } else {
         Conversation::OneShot(prompt)
     };
-    match converse(&display, history, conversation).await {
+    let scene = Scene {
+        place: &place,
+        setting: &setting,
+    };
+    match converse(&display, scene, input, conversation).await {
         Err(error) if error.downcast_ref::<HubBusy>().is_some() => {
             eprintln!("please: {error}");
             Ok(ExitCode::from(EX_TEMPFAIL))
@@ -82,7 +91,8 @@ pub async fn run() -> Result<ExitCode> {
 /// Connect to the hub, maybe starting a new hub process, and hold the conversation.
 async fn converse(
     display: &display::Display,
-    mut history: Vec<Message>,
+    scene: Scene<'_>,
+    input: Option<Message>,
     conversation: Conversation,
 ) -> Result<()> {
     let mut interrupt = signal(SignalKind::interrupt())?;
@@ -107,11 +117,17 @@ async fn converse(
     let mut stream = Some(stream);
 
     match conversation {
-        Conversation::Interactive => interact_forever(&mut stream, display, history).await?,
-        Conversation::OneShot(prompt) => {
-            history.push(Message::User(prompt));
-            run_turn(&mut stream, display, &mut history).await?;
-        }
+        Conversation::Interactive => interact_forever(&mut stream, display, scene).await?,
+        Conversation::OneShot(prompt) => match commands::parse(&prompt) {
+            Some(Ok(command)) => {
+                restart(&mut stream, display, scene, command == Command::Compact).await?
+            }
+            Some(Err(error)) => eyre::bail!(error),
+            None => {
+                let request = input.into_iter().chain([Message::User(prompt)]).collect();
+                run_turn(&mut stream, display, scene, request).await?;
+            }
+        },
     }
 
     Ok(())

@@ -1,6 +1,39 @@
 use super::*;
-use crate::protocol::{ProtocolError, write_frame_to_stream};
+use crate::protocol::{Effort, ProtocolError, write_frame_to_stream};
 use std::time::Duration;
+
+fn place() -> Place {
+    Place {
+        host: "host".into(),
+        cwd: "/".into(),
+        session: "1@1".into(),
+    }
+}
+
+fn setting() -> Setting {
+    Setting {
+        today: "2040-02-03".into(),
+        effort: Effort::Medium,
+        redirection: None,
+    }
+}
+
+/// The messages of the next request the probe sends.
+async fn next_request(server: &mut UnixStream, store: &mut Vec<u8>) -> Result<Vec<Message>> {
+    match read_frame_from_stream(server, store, None, None).await? {
+        Frame::Request { messages, .. } => Ok(messages),
+        frame => Err(eyre!("expected a request, got {frame:?}")),
+    }
+}
+
+fn result_of(messages: &[Message], tool: &str) -> Option<Value> {
+    messages.iter().find_map(|message| match message {
+        Message::Result(ToolResult { name, content }) if name == tool => {
+            serde_json::from_str(content).ok()
+        }
+        _ => None,
+    })
+}
 
 #[tokio::test]
 async fn completed_subturn_resets_budget_before_later_disconnect() {
@@ -8,10 +41,8 @@ async fn completed_subturn_resets_budget_before_later_disconnect() {
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let hub = tokio::spawn(async move {
         let mut store = Vec::new();
-        let request: Frame = read_frame_from_stream(&mut server, &mut store, None, None)
-            .await
-            .unwrap();
-        assert!(matches!(request, Frame::Request { .. }));
+        let first = next_request(&mut server, &mut store).await.unwrap();
+        assert_eq!(first, [Message::User("hello".into())]);
         write_frame_to_stream(
             &mut server,
             &Frame::ToolCall {
@@ -25,27 +56,22 @@ async fn completed_subturn_resets_budget_before_later_disconnect() {
             .await
             .unwrap();
 
-        let request: Frame = read_frame_from_stream(&mut server, &mut store, None, None)
-            .await
-            .unwrap();
-        let Frame::Request { messages } = request else {
-            panic!("tool result is sent back in the next request");
-        };
-        assert!(
-            matches!(&messages[messages.len() - 2], Message::Reasoning(text) if text.is_empty())
-        );
-        let Some(Message::Tool(payload)) = messages.last() else {
-            panic!("completed tool exchange preserves the result in history");
-        };
-        let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(payload["tool"], "list_files");
-        assert!(payload["result"].is_array());
+        // The hub keeps the conversation, so the probe sends only the new result.
+        let messages = next_request(&mut server, &mut store).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(result_of(&messages, "list_files").unwrap().is_array());
     });
-    let mut messages = vec![Message::User("hello".into())];
+    let (place, setting) = (place(), setting());
+    let scene = Scene {
+        place: &place,
+        setting: &setting,
+    };
+    let mut pending = Pending::new(vec![Message::User("hello".into())]);
     let mut reconnect_attempts = 6;
     let commands = Commands::default();
     let attempt = attempt_turn_on_stream(
-        &mut messages,
+        scene,
+        &mut pending,
         &commands,
         &mut client,
         &mut reconnect_attempts,
@@ -60,28 +86,33 @@ async fn completed_subturn_resets_budget_before_later_disconnect() {
         Some(ProtocolError::Disconnect)
     ));
     assert_eq!(reconnect_attempts, 0);
+    // A retry after reconnecting resends the result the hub never answered, under one ID.
+    assert!(result_of(&pending.messages, "list_files").is_some());
     hub.await.unwrap();
 }
 
 #[tokio::test]
-async fn incomplete_subturn_preserves_reconnect_budget() {
+async fn incomplete_subturn_preserves_reconnect_budget_and_request() {
     let display = crate::display::make_display();
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let hub = tokio::spawn(async move {
         let mut store = Vec::new();
-        let request: Frame = read_frame_from_stream(&mut server, &mut store, None, None)
-            .await
-            .unwrap();
-        assert!(matches!(request, Frame::Request { .. }));
+        next_request(&mut server, &mut store).await.unwrap();
         write_frame_to_stream(&mut server, &Frame::Thinking("partial response".into()))
             .await
             .unwrap();
     });
-    let mut messages = vec![Message::User("hello".into())];
+    let (place, setting) = (place(), setting());
+    let scene = Scene {
+        place: &place,
+        setting: &setting,
+    };
+    let mut pending = Pending::new(vec![Message::User("hello".into())]);
     let mut reconnect_attempts = 6;
     let commands = Commands::default();
     let attempt = attempt_turn_on_stream(
-        &mut messages,
+        scene,
+        &mut pending,
         &commands,
         &mut client,
         &mut reconnect_attempts,
@@ -96,6 +127,7 @@ async fn incomplete_subturn_preserves_reconnect_budget() {
         Some(ProtocolError::Disconnect)
     ));
     assert_eq!(reconnect_attempts, 6);
+    assert_eq!(pending.messages, [Message::User("hello".into())]);
     hub.await.unwrap();
 }
 
@@ -116,7 +148,8 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
     let (mut client, mut server) = UnixStream::pair()?;
     let hub = tokio::spawn(async move {
         let mut store = Vec::new();
-        let _: Frame = read_frame_from_stream(&mut server, &mut store, None, None).await?;
+        let first = next_request(&mut server, &mut store).await?;
+        assert!(first.contains(&Message::Note(Note::Pending(vec![id]))));
         write_frame_to_stream(
             &mut server,
             &Frame::Thinking("the job can run in the background".into()),
@@ -137,40 +170,18 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
         .await?;
         write_frame_to_stream(&mut server, &Frame::Stop).await?;
 
-        let request = read_frame_from_stream(&mut server, &mut store, None, None).await?;
-        let Frame::Request { messages } = request else {
-            panic!("expected a follow-up request")
-        };
-        assert!(
-            messages
-                .iter()
-                .any(|message| matches!(message, Message::Reasoning(text)
-            if text == "the job can run in the background"))
-        );
-        assert!(
-            messages
-                .iter()
-                .any(|message| matches!(message, Message::Assistant(text)
-            if text == "I'll list the files while it runs."))
-        );
-        assert!(
-            messages
-                .iter()
-                .any(|message| matches!(message, Message::Tool(payload)
-            if serde_json::from_str::<Value>(payload).unwrap()["result"].is_array()))
+        let messages = next_request(&mut server, &mut store).await?;
+        assert!(result_of(&messages, "list_files").unwrap().is_array());
+        assert_eq!(
+            messages.last(),
+            Some(&Message::Note(Note::Pending(vec![id])))
         );
         write_frame_to_stream(&mut server, &Frame::Answer("too early".into())).await?;
         write_frame_to_stream(&mut server, &Frame::Stop).await?;
 
-        let request = read_frame_from_stream(&mut server, &mut store, None, None).await?;
-        let Frame::Request { messages } = request else {
-            panic!("expected a follow-up request")
-        };
-        assert!(
-            !messages
-                .iter()
-                .any(|message| matches!(message, Message::Assistant(text) if text == "too early"))
-        );
+        // An answer while the command runs is set aside, and the hub hears why.
+        let messages = next_request(&mut server, &mut store).await?;
+        assert_eq!(messages, [Message::Note(Note::AnswerSetAside(vec![id]))]);
         write_frame_to_stream(
             &mut server,
             &Frame::ToolCall {
@@ -181,24 +192,29 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
         .await?;
         write_frame_to_stream(&mut server, &Frame::Stop).await?;
 
-        let request = read_frame_from_stream(&mut server, &mut store, None, None).await?;
-        let Frame::Request { messages } = request else {
-            panic!("expected a follow-up request")
-        };
-        let Some(Message::Tool(payload)) = messages.last() else {
-            panic!("missing stop result")
-        };
-        let payload: Value = serde_json::from_str(payload)?;
-        assert_eq!(payload["result"]["status"], "killed");
+        let messages = next_request(&mut server, &mut store).await?;
+        let killed = result_of(&messages, "control_command").unwrap();
+        assert_eq!(killed["status"], "killed");
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::Note(_)))
+        );
         write_frame_to_stream(&mut server, &Frame::Answer("settled".into())).await?;
         write_frame_to_stream(&mut server, &Frame::Stop).await
     });
 
-    let mut messages = vec![Message::User("start a command".into())];
+    let (place, setting) = (place(), setting());
+    let scene = Scene {
+        place: &place,
+        setting: &setting,
+    };
+    let mut pending = Pending::new(vec![Message::User("start a command".into())]);
     let mut reconnect_attempts = 0;
     let display = crate::display::make_display();
     let attempt = attempt_turn_on_stream(
-        &mut messages,
+        scene,
+        &mut pending,
         &commands,
         &mut client,
         &mut reconnect_attempts,

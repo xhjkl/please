@@ -2,6 +2,7 @@
 use super::conversation::{ConversationMessage, Rendered, ToolCall, fit_command_results};
 use super::piece::{Piece, encode_pieces, encode_text};
 use super::{Adapter as DialectAdapter, OutputParser};
+use crate::protocol::Effort;
 use eyre::{Result, eyre};
 use oco::Tokenizer;
 use serde_json::{Value, json};
@@ -49,19 +50,16 @@ fn tool_declarations() -> String {
     tools.to_string()
 }
 
-fn effort(level: Option<&str>) -> Result<&'static str> {
+/// The checkpoint's thinking-effort scale, from 0 to 1.
+fn effort(level: Effort) -> &'static str {
     match level {
-        Some("none") => Ok("0"),
-        Some("minimal") => Ok("0.1"),
-        Some("low") => Ok("0.2"),
-        Some("medium") => Ok("0.7"),
-        None | Some("high") => Ok("0.9"),
-        Some("xhigh" | "max") => Ok("0.99"),
-        Some(level) => Err(eyre!("unknown Inkling reasoning effort: {level}")),
+        Effort::Low => "0.2",
+        Effort::Medium => "0.7",
+        Effort::High => "0.9",
     }
 }
 
-/// Replay one model step and its results. The probe stores results interleaved with calls.
+/// Replay one model step and its results, which may interleave with its calls.
 fn step(prompt: &mut Vec<Piece>, messages: &[ConversationMessage]) -> Result<usize> {
     use ConversationMessage::*;
     let text = messages
@@ -119,12 +117,12 @@ fn render(messages: &[ConversationMessage]) -> Result<(Vec<Piece>, usize)> {
         .take_while(|message| message.is_preamble())
         .count();
     let (head, mut rest) = messages.split_at(head);
-    let mut level = None;
+    let mut level = crate::protocol::Effort::High;
     let mut preamble = None;
     for message in head {
         match message {
-            Effort(effort) => level = Some(effort.as_str()),
-            System(text) | Developer(text) => frame(&mut prompt, SYSTEM, "", TEXT, text),
+            Effort(effort) => level = *effort,
+            Instructions(text) => frame(&mut prompt, SYSTEM, "", TEXT, text),
             Fact(text) => {
                 preamble.get_or_insert(prompt.len());
                 frame(&mut prompt, SYSTEM, "", TEXT, text);
@@ -133,7 +131,7 @@ fn render(messages: &[ConversationMessage]) -> Result<(Vec<Piece>, usize)> {
         }
     }
     let preamble = preamble.unwrap_or(prompt.len());
-    let level = effort(level)?;
+    let level = effort(level);
     frame(
         &mut prompt,
         SYSTEM,
@@ -150,7 +148,7 @@ fn render(messages: &[ConversationMessage]) -> Result<(Vec<Piece>, usize)> {
                 continue;
             }
             Effort(_) => {}
-            System(text) | Developer(text) | Fact(text) => {
+            Instructions(text) | Fact(text) | Note(text) => {
                 frame(&mut prompt, SYSTEM, "", TEXT, text)
             }
             User(text) => frame(&mut prompt, USER, "", TEXT, text),

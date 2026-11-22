@@ -14,36 +14,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// of the default model, whose sentence opens its prompt, plus the fallback's.
 const KEPT: usize = 4;
 
-/// z-base-32 digit alphabet
-const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
-
 /// Where cached heads live, beside `~/.please/weights`.
 fn directory() -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
     PathBuf::from(home).join(".please/caches")
 }
 
-/// Encode `n` as a z-base-32 integer without leading zero digits.
-fn z_base_32(mut n: u128) -> String {
-    let mut digits = Vec::new();
-    loop {
-        digits.push(ALPHABET[(n % 32) as usize]);
-        n /= 32;
-        if n == 0 {
-            break;
-        }
-    }
-    digits
-        .iter()
-        .rev()
-        .map(|&digit| char::from(digit))
-        .collect()
-}
-
 /// Whether `name` could be a head this module wrote; anything else in the directory, such as
 /// a save still being written, is left alone.
 fn is_head(name: &str) -> bool {
-    (1..=26).contains(&name.len()) && name.bytes().all(|byte| ALPHABET.contains(&byte))
+    super::digest::is_name(name)
 }
 
 /// What a saved head's bytes depend on besides its IDs.
@@ -74,9 +54,7 @@ impl Origin {
         }
         let mut hash = self.0.clone();
         hash.update(ids.finalize());
-        let mut name = [0; 16];
-        name.copy_from_slice(&hash.finalize()[..16]);
-        directory().join(z_base_32(u128::from_be_bytes(name)))
+        directory().join(super::digest::name(hash))
     }
 }
 
@@ -121,6 +99,7 @@ fn prune(directory: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::digest::z_base_32;
     use crate::test_support::TempDir;
     use std::time::Duration;
 

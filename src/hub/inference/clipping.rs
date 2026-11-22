@@ -18,15 +18,24 @@ pub fn visible(history: &[Message], dropped: &[Range<usize>]) -> Vec<Message> {
 }
 
 /// Indices where a user turn or an assistant step begins; cutting elsewhere would separate a
-/// tool call from its reasoning or result.
-fn boundaries(history: &[Message], start: usize) -> Vec<usize> {
-    (start + 1..history.len())
-        .filter(|&index| {
-            matches!(history[index], Message::User(_))
-                || matches!(history[index - 1], Message::Tool(_))
-                    && !matches!(history[index], Message::Tool(_))
+/// tool call from its reasoning or result, or piped input from the request it came with.
+fn boundaries(history: &[Message]) -> Vec<usize> {
+    let tool = |message: &Message| matches!(message, Message::Call(_) | Message::Result(_));
+    (1..history.len())
+        .filter(|&index| match &history[index] {
+            Message::Input(_) => true,
+            Message::User(_) => !matches!(history[index - 1], Message::Input(_)),
+            message => tool(&history[index - 1]) && !tool(message),
         })
         .collect()
+}
+
+/// Where the turn of the user message at `user` opens: at its piped input, if any.
+fn opening(history: &[Message], user: usize) -> usize {
+    match user.checked_sub(1).map(|index| &history[index]) {
+        Some(Message::Input(_)) => user - 1,
+        _ => user,
+    }
 }
 
 /// Extend `dropped` until the prompt fits. `size` measures a candidate history and `limit`
@@ -42,23 +51,25 @@ pub fn choose(
     if size(&visible(history, dropped))? <= limit {
         return Ok(dropped.to_vec());
     }
-    let start = usize::from(matches!(history.first(), Some(Message::Context(_))));
-    let cuts = boundaries(history, start);
-    let request = history
+    let cuts = boundaries(history);
+    // A conversation that restarted may hold no request yet: the message it restarted from
+    // anchors it instead.
+    let user = history
         .iter()
         .rposition(|message| matches!(message, Message::User(_)))
-        .filter(|&index| index >= start);
-    // Older turns go whole: only their user messages are cut points.
+        .or((!history.is_empty()).then_some(0));
+    let request = user.map(|user| opening(history, user));
+    // Older turns go whole: only where they open are cut points.
     let older = cuts
         .iter()
-        .filter(|&&cut| matches!(history[cut], Message::User(_)))
+        .filter(|&&cut| matches!(history[cut], Message::User(_) | Message::Input(_)))
         .filter(|&&cut| request.is_none_or(|request| cut <= request))
-        .map(|&cut| std::iter::once(start..cut).collect::<Vec<_>>());
-    let steps = request.into_iter().flat_map(|request| {
-        let last = cuts.last().copied().unwrap_or(request);
+        .map(|&cut| std::iter::once(0..cut).collect::<Vec<_>>());
+    let steps = request.zip(user).into_iter().flat_map(|(request, user)| {
+        let last = cuts.last().copied().unwrap_or(user);
         cuts.iter()
-            .filter(move |&&cut| cut > request + 1 && cut <= last)
-            .map(move |&cut| vec![start..request, request + 1..cut])
+            .filter(move |&&cut| cut > user + 1 && cut <= last)
+            .map(move |&cut| vec![0..request, user + 1..cut])
     });
     let mut fitting = None;
     for candidate in older.chain(steps) {
@@ -77,34 +88,32 @@ pub fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Context;
-
-    fn context() -> Message {
-        Message::Context(Context {
-            today: "2040-02-03".into(),
-            reasoning: "medium".into(),
-            stdin: None,
-            stdout_redirection: None,
-        })
-    }
+    use crate::protocol::{Call, ToolResult};
 
     /// Every message weighs ten tokens.
     fn size(history: &[Message]) -> Result<usize> {
         Ok(history.len() * 10)
     }
 
-    /// A user turn followed by `steps` tool steps of reasoning and one call each.
+    /// A user turn followed by `steps` tool steps of reasoning, a call, and its result.
     fn turn(history: &mut Vec<Message>, request: &str, steps: usize) {
         history.push(Message::User(request.into()));
         for step in 0..steps {
-            history.push(Message::Reasoning(format!("{request} {step}")));
-            history.push(Message::Tool(format!("{request} {step}")));
+            history.push(Message::Thinking(format!("{request} {step}")));
+            history.push(Message::Call(Call {
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }));
+            history.push(Message::Result(ToolResult {
+                name: "read_file".into(),
+                content: format!("{request} {step}"),
+            }));
         }
     }
 
     #[test]
     fn nothing_is_dropped_while_the_prompt_fits() -> Result<()> {
-        let mut history = vec![context()];
+        let mut history = vec![];
         turn(&mut history, "a", 3);
         assert!(choose(&history, &[], 100, 50, size)?.is_empty());
         Ok(())
@@ -112,38 +121,38 @@ mod tests {
 
     #[test]
     fn older_turns_go_first_and_whole() -> Result<()> {
-        let mut history = vec![context()];
+        let mut history = vec![];
         turn(&mut history, "a", 2);
         turn(&mut history, "b", 2);
         turn(&mut history, "c", 1);
-        // 14 messages: over a limit of 120, down to at most 90.
-        let dropped = choose(&history, &[], 120, 90, size)?;
-        assert_eq!(dropped, std::iter::once(1..6).collect::<Vec<_>>());
+        // 18 messages: over a limit of 120, down to at most 110.
+        let dropped = choose(&history, &[], 120, 110, size)?;
+        assert_eq!(dropped, std::iter::once(0..7).collect::<Vec<_>>());
         let kept = visible(&history, &dropped);
-        assert!(matches!(&kept[1], Message::User(text) if text == "b"));
+        assert!(matches!(&kept[0], Message::User(text) if text == "b"));
         Ok(())
     }
 
     #[test]
     fn a_long_turn_keeps_its_request_and_newest_step() -> Result<()> {
-        let mut history = vec![context()];
+        let mut history = vec![];
         turn(&mut history, "a", 10);
         let dropped = choose(&history, &[], 150, 100, size)?;
         let kept = visible(&history, &dropped);
-        assert!(matches!(&kept[1], Message::User(text) if text == "a"));
-        assert!(matches!(&kept[2], Message::Reasoning(_)));
-        assert!(matches!(kept.last(), Some(Message::Tool(text)) if text == "a 9"));
+        assert!(matches!(&kept[0], Message::User(text) if text == "a"));
+        assert!(matches!(&kept[1], Message::Thinking(_)));
+        assert!(matches!(kept.last(), Some(Message::Result(result)) if result.content == "a 9"));
         assert!(kept.len() * 10 <= 100);
         Ok(())
     }
 
     #[test]
     fn later_requests_reuse_the_choice_until_they_overflow_again() -> Result<()> {
-        let mut history = vec![context()];
+        let mut history = vec![];
         turn(&mut history, "a", 10);
         let dropped = choose(&history, &[], 150, 100, size)?;
         let first = visible(&history, &dropped);
-        history.push(Message::Reasoning("next".into()));
+        history.push(Message::Thinking("next".into()));
         let again = choose(&history, &dropped, 150, 100, size)?;
         assert_eq!(again, dropped);
         // The new prompt extends the previous one, so a kept session only feeds the suffix.
@@ -153,8 +162,43 @@ mod tests {
     }
 
     #[test]
+    fn piped_input_stays_with_its_request() -> Result<()> {
+        let mut history = vec![];
+        turn(&mut history, "a", 3);
+        history.push(Message::Input("data".into()));
+        turn(&mut history, "b", 6);
+        let dropped = choose(&history, &[], 200, 120, size)?;
+        let kept = visible(&history, &dropped);
+        assert!(matches!(&kept[0], Message::Input(data) if data == "data"));
+        assert!(matches!(&kept[1], Message::User(text) if text == "b"));
+        Ok(())
+    }
+
+    #[test]
+    fn after_a_restart_older_steps_go_and_the_summary_stays() -> Result<()> {
+        let mut history = vec![Message::Answer("You asked me to read three files.".into())];
+        for step in 0..8 {
+            history.push(Message::Thinking(format!("step {step}")));
+            history.push(Message::Call(Call {
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }));
+            history.push(Message::Result(ToolResult {
+                name: "read_file".into(),
+                content: format!("{step}"),
+            }));
+        }
+        let dropped = choose(&history, &[], 150, 100, size)?;
+        let kept = visible(&history, &dropped);
+        assert!(matches!(&kept[0], Message::Answer(_)));
+        assert!(matches!(kept.last(), Some(Message::Result(result)) if result.content == "7"));
+        assert!(kept.len() * 10 <= 100);
+        Ok(())
+    }
+
+    #[test]
     fn an_unfittable_newest_step_is_an_error() {
-        let mut history = vec![context()];
+        let mut history = vec![];
         turn(&mut history, "a", 2);
         assert!(choose(&history, &[], 30, 20, size).is_err());
     }

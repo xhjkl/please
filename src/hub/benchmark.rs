@@ -3,7 +3,9 @@ use super::{
     dialect::Delta,
     inference::{self, Engine},
 };
-use crate::protocol::{Frame, Message, read_frame_from_stream, write_frame_to_stream};
+use crate::protocol::{
+    Call, Frame, Message, Setting, ToolResult, read_frame_from_stream, write_frame_to_stream,
+};
 use eyre::{Result, eyre};
 use serde::Deserialize;
 use std::{sync::Arc, time::Instant};
@@ -13,6 +15,7 @@ use std::{sync::Arc, time::Instant};
 struct Case {
     name: String,
     max_tokens: usize,
+    setting: Setting,
     messages: Vec<Message>,
 }
 
@@ -25,6 +28,7 @@ pub async fn run(model_path: &str, cases_path: &str) -> Result<()> {
     let mut store = Vec::new();
     for case in cases {
         let request = Frame::BenchmarkRequest {
+            setting: case.setting,
             messages: case.messages,
             max_tokens: case.max_tokens,
         };
@@ -49,14 +53,15 @@ pub async fn run(model_path: &str, cases_path: &str) -> Result<()> {
 /// stub tool results, as the probe's next request would.
 pub(super) async fn measure(
     hub: Arc<Engine>,
+    setting: Setting,
     messages: Vec<Message>,
     max_tokens: usize,
 ) -> Result<String> {
     let connection = hub.connect();
-    let first = exchange(&hub, connection, messages.clone(), max_tokens).await?;
+    let first = exchange(&hub, connection, &setting, messages.clone(), max_tokens).await?;
     let mut follow_up = messages;
     follow_up.extend(first.reply());
-    let second = exchange(&hub, connection, follow_up, max_tokens).await?;
+    let second = exchange(&hub, connection, &setting, follow_up, max_tokens).await?;
     let report = serde_json::json!({
         "model": hub.path, "load_seconds": hub.load_seconds,
         "first": first.report()?, "follow_up": second.report()?,
@@ -80,6 +85,7 @@ struct Exchange {
 async fn exchange(
     hub: &Arc<Engine>,
     connection: u64,
+    setting: &Setting,
     messages: Vec<Message>,
     max_tokens: usize,
 ) -> Result<Exchange> {
@@ -91,9 +97,18 @@ async fn exchange(
     let mut times = Vec::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let worker = hub.clone();
+    let setting = setting.clone();
     let started = Instant::now();
     let task = tokio::spawn(async move {
-        inference::generate(&worker, connection, &messages, tx, Some(max_tokens)).await
+        inference::generate(
+            &worker,
+            connection,
+            &setting,
+            &messages,
+            tx,
+            Some(max_tokens),
+        )
+        .await
     });
     while let Some(event) = rx.recv().await {
         match event {
@@ -131,18 +146,21 @@ impl Exchange {
     fn reply(&self) -> Vec<Message> {
         let mut messages = Vec::new();
         if !self.thinking.is_empty() {
-            messages.push(Message::Reasoning(self.thinking.clone()));
+            messages.push(Message::Thinking(self.thinking.clone()));
         }
         if !self.answer.is_empty() {
-            messages.push(Message::Assistant(self.answer.clone()));
+            messages.push(Message::Answer(self.answer.clone()));
         }
         let calls = self.calls.as_deref().unwrap_or_default();
         for call in calls {
-            let record = serde_json::json!({
-                "tool": call.name, "arguments": call.arguments,
-                "result": {"error": "the benchmark does not execute tools"},
-            });
-            messages.push(Message::Tool(record.to_string()));
+            messages.push(Message::Call(Call {
+                name: call.name.clone(),
+                arguments: call.arguments.to_string(),
+            }));
+            messages.push(Message::Result(ToolResult {
+                name: call.name.clone(),
+                content: r#"{"error":"the benchmark does not execute tools"}"#.into(),
+            }));
         }
         if calls.is_empty() {
             messages.push(Message::User("Continue.".into()));

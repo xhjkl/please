@@ -8,6 +8,7 @@
 use super::conversation::{ConversationMessage, Rendered, ToolCall, fit_command_results};
 use super::piece::{Piece, encode_pieces, encode_text, special};
 use super::{Adapter as DialectAdapter, OutputParser as DialectOutputParser};
+use crate::protocol::Effort;
 use eyre::{Result, eyre};
 use oco::Tokenizer;
 use serde_json::Value;
@@ -21,15 +22,15 @@ const CALL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply
 const MARKERS: [&str; 2] = ["<tool_call>", "</tool_call>"];
 
 /// The template's effort sentences; medium, which is also please's default, has none.
-fn effort_instructions(effort: &str) -> Option<&'static str> {
+fn effort_instructions(effort: Effort) -> Option<&'static str> {
     match effort {
-        "high" => Some(
+        Effort::High => Some(
             "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
         ),
-        "low" => Some(
+        Effort::Low => Some(
             "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
         ),
-        _ => None,
+        Effort::Medium => None,
     }
 }
 
@@ -149,7 +150,7 @@ impl Prompt {
 
     /// Lead with tools, then the merged leading system and developer messages, as the template does.
     /// Static instructions precede per-invocation facts, so everything before the facts is cacheable.
-    fn system(&mut self, effort: Option<&str>, instructions: &str, facts: &str) -> Result<()> {
+    fn system(&mut self, effort: Option<Effort>, instructions: &str, facts: &str) -> Result<()> {
         self.marker("<|im_start|>");
         self.text("system\n");
         if let Some(instructions) = effort.and_then(effort_instructions) {
@@ -246,10 +247,8 @@ fn render(messages: &[ConversationMessage]) -> Result<Prompt> {
         let mut facts = Vec::new();
         for message in &messages[..preamble] {
             match message {
-                Effort(level) => effort = Some(level.as_str()),
-                System(text) | Developer(text) if !text.trim().is_empty() => {
-                    instructions.push(text.trim())
-                }
+                Effort(level) => effort = Some(*level),
+                Instructions(text) if !text.trim().is_empty() => instructions.push(text.trim()),
                 Fact(text) if !text.trim().is_empty() => facts.push(text.trim()),
                 _ => {}
             }
@@ -260,7 +259,7 @@ fn render(messages: &[ConversationMessage]) -> Result<Prompt> {
     while let Some(first) = rest.first() {
         match first {
             Effort(_) => rest = &rest[1..],
-            System(text) | Developer(text) | Fact(text) | User(text) => {
+            Instructions(text) | Fact(text) | Note(text) | User(text) => {
                 prompt.message("user", text);
                 rest = &rest[1..];
             }

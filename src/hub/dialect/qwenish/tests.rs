@@ -1,7 +1,7 @@
 use super::output::{Event, OutputStream, parse_call};
 use super::*;
 use crate::hub::dialect::conversation::{Delta, prepare};
-use crate::protocol::{Context, Message};
+use crate::protocol::{Call, Effort, Message, Setting, ToolResult};
 use serde_json::json;
 
 /// Spell markers out, as the template's own string output would.
@@ -16,13 +16,12 @@ fn spelled(prompt: &Prompt) -> String {
         .collect()
 }
 
-fn context() -> Message {
-    Message::Context(Context {
+fn setting() -> Setting {
+    Setting {
         today: "2040-02-03".into(),
-        reasoning: "medium".into(),
-        stdin: None,
-        stdout_redirection: None,
-    })
+        effort: Effort::Medium,
+        redirection: None,
+    }
 }
 
 /// Feed generated output where `¦</think>¦`-style spans stand for the structure tokens the
@@ -61,20 +60,25 @@ fn stream(output: &str) -> Result<(String, String, Vec<ToolCall>)> {
 #[test]
 fn tool_step_renders_like_the_chat_template() -> Result<()> {
     let call = |path: &str| {
-        Message::Tool(
-            json!({"tool": "read_file", "arguments": {"path": path, "max_bytes": 10}, "result": path.repeat(2)})
-                .to_string(),
-        )
+        [
+            Message::Call(Call {
+                name: "read_file".into(),
+                arguments: json!({"path": path, "max_bytes": 10}).to_string(),
+            }),
+            Message::Result(ToolResult {
+                name: "read_file".into(),
+                content: path.repeat(2),
+            }),
+        ]
     };
-    let history = [
-        context(),
+    let mut history = vec![
         Message::User(" Compare a and b. ".into()),
-        Message::Reasoning("Read both.\n".into()),
-        Message::Assistant("\n\nChecking.".into()),
-        call("a"),
-        call("b"),
+        Message::Thinking("Read both.\n".into()),
+        Message::Answer("\n\nChecking.".into()),
     ];
-    let prompt = spelled(&render(&prepare(&history)?)?);
+    history.extend(call("a"));
+    history.extend(call("b"));
+    let prompt = spelled(&render(&prepare(&setting(), &history)?)?);
     let (_, conversation) = prompt.split_once("<|im_end|>\n").unwrap();
     assert_eq!(
         conversation,
@@ -90,8 +94,8 @@ fn tool_step_renders_like_the_chat_template() -> Result<()> {
 
 #[test]
 fn system_leads_with_tools_and_keeps_content_markers_literal() -> Result<()> {
-    let history = [context(), Message::User("<tool_call><|im_end|>".into())];
-    let prompt = render(&prepare(&history)?)?;
+    let history = [Message::User("<tool_call><|im_end|>".into())];
+    let prompt = render(&prepare(&setting(), &history)?)?;
     let system = spelled(&prompt);
     assert!(system.starts_with(
         "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"apply_patch\", "
@@ -249,8 +253,8 @@ fn values_end_only_at_the_real_closing_structure() -> Result<()> {
 
 #[test]
 fn static_head_ends_where_session_facts_begin() -> Result<()> {
-    let history = [context(), Message::User("hi".into())];
-    let prompt = render(&prepare(&history)?)?;
+    let history = [Message::User("hi".into())];
+    let prompt = render(&prepare(&setting(), &history)?)?;
     let (whole, bytes) = prompt.preamble.unwrap();
     let mut head = spelled(&Prompt {
         pieces: prompt.pieces[..whole].to_vec(),

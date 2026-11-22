@@ -201,11 +201,11 @@ pub(super) fn parse_call(source: &str) -> Result<ToolCall> {
     let (name, body) = source
         .split_once('>')
         .ok_or_else(|| eyre!("unterminated function name"))?;
-    let tools = crate::tools::all_tools();
+    let tools = crate::hub::dialect::conversation::tool_specs();
     let (_, _, parameters) = tools
-        .get(name)
+        .into_iter()
+        .find(|(known, ..)| *known == name)
         .ok_or_else(|| eyre!("unknown tool {name}"))?;
-    let parameters = *parameters;
     let mut body = body
         .trim()
         .strip_suffix("</function>")

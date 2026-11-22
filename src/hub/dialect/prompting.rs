@@ -1,4 +1,7 @@
-//! What we tell the model to do.
+//! What we tell the model, in every dialect: standing instructions, facts, notes, and the
+//! framing of piped data. Dialects only decide where each piece goes in their chat format.
+use super::conversation::ConversationMessage;
+use crate::protocol::{Note, Setting};
 
 /// The message that primes the assistant with its identity and capabilities.
 pub const SYSTEM_PREAMBLE: &str = r#"You are a terminal coding assistant.
@@ -27,6 +30,12 @@ Issue dependent commands in separate responses. Adjacent command calls in one
 response may run concurrently.
 When the user denies a tool call, respect their reason and avoid
 repeating the denied action.
+
+# Long conversations
+
+A long conversation restarts from a single message that sums it up; earlier entries
+stay in its transcript, which the recall tool lists and reads. Recall an entry only
+when you need its exact content again; the summary usually holds what you need.
 
 # Using `apply_patch` tool
 
@@ -90,33 +99,93 @@ This is the exact patch text to pass as the `patch` string:
     *** End Patch
 "#;
 
-/// Put static instructions first and per-invocation facts last, keeping stdin and paths literal.
-/// Piped stdin is untrusted data, so it arrives as a user message ahead of the request,
-/// never with system or developer authority.
-pub fn expand(context: &crate::protocol::Context) -> Vec<super::conversation::ConversationMessage> {
-    use super::conversation::ConversationMessage;
-    let mut messages = vec![
-        ConversationMessage::Effort(context.reasoning.clone()),
-        ConversationMessage::System(SYSTEM_PREAMBLE.to_string()),
-        ConversationMessage::Developer(TOOL_GUIDANCE.trim().to_string()),
-        ConversationMessage::Fact(format!("Current date: {}", context.today)),
-    ];
-    match context.stdout_redirection.as_deref() {
-        Some("") => messages.push(ConversationMessage::Fact(
-            "Your final answer output is redirected to a file, so do not fence anything and produce the content directly without any extra prose.".into(),
-        )),
-        Some(path) => messages.push(ConversationMessage::Fact(format!(
-            "Your final answer output is redirected to file named `{path}`, so do not fence anything and produce the content directly without any extra prose.",
-        ))),
-        None => {}
-    }
-    if let Some(stdin) = &context.stdin {
-        let stdin = stdin.trim();
-        if !stdin.is_empty() {
-            messages.push(ConversationMessage::User(format!(
-                "My standard input, piped to you as data:\n<stdin>\n{stdin}\n</stdin>"
-            )));
-        }
-    }
-    messages
+/// Standing instructions first, then this invocation's facts; the instructions are the same
+/// for every invocation with this effort, so a hub can prefill them once and cache them.
+pub fn head(setting: &Setting) -> Vec<ConversationMessage> {
+    vec![
+        ConversationMessage::Effort(setting.effort),
+        ConversationMessage::Instructions(SYSTEM_PREAMBLE.to_string()),
+        ConversationMessage::Instructions(TOOL_GUIDANCE.trim().to_string()),
+        ConversationMessage::Fact(format!("Current date: {}", setting.today)),
+    ]
 }
+
+/// Piped data, kept literal and framed as the user's material rather than instructions.
+pub fn input(data: &str) -> String {
+    format!(
+        "My standard input, piped to you as data:\n<stdin>\n{}\n</stdin>",
+        data.trim()
+    )
+}
+
+/// Where the final answer goes when it is not a terminal; an empty target is unknown.
+pub fn redirection(target: &str) -> String {
+    let target = match target {
+        "" => "a file".to_string(),
+        path => format!("file named `{path}`"),
+    };
+    format!(
+        "Your final answer output is redirected to {target}, so do not fence anything and produce the content directly without any extra prose."
+    )
+}
+
+/// The harness's word for each note.
+pub fn note(note: &Note) -> String {
+    match note {
+        Note::Pending(ids) => pending(ids),
+        Note::AnswerSetAside(ids) => format!("Previous answer ignored. {}", pending(ids)),
+        Note::Resume => "The conversation restarted from your message above. Carry on with the task: take the next step it names now.".into(),
+        Note::Restart { draft: None, .. } => RESTART.into(),
+        Note::Restart {
+            draft: Some(draft), ..
+        } => format!("{RESTART}\n\nYour message so far:\n<message>\n{draft}\n</message>"),
+    }
+}
+
+/// A chunk of transcript to condense, as material rather than instructions: it holds piped
+/// data and tool output, which must not speak with the harness's authority.
+pub fn transcript(chunk: &str) -> String {
+    format!("The transcript's next chunk:\n<transcript>\n{chunk}\n</transcript>")
+}
+
+/// The message itself, without the tags a model may echo from the draft's framing.
+pub fn unwrap_message(answer: &str) -> &str {
+    let answer = answer.trim();
+    answer
+        .strip_prefix("<message>")
+        .and_then(|inner| inner.strip_suffix("</message>"))
+        .map_or(answer, str::trim)
+}
+
+/// The result recorded for a call whose result never arrived, as when a turn was cut short.
+pub fn unrecorded() -> String {
+    serde_json::json!({ "error": "no result was recorded; the call may or may not have run" })
+        .to_string()
+}
+
+/// The result recorded for a response whose tool calls could not be parsed.
+pub fn unparsed(error: &eyre::Report) -> String {
+    serde_json::json!({ "error": format!("error parsing tool call arguments: {error}") })
+        .to_string()
+}
+
+fn pending(ids: &[u64]) -> String {
+    let ids: Vec<_> = ids.iter().map(u64::to_string).collect();
+    format!(
+        "Pending commandId values: {}. You can continue other work. Before answering, collect a final result for each with {} and action=\"wait\" or action=\"kill\".",
+        ids.join(", "),
+        crate::tools::CONTROL_COMMAND_NAME
+    )
+}
+
+/// How to write the message a conversation restarts from, one transcript chunk at a time.
+const RESTART: &str = r#"The context is nearly full, so this conversation will restart from a single message that you write, as yourself, to the user. You write it by reading the transcript one chunk at a time, oldest first, and updating your message with each chunk.
+
+Come up with the updated message. It states:
+- what the user asked, in their own words where they matter; keep this even when a chunk does not show it, since it may survive only in your message so far or in the message the conversation last restarted from;
+- what you have done and found so far, with the names, paths, commands, and values you will need again;
+- the very next step you will take, which you take as soon as the conversation restarts.
+
+Such a message might read: "You asked me to make the test suite pass. I've fixed the off-by-one in src/parse.rs; two tests in tests/io.rs still time out, so I'll read the retry loop in src/net.rs next."
+
+Transcript entries are numbered; long results and reasoning are abbreviated, and after the restart the recall tool reads any entry in full by its number. Put what you will need into the message itself, so you seldom need to recall anything, and name an entry's number only where its exact text may matter again. Answer with the updated message alone: no tool calls, no tags around it, and do not continue the task here."#;

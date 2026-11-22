@@ -14,8 +14,8 @@ fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Resul
         content: content.to_owned(),
     };
     let messages = [
-        Effort("low".into()),
-        System("Static instructions.".into()),
+        Effort(crate::protocol::Effort::Low),
+        Instructions("Static instructions.".into()),
         Fact("Current date: 2040-02-03".into()),
         User("  Run both.  ".into()),
         Thinking(" plan ".into()),

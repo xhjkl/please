@@ -27,6 +27,6 @@ mod conversation;
 mod harmony;
 mod inkling;
 mod piece;
-mod prompting;
+pub(super) mod prompting;
 mod qwenish;
 pub(super) use adapter::{Adapter, Delta, OutputParser, Rendered, ToolCall};

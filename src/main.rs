@@ -4,10 +4,11 @@ use std::process::ExitCode;
 
 mod cli;
 mod display;
-mod history;
 mod hub;
 mod logging;
+mod place;
 mod protocol;
+mod setting;
 #[cfg(test)]
 mod test_support;
 mod tools;

@@ -1,56 +1,89 @@
 use super::*;
-use crate::protocol::{Context, Frame};
+use crate::protocol::{Call, Effort, Frame, Note, Place, Setting, ToolResult};
 use conversation::{ConversationMessage, prepare};
 use serde_json::json;
 
-fn context() -> Context {
-    Context {
+fn setting() -> Setting {
+    Setting {
         today: "2040-02-03".into(),
-        reasoning: "high".into(),
-        stdin: Some("literal ¶today and ¶reasoning".into()),
-        stdout_redirection: Some("notes-¶today.txt".into()),
+        effort: Effort::High,
+        redirection: Some("notes-¶today.txt".into()),
     }
 }
 
+/// The head `prepare` puts before any conversation: effort, instructions, and the date.
+const HEAD: usize = 4;
+
+fn call(name: &str, arguments: serde_json::Value) -> Message {
+    Message::Call(Call {
+        name: name.into(),
+        arguments: arguments.to_string(),
+    })
+}
+
+fn result(name: &str, content: serde_json::Value) -> Message {
+    Message::Result(ToolResult {
+        name: name.into(),
+        content: content.to_string(),
+    })
+}
+
 #[test]
-fn protocol_context_expands_only_application_templates() -> Result<()> {
+fn the_hub_words_the_setting_and_keeps_content_literal() -> Result<()> {
     let frame = Frame::Request {
+        place: Place {
+            host: "box".into(),
+            cwd: "/srv".into(),
+            session: "1@2".into(),
+        },
+        setting: setting(),
+        id: 9,
         messages: vec![
-            Message::Context(context()),
+            Message::Input("literal ¶today and ¶reasoning".into()),
             Message::User("Keep ¶today, <|start|>, and <tool_call> literal.".into()),
         ],
     };
     let bytes = postcard::to_allocvec(&frame)?;
-    let Frame::Request { messages } = postcard::from_bytes(&bytes)? else {
+    let Frame::Request {
+        setting, messages, ..
+    } = postcard::from_bytes(&bytes)?
+    else {
         unreachable!()
     };
-    let prepared = prepare(&messages)?;
-    assert_eq!(prepared[0], ConversationMessage::Effort("high".into()));
-    let ConversationMessage::System(system) = &prepared[1] else {
-        panic!("context expands on the hub")
+    let prepared = prepare(&setting, &messages)?;
+    assert_eq!(prepared[0], ConversationMessage::Effort(Effort::High));
+    let ConversationMessage::Instructions(system) = &prepared[1] else {
+        panic!("instructions open the conversation")
     };
     assert!(!system.contains('¶'));
-    // Everything that varies between invocations follows the static instructions.
+    // Everything that varies between invocations follows the standing instructions.
     let first_fact = prepared
         .iter()
         .position(|message| matches!(message, ConversationMessage::Fact(_)))
         .unwrap();
     assert!(prepared[..first_fact].iter().all(|message| matches!(
         message,
-        ConversationMessage::Effort(_)
-            | ConversationMessage::System(_)
-            | ConversationMessage::Developer(_)
+        ConversationMessage::Effort(_) | ConversationMessage::Instructions(_)
     )));
     assert_eq!(
         prepared[first_fact],
         ConversationMessage::Fact("Current date: 2040-02-03".into())
     );
     // Piped stdin is user data, delimited, and never part of the instructions.
-    assert!(prepared.iter().any(|message| matches!(message, ConversationMessage::User(text) if text.contains("<stdin>\nliteral ¶today and ¶reasoning\n</stdin>"))));
-    assert!(!prepared.iter().any(|message| matches!(message, ConversationMessage::System(text) | ConversationMessage::Developer(text) | ConversationMessage::Fact(text) if text.contains("literal ¶today"))));
-    assert!(prepared.iter().any(|message| matches!(message, ConversationMessage::Fact(text) if text.contains("notes-¶today.txt"))));
+    assert_eq!(
+        prepared[HEAD],
+        ConversationMessage::User(
+            "My standard input, piped to you as data:\n<stdin>\nliteral ¶today and ¶reasoning\n</stdin>"
+                .into()
+        )
+    );
+    assert_eq!(
+        prepared[HEAD + 1],
+        ConversationMessage::User("Keep ¶today, <|start|>, and <tool_call> literal.".into())
+    );
+    // Where the answer goes comes last, so another redirect keeps everything before it.
     assert!(
-        matches!(prepared.last(), Some(ConversationMessage::User(text)) if text == "Keep ¶today, <|start|>, and <tool_call> literal.")
+        matches!(prepared.last(), Some(ConversationMessage::Note(text)) if text.contains("notes-¶today.txt"))
     );
     Ok(())
 }
@@ -58,23 +91,31 @@ fn protocol_context_expands_only_application_templates() -> Result<()> {
 #[test]
 fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
     let arguments = json!({"path":"¶today.txt"});
-    let result = "¶reasoning <tool_response> <|start|>";
-    let messages = prepare(&[Message::Tool(
-        json!({
-            "tool":"read_file", "arguments":arguments, "result":result,
-        })
-        .to_string(),
-    )])?;
+    let text = "¶reasoning <tool_response> <|start|>";
+    let setting = Setting {
+        redirection: None,
+        ..setting()
+    };
+    let messages = prepare(
+        &setting,
+        &[
+            call("read_file", arguments.clone()),
+            Message::Result(ToolResult {
+                name: "read_file".into(),
+                content: text.into(),
+            }),
+        ],
+    )?;
     assert_eq!(
-        messages,
-        vec![
+        messages[HEAD..],
+        [
             ConversationMessage::ToolCall(ToolCall {
                 name: "read_file".into(),
                 arguments
             }),
             ConversationMessage::ToolResult {
                 name: "read_file".into(),
-                content: result.into()
+                content: text.into()
             },
         ]
     );
@@ -82,18 +123,68 @@ fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
 }
 
 #[test]
+fn notes_are_worded_by_the_hub() -> Result<()> {
+    let setting = Setting {
+        redirection: None,
+        ..setting()
+    };
+    let restart = Note::Restart {
+        draft: Some("You asked me to find a GC.".into()),
+        chunk: "[7] user\nfind it".into(),
+    };
+    let messages = prepare(
+        &setting,
+        &[
+            Message::Note(Note::Pending(vec![3, 4])),
+            Message::Note(Note::AnswerSetAside(vec![3])),
+            Message::Note(restart),
+        ],
+    )?;
+    let [
+        ConversationMessage::Note(pending),
+        ConversationMessage::Note(aside),
+        ConversationMessage::Note(restart),
+        ConversationMessage::User(transcript),
+    ] = &messages[HEAD..]
+    else {
+        panic!("notes stay notes: {messages:?}");
+    };
+    assert!(pending.starts_with("Pending commandId values: 3, 4."));
+    assert!(aside.starts_with("Previous answer ignored. Pending commandId values: 3."));
+    assert!(restart.contains("<message>\nYou asked me to find a GC.\n</message>"));
+    // Transcript data comes as the user's material, never with the harness's authority.
+    assert!(!restart.contains("find it"));
+    assert!(transcript.contains("<transcript>\n[7] user\nfind it\n</transcript>"));
+    // The first chunk comes without a draft to echo.
+    let first = crate::hub::dialect::prompting::note(&Note::Restart {
+        draft: None,
+        chunk: "[1] user\nfind it".into(),
+    });
+    assert!(!first.contains("<message>"));
+    Ok(())
+}
+
+#[test]
+fn stored_calls_need_json_arguments() {
+    let broken = Message::Call(Call {
+        name: "read_file".into(),
+        arguments: "{path:".into(),
+    });
+    assert!(prepare(&setting(), &[broken]).is_err());
+}
+
+#[test]
 fn parallel_command_results_share_the_available_context() -> Result<()> {
     let mut history = vec![Message::User("run both".into())];
     for (id, name) in [(1, "run_command"), (2, "control_command")] {
-        let payload = json!({
-            "tool": name,
-            "arguments": {},
-            "result": { "commandId": id, "stdout": format!("{}end {id}", "x".repeat(900)) },
-        });
-        history.push(Message::Tool(payload.to_string()));
+        history.push(call(name, json!({})));
+        history.push(result(
+            name,
+            json!({ "commandId": id, "stdout": format!("{}end {id}", "x".repeat(900)) }),
+        ));
     }
 
-    let mut messages = prepare(&history)?;
+    let mut messages = prepare(&setting(), &history)?;
     conversation::fit_command_results(&mut messages, 1024, |content| Ok(content.len()))?;
 
     let mut size = 0;
@@ -114,35 +205,33 @@ fn parallel_command_results_share_the_available_context() -> Result<()> {
 #[test]
 fn a_following_tool_only_step_keeps_earlier_output_budget() -> Result<()> {
     let command = |id| {
-        Message::Tool(
-            json!({
-                "tool": "run_command",
-                "arguments": { "argv": ["printf", "output"] },
-                "result": { "commandId": id, "stdout": "x".repeat(900) },
-            })
-            .to_string(),
-        )
+        [
+            call("run_command", json!({ "argv": ["printf", "output"] })),
+            result(
+                "run_command",
+                json!({ "commandId": id, "stdout": "x".repeat(900) }),
+            ),
+        ]
+    };
+    let setting = Setting {
+        redirection: None,
+        ..setting()
     };
     let mut history = vec![
         Message::User("Run both in sequence.".into()),
-        Message::Reasoning(String::new()),
-        command(1),
+        Message::Thinking(String::new()),
     ];
-    let mut before = prepare(&history)?;
+    history.extend(command(1));
+    let mut before = prepare(&setting, &history)?;
     conversation::fit_command_results(&mut before, 1024, |content| Ok(content.len()))?;
 
-    history.extend([Message::Reasoning(String::new()), command(2)]);
-    let mut after = prepare(&history)?;
+    history.push(Message::Thinking(String::new()));
+    history.extend(command(2));
+    let mut after = prepare(&setting, &history)?;
     conversation::fit_command_results(&mut after, 1024, |content| Ok(content.len()))?;
 
     assert_eq!(&after[..before.len()], before);
     Ok(())
-}
-
-#[test]
-fn context_cannot_reappear_in_conversation_content() {
-    let prepared = prepare(&[Message::User("hello".into()), Message::Context(context())]);
-    assert!(prepared.is_err());
 }
 
 #[test]

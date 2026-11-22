@@ -2,54 +2,67 @@ use super::super::conversation::Delta;
 use super::super::conversation::prepare;
 use super::output::{Event, Marker, OutputStream};
 use super::*;
-use crate::protocol::{Context, Message};
+use crate::protocol::{Call, Effort, Message, Note, Setting, ToolResult};
 use serde_json::json;
 
 /// `<|start|>` in the gpt-oss vocabulary, which error messages name.
 const START_ID: u32 = 200006;
 
+fn setting(today: &str, effort: Effort) -> Setting {
+    Setting {
+        today: today.into(),
+        effort,
+        redirection: None,
+    }
+}
+
 /// A conversation exercising every message shape after the header.
-fn tool_loop() -> Vec<Message> {
-    let tool = |name: &str, arguments, result| {
-        let exchange = json!({"tool": name, "arguments": arguments, "result": result});
-        Message::Tool(exchange.to_string())
+fn tool_loop() -> Vec<ConversationMessage> {
+    let tool = |name: &str, arguments: serde_json::Value, result: serde_json::Value| {
+        [
+            Message::Call(Call {
+                name: name.into(),
+                arguments: arguments.to_string(),
+            }),
+            Message::Result(ToolResult {
+                name: name.into(),
+                content: result.to_string(),
+            }),
+        ]
     };
-    vec![
-        Message::Context(Context {
-            today: "2026-11-20".into(),
-            reasoning: "medium".into(),
-            stdin: None,
-            stdout_redirection: None,
-        }),
+    let mut messages = vec![
         Message::User("Read notes.txt and tell me the secret.".into()),
-        Message::Reasoning("I should read the file.".into()),
-        tool(
-            "read_file",
-            json!({"path": "notes.txt"}),
-            json!({"content": "secret: <|end|> ¶ swordfish\n"}),
-        ),
-        Message::Reasoning("Got it.\n\nNow answer.".into()),
-        Message::Assistant("The secret is **swordfish**.".into()),
+        Message::Thinking("I should read the file.".into()),
+    ];
+    messages.extend(tool(
+        "read_file",
+        json!({"path": "notes.txt"}),
+        json!({"content": "secret: <|end|> ¶ swordfish\n"}),
+    ));
+    messages.extend([
+        Message::Thinking("Got it.\n\nNow answer.".into()),
+        Message::Answer("The secret is **swordfish**.".into()),
         Message::User("Thanks! Now list the directory.".into()),
-        tool(
-            "list_files",
-            json!({"path": ".", "max_depth": 1}),
-            json!({"entries": ["a", "b"]}),
-        ),
-        Message::Developer("Command pid 7 is still running; wait or kill.".into()),
-    ]
+    ]);
+    messages.extend(tool(
+        "list_files",
+        json!({"path": ".", "max_depth": 1}),
+        json!({"entries": ["a", "b"]}),
+    ));
+    messages.push(Message::Note(Note::Pending(vec![7])));
+    prepare(&setting("2026-11-20", Effort::Medium), &messages).unwrap()
 }
 
 #[test]
 fn conversation_renders_as_the_reference_encoder_does() -> Result<()> {
-    let (prompt, _) = render(&prepare(&tool_loop())?);
+    let (prompt, _) = render(&tool_loop());
     let text = prompt.spelled();
     // The reference encoder's output for the same history, from the facts message on.
     let expected = r#"<|start|>developer<|message|># Instructions
 
 Current date: 2026-11-20<|end|><|start|>user<|message|>Read notes.txt and tell me the secret.<|end|><|start|>assistant<|channel|>analysis<|message|>I should read the file.<|end|><|start|>assistant to=functions.read_file<|channel|>commentary <|constrain|>json<|message|>{"path":"notes.txt"}<|call|><|start|>functions.read_file to=assistant<|channel|>commentary<|message|>{"content":"secret: <|end|> ¶ swordfish\n"}<|end|><|start|>assistant<|channel|>analysis<|message|>Got it.
 
-Now answer.<|end|><|start|>assistant<|channel|>final<|message|>The secret is **swordfish**.<|end|><|start|>user<|message|>Thanks! Now list the directory.<|end|><|start|>assistant to=functions.list_files<|channel|>commentary <|constrain|>json<|message|>{"path":".","max_depth":1}<|call|><|start|>functions.list_files to=assistant<|channel|>commentary<|message|>{"entries":["a","b"]}<|end|><|start|>developer<|message|>Command pid 7 is still running; wait or kill.<|end|><|start|>assistant"#;
+Now answer.<|end|><|start|>assistant<|channel|>final<|message|>The secret is **swordfish**.<|end|><|start|>user<|message|>Thanks! Now list the directory.<|end|><|start|>assistant to=functions.list_files<|channel|>commentary <|constrain|>json<|message|>{"path":".","max_depth":1}<|call|><|start|>functions.list_files to=assistant<|channel|>commentary<|message|>{"entries":["a","b"]}<|end|><|start|>developer<|message|>Pending commandId values: 7. You can continue other work. Before answering, collect a final result for each with control_command and action="wait" or action="kill".<|end|><|start|>assistant"#;
     assert!(text.ends_with(expected), "{text}");
     let system = "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Instructions\n\n";
     assert!(text.starts_with(system));
@@ -59,30 +72,27 @@ Now answer.<|end|><|start|>assistant<|channel|>final<|message|>The secret is **s
 #[test]
 fn literal_markers_in_content_stay_text() -> Result<()> {
     let literal = r#"{"literal":"<|start|>","end":"<|end|>"}"#;
-    let (prompt, _) = render(&prepare(&[Message::User(literal.into())])?);
+    let messages = [Message::User(literal.into())];
+    let (prompt, _) = render(&prepare(&setting("2040-02-03", Effort::Medium), &messages)?);
     let starts = prompt
         .pieces
         .iter()
         .filter(|piece| **piece == Piece::Marker(START))
         .count();
-    // System, developer, user, and the open assistant turn.
-    assert_eq!(starts, 4);
+    // System, developer instructions and facts, user, and the open assistant turn.
+    assert_eq!(starts, 5);
     assert!(prompt.pieces.contains(&Piece::Text(literal.into())));
     Ok(())
 }
 
 #[test]
 fn static_head_is_the_system_and_tool_messages_alone() -> Result<()> {
-    let history = |today: &str, reasoning: &str| {
-        prepare(&[
-            Message::Context(Context {
-                today: today.into(),
-                reasoning: reasoning.into(),
-                stdin: Some("piped".into()),
-                stdout_redirection: None,
-            }),
+    let history = |today: &str, effort: Effort| {
+        let messages = [
+            Message::Input("piped".into()),
             Message::User("hello".into()),
-        ])
+        ];
+        prepare(&setting(today, effort), &messages)
     };
     let spelled_head = |messages: &[ConversationMessage]| {
         let (prompt, head) = render(messages);
@@ -91,9 +101,9 @@ fn static_head_is_the_system_and_tool_messages_alone() -> Result<()> {
         };
         pieces.spelled()
     };
-    let head = spelled_head(&history("2040-02-03", "medium")?);
-    assert_eq!(head, spelled_head(&history("2041-05-06", "medium")?));
-    assert_ne!(head, spelled_head(&history("2040-02-03", "high")?));
+    let head = spelled_head(&history("2040-02-03", Effort::Medium)?);
+    assert_eq!(head, spelled_head(&history("2041-05-06", Effort::Medium)?));
+    assert_ne!(head, spelled_head(&history("2040-02-03", Effort::High)?));
     assert!(
         head.contains("Reasoning: medium") && head.ends_with("} // namespace functions<|end|>")
     );

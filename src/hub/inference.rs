@@ -8,7 +8,7 @@
 use super::dialect::{Adapter, Dialect, OutputParser, Rendered};
 use super::occupancy::Occupancy;
 use super::preamble;
-use crate::protocol::Message;
+use crate::protocol::{Message, Setting};
 use eyre::{Result, ensure, eyre};
 use std::ops::Range;
 use std::time::Instant;
@@ -48,9 +48,9 @@ pub struct Engine {
 /// The session with the conversation it last served.
 struct Kept {
     session: oco::Session,
-    /// The connection whose requests it last served.
+    /// The conversation whose requests it last served.
     owner: u64,
-    /// That conversation's probe history indices clipped from every prompt it was fed.
+    /// That conversation's history indices clipped from every prompt it was fed.
     dropped: Vec<Range<usize>>,
 }
 
@@ -94,12 +94,28 @@ impl Engine {
     }
 
     /// Encode neutral history with this checkpoint's tokenizer and selected dialect.
-    pub fn render(&self, history: &[Message], tail_budget: usize) -> Result<Rendered> {
+    pub fn render(
+        &self,
+        setting: &Setting,
+        history: &[Message],
+        tail_budget: usize,
+    ) -> Result<Rendered> {
         self.adapter
-            .render(self.weights.tokenizer(), history, tail_budget)
+            .render(self.weights.tokenizer(), setting, history, tail_budget)
     }
 
-    /// Name a client whose requests extend one conversation.
+    /// Tokens the session holds.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// What share of the context a prompt of this history fills.
+    pub fn fill(&self, setting: &Setting, history: &[Message]) -> Result<f64> {
+        let tokens = self.render(setting, history, self.capacity)?.tokens.len();
+        Ok(tokens as f64 / self.capacity as f64)
+    }
+
+    /// A conversation key shared with no other, for prompts that extend nothing kept.
     pub fn connect(&self) -> u64 {
         self.connections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -163,6 +179,12 @@ pub async fn load_model(model_path: &std::path::Path, dialect: Dialect) -> Resul
     let weights = blocking(move || oco::load(load_path)).await?;
     let weights = weights.map_err(|error| eyre!(error))?;
     let capacity = weights.capacity_within(GPU_SHARE);
+    // `PLEASE_CONTEXT` caps the context, to try long-conversation behavior on short ones.
+    let capacity = match std::env::var("PLEASE_CONTEXT").ok().map(|cap| cap.parse()) {
+        Some(Ok(cap)) => capacity.min(cap),
+        Some(Err(_)) => eyre::bail!("PLEASE_CONTEXT must be a number of tokens"),
+        None => capacity,
+    };
     ensure!(
         capacity >= MIN_CAPACITY,
         "{} leaves too little GPU memory for a context ({capacity} tokens)",
@@ -188,7 +210,8 @@ pub async fn load_model(model_path: &std::path::Path, dialect: Dialect) -> Resul
 /// Stream greedy predictions, stopping at a model boundary or a bounded output limit.
 pub async fn generate(
     engine: &Engine,
-    connection: u64,
+    conversation: u64,
+    setting: &Setting,
     history: &[Message],
     generated: UnboundedSender<Generated>,
     max_tokens: Option<usize>,
@@ -199,15 +222,14 @@ pub async fn generate(
         return Ok(None);
     }
     let capacity = engine.capacity;
-    let context = usize::from(matches!(history.first(), Some(Message::Context(_))));
-    let base = engine.render(&history[..context], capacity)?.tokens.len();
+    let base = engine.render(setting, &[], capacity)?.tokens.len();
     if base >= capacity / 2 {
         eyre::bail!(
             "system instructions and stdin exceed half the {capacity}-token context; shorten the input"
         );
     }
     let tail_budget = capacity - base - REPLY_ROOM;
-    let whole = engine.render(history, tail_budget)?;
+    let whole = engine.render(setting, history, tail_budget)?;
     let head = &whole.tokens[..whole.preamble];
     // Holding the head means rewinding to it is free, whichever conversation came before;
     // otherwise the old session goes before its replacement is allocated.
@@ -220,22 +242,22 @@ pub async fn generate(
             let (session, start) = engine.start(head).await?;
             let kept = Kept {
                 session,
-                owner: connection,
+                owner: conversation,
                 dropped: vec![],
             };
             (kept, start)
         }
     };
-    if kept.owner != connection {
+    if kept.owner != conversation {
         // Clipping indices describe the previous conversation's history.
-        kept.owner = connection;
+        kept.owner = conversation;
         kept.dropped.clear();
     }
-    let size = |visible: &[Message]| Ok(engine.render(visible, tail_budget)?.tokens.len());
+    let size = |visible: &[Message]| Ok(engine.render(setting, visible, tail_budget)?.tokens.len());
     let limit = capacity - REPLY_ROOM;
     kept.dropped = clipping::choose(history, &kept.dropped, limit, capacity / 2, size)?;
     let visible = clipping::visible(history, &kept.dropped);
-    let mut tokens = engine.render(&visible, tail_budget)?.tokens;
+    let mut tokens = engine.render(setting, &visible, tail_budget)?.tokens;
     let limit = max_tokens.unwrap_or(MAX_GENERATED_TOKENS);
     let mut reply = Vec::new();
     let mut turn = None;
@@ -278,7 +300,7 @@ pub async fn generate(
         }
         // The context filled mid-reply: drop more history so the reply can continue.
         let size = |visible: &[Message]| {
-            Ok(engine.render(visible, tail_budget)?.tokens.len() + reply.len())
+            Ok(engine.render(setting, visible, tail_budget)?.tokens.len() + reply.len())
         };
         kept.dropped = match clipping::choose(
             history,
@@ -291,7 +313,7 @@ pub async fn generate(
             Err(error) => break Err(error),
         };
         let visible = clipping::visible(history, &kept.dropped);
-        tokens = match engine.render(&visible, tail_budget) {
+        tokens = match engine.render(setting, &visible, tail_budget) {
             Ok(rendered) => rendered.tokens,
             Err(error) => break Err(error),
         };

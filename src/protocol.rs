@@ -2,34 +2,106 @@
 use eyre::{Result, eyre};
 use serde::{Deserialize, Serialize};
 
-/// Probe-local session facts; the hub turns them into model instructions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Context {
-    pub today: String,
-    pub reasoning: String,
-    pub stdin: Option<String>,
-    /// None for a terminal; an empty path for a redirect whose destination is unknown.
-    pub stdout_redirection: Option<String>,
+/// How hard the model should think before answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Facts about this invocation that the hub states to the model; they hold for every message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Setting {
+    pub today: String,
+    pub effort: Effort,
+    /// Where the final answer goes: `None` for a terminal, an empty path for a redirect whose
+    /// destination is unknown.
+    pub redirection: Option<String>,
+}
+
+/// Where a probe runs; the hub keeps one conversation per place.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Place {
+    pub host: String,
+    /// The canonical working directory.
+    pub cwd: String,
+    /// The terminal session, so each shell has its own conversation.
+    pub session: String,
+}
+
+/// One entry of a conversation, in terms no model's chat format dictates; the hub words and
+/// frames them for the loaded checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
-    System(String),
-    Developer(String),
+    /// What the person asked.
     User(String),
-    Reasoning(String),
-    Tool(String),
-    Assistant(String),
-    /// Session context, present only at the beginning of probe history.
-    Context(Context),
+    /// Data the person piped in alongside a request: material, never instructions.
+    Input(String),
+    /// The harness's word in the middle of a conversation.
+    Note(Note),
+    /// The model's reasoning before it answers or calls tools.
+    Thinking(String),
+    /// The model's visible answer.
+    Answer(String),
+    /// A tool call the model made.
+    Call(Call),
+    /// What a tool returned to the model.
+    Result(ToolResult),
+}
+
+/// Something the harness tells the model; the hub chooses the words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Note {
+    /// These commands still run; each needs a final result before the answer.
+    Pending(Vec<u64>),
+    /// An answer arrived while these commands still ran, so it was set aside.
+    AnswerSetAside(Vec<u64>),
+    /// The context is nearly full: fold the next chunk of the transcript into the message the
+    /// conversation restarts from, as drafted so far (none before the first chunk).
+    Restart {
+        draft: Option<String>,
+        chunk: String,
+    },
+    /// The conversation just restarted in the middle of a task: carry on from its message.
+    Resume,
+}
+
+/// A named tool invocation with its arguments as a JSON object's text (postcard cannot carry
+/// `serde_json::Value`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Call {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// A tool's output as text, JSON for structured results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub name: String,
+    pub content: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Frame {
+    /// Continue the place's conversation with what is new since the hub's last reply: a
+    /// request, or tool results; notes hold for this request only. A retry after a dropped
+    /// connection carries the same `id`, so the hub keeps its messages once.
     Request {
+        place: Place,
+        setting: Setting,
+        id: u64,
         messages: Vec<Message>,
     },
+    /// Restart the place's conversation: from a message summing it up, or from nothing.
+    Restart {
+        place: Place,
+        setting: Setting,
+        summarize: bool,
+    },
     Log(String),
+    /// The message the conversation restarted from; the probe shows it apart from the answer.
+    Restarted(String),
     Answer(String),
     Thinking(String),
     ToolCall {
@@ -37,7 +109,6 @@ pub enum Frame {
         /// Tool arguments encoded as JSON text because postcard cannot deserialize `serde_json::Value`.
         arguments_json: String,
     },
-    ToolCallParseError(String),
     Stop,
     ModelInfoRequest,
     ModelInfo {
@@ -46,6 +117,7 @@ pub enum Frame {
     },
     Error(String),
     BenchmarkRequest {
+        setting: Setting,
         messages: Vec<Message>,
         max_tokens: usize,
     },

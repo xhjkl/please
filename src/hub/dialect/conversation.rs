@@ -1,18 +1,20 @@
 //! Neutral conversation data shared by the hub-side adapters.
-use crate::protocol::Message;
+use crate::protocol::{Effort, Message, Note, Setting};
 use crate::tools::ParamType;
-use eyre::{Result, eyre};
+use eyre::{Result, WrapErr};
 use serde_json::{Map, Value, json};
 
-/// Probe history with context expanded and tool exchanges split into calls and results.
+/// A conversation with every message worded, ready for a dialect to frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationMessage {
     /// Requested reasoning effort, stated wherever each dialect's chat template expects it.
-    Effort(String),
-    System(String),
-    Developer(String),
-    /// Per-invocation fact or input (date, stdin, redirection), placed after all static text.
+    Effort(Effort),
+    /// The harness's standing instructions, the same for every invocation.
+    Instructions(String),
+    /// A fact about this invocation (the date), placed after all standing text.
     Fact(String),
+    /// The harness's word in the middle of the conversation.
+    Note(String),
     User(String),
     Answer(String),
     Thinking(String),
@@ -31,11 +33,11 @@ pub struct ToolCall {
 }
 
 impl ConversationMessage {
-    /// Leading entries that dialects fold into their system and developer header.
+    /// Leading entries that dialects fold into their header.
     pub fn is_preamble(&self) -> bool {
         matches!(
             self,
-            Self::Effort(_) | Self::System(_) | Self::Developer(_) | Self::Fact(_)
+            Self::Effort(_) | Self::Instructions(_) | Self::Fact(_)
         )
     }
 }
@@ -55,13 +57,23 @@ pub enum Delta {
     Thinking(String),
 }
 
+/// A tool's name, description, and parameters, as the model is told them.
+pub type ToolSpec = (&'static str, &'static str, &'static [crate::tools::Param]);
+
+/// Every tool the model may call, the probe's and the hub's own, by name.
+pub fn tool_specs() -> Vec<ToolSpec> {
+    let probe = crate::tools::all_tools().into_iter();
+    let probe = probe.map(|(name, (description, _, parameters))| (name, description, parameters));
+    let mut tools: Vec<_> = probe.chain([crate::hub::transcript::RECALL_SPEC]).collect();
+    tools.sort_by_key(|(name, ..)| *name);
+    tools
+}
+
 /// Declare every tool as an OpenAI-style function schema for the chat templates.
 pub fn tool_schemas() -> Vec<Value> {
-    let mut tools: Vec<_> = crate::tools::all_tools().into_iter().collect();
-    tools.sort_by_key(|(name, _)| *name);
-    tools
+    tool_specs()
         .into_iter()
-        .map(|(name, (description, _, parameters))| {
+        .map(|(name, description, parameters)| {
             let mut properties = Map::new();
             let mut required = Vec::new();
             for parameter in parameters {
@@ -170,66 +182,39 @@ pub fn fit_command_results(
     Ok(())
 }
 
-/// Expand probe context and tool exchanges before dialect-specific encoding.
-pub fn prepare(history: &[Message]) -> Result<Vec<ConversationMessage>> {
-    let mut out = Vec::new();
-    for (index, message) in history.iter().enumerate() {
-        match message {
-            Message::Context(context) => {
-                if index != 0 {
-                    return Err(eyre!("session context must be the first history entry"));
-                }
-                out.extend(super::prompting::expand(context));
+/// Word the setting and the conversation: standing instructions first, then per-invocation
+/// facts, the conversation itself, and where the answer goes last, so a different redirect
+/// leaves everything before it reusable.
+pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<ConversationMessage>> {
+    let mut out = super::prompting::head(setting);
+    for message in history {
+        let worded = match message {
+            Message::User(text) => ConversationMessage::User(text.clone()),
+            Message::Input(data) => ConversationMessage::User(super::prompting::input(data)),
+            Message::Note(note @ Note::Restart { chunk, .. }) => {
+                let instructions = ConversationMessage::Note(super::prompting::note(note));
+                out.push(instructions);
+                ConversationMessage::User(super::prompting::transcript(chunk))
             }
-            Message::System(content) => out.push(ConversationMessage::System(content.clone())),
-            Message::Developer(content) => {
-                out.push(ConversationMessage::Developer(content.clone()))
-            }
-            Message::User(content) => out.push(ConversationMessage::User(content.clone())),
-            Message::Reasoning(content) => out.push(ConversationMessage::Thinking(content.clone())),
-            Message::Assistant(content) => out.push(ConversationMessage::Answer(content.clone())),
-            Message::Tool(content) => push_tool_history(&mut out, content),
-        }
+            Message::Note(note) => ConversationMessage::Note(super::prompting::note(note)),
+            Message::Thinking(text) => ConversationMessage::Thinking(text.clone()),
+            Message::Answer(text) => ConversationMessage::Answer(text.clone()),
+            Message::Call(call) => ConversationMessage::ToolCall(ToolCall {
+                name: call.name.clone(),
+                arguments: serde_json::from_str(&call.arguments)
+                    .wrap_err_with(|| format!("tool call {} has invalid arguments", call.name))?,
+            }),
+            Message::Result(result) => ConversationMessage::ToolResult {
+                name: result.name.clone(),
+                content: result.content.clone(),
+            },
+        };
+        out.push(worded);
+    }
+    if let Some(target) = &setting.redirection {
+        out.push(ConversationMessage::Note(super::prompting::redirection(
+            target,
+        )));
     }
     Ok(out)
-}
-
-/// Split one probe tool record into the call and result it holds; unreadable records become results.
-fn push_tool_history(out: &mut Vec<ConversationMessage>, content: &str) {
-    let value = serde_json::from_str::<Value>(content);
-    let Ok(value) = value else {
-        out.push(ConversationMessage::ToolResult {
-            name: "tool".to_string(),
-            content: content.to_string(),
-        });
-        return;
-    };
-
-    let name = value
-        .get("tool")
-        .and_then(Value::as_str)
-        .unwrap_or("tool")
-        .to_string();
-    if let Some(arguments) = value.get("arguments") {
-        out.push(ConversationMessage::ToolCall(ToolCall {
-            name: name.clone(),
-            arguments: arguments.clone(),
-        }));
-    }
-    if let Some(result) = value.get("result") {
-        let content = result
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| result.to_string());
-        out.push(ConversationMessage::ToolResult {
-            name: name.clone(),
-            content,
-        });
-    }
-    if value.get("arguments").is_none() && value.get("result").is_none() {
-        out.push(ConversationMessage::ToolResult {
-            name,
-            content: content.to_string(),
-        });
-    }
 }

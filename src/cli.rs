@@ -1,3 +1,4 @@
+mod commands;
 mod connect;
 mod io;
 mod repl;

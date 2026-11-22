@@ -6,9 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use super::dialect::Delta;
 use super::inference::{self, Engine};
-use crate::protocol::Message;
 use crate::protocol::{Frame, ProtocolError, read_frame_from_stream, write_frame_to_stream};
 
 /// Load the hub's explicit checkpoint or discover the best installed model on this machine.
@@ -82,66 +80,6 @@ async fn cleanup_stale_socket(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Run streaming inference and forward deltas to the sink.
-async fn serve_one_turn(
-    sink: &mut (impl AsyncWriteExt + Unpin),
-    hub: Arc<Engine>,
-    connection: u64,
-    history: &[Message],
-) -> Result<()> {
-    let mut parser = hub.output_parser()?;
-    let (generated_tx, mut generated_rx) =
-        tokio::sync::mpsc::unbounded_channel::<inference::Generated>();
-
-    let history = history.to_owned();
-    let worker = hub.clone();
-    let inference = tokio::spawn(async move {
-        inference::generate(&worker, connection, &history, generated_tx, None).await
-    });
-
-    while let Some(event) = generated_rx.recv().await {
-        match event {
-            inference::Generated::Stop => break,
-            inference::Generated::Token(token) => {
-                let deltas = parser.push_token(token)?;
-                for delta in deltas {
-                    match delta {
-                        Delta::Answer(text) => {
-                            write_frame_to_stream(sink, &Frame::Answer(text)).await?;
-                        }
-                        Delta::Thinking(text) => {
-                            write_frame_to_stream(sink, &Frame::Thinking(text)).await?;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    inference.await??;
-    let calls = parser.finish();
-    match calls {
-        Err(error) => {
-            write_frame_to_stream(sink, &Frame::ToolCallParseError(error.to_string())).await?;
-        }
-        Ok(calls) => {
-            for call in calls {
-                write_frame_to_stream(
-                    sink,
-                    &Frame::ToolCall {
-                        name: call.name,
-                        arguments_json: serde_json::to_string(&call.arguments)?,
-                    },
-                )
-                .await?;
-            }
-        }
-    }
-    write_frame_to_stream(sink, &Frame::Stop).await?;
-
-    Ok(())
-}
-
 /// Read a complete request within the frame deadline.
 async fn read_request(
     stream: &mut UnixStream,
@@ -176,8 +114,6 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
 
     let mut store = Vec::with_capacity(4096);
     let mut request = read_request(stream, &mut store).await;
-    // Requests on one connection extend one conversation, so they share one session.
-    let connection = hub.connect();
     // Only an introduced probe may use the session, and only one probe at a time.
     let mut admission = None;
 
@@ -204,17 +140,24 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
                 admission = Some(admitted);
                 write_frame_to_stream(stream, &Frame::Welcome).await
             }
-            Frame::Request { .. } | Frame::BenchmarkRequest { .. } if admission.is_none() => {
+            Frame::Request { .. } | Frame::Restart { .. } | Frame::BenchmarkRequest { .. }
+                if admission.is_none() =>
+            {
                 let refusal = Frame::Error(
                     "the probe did not say hello; probe and hub are probably different versions of please"
                         .into(),
                 );
                 return write_frame_to_stream(stream, &refusal).await;
             }
-            Frame::Request { messages } => {
+            Frame::Request {
+                place,
+                setting,
+                id,
+                messages,
+            } => {
                 tracing::info!("hub: received inference request");
                 let (mut reader, mut writer) = stream.split();
-                let turn = serve_one_turn(&mut writer, hub.clone(), connection, &messages);
+                let turn = super::turn::serve(&mut writer, &hub, &place, &setting, id, messages);
                 tokio::pin!(turn);
                 let mut byte = [0];
                 tokio::select! {
@@ -231,12 +174,37 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
                     result = &mut turn => result,
                 }
             }
+            Frame::Restart {
+                place,
+                setting,
+                summarize,
+            } => {
+                tracing::info!("hub: received restart request");
+                let (mut reader, mut writer) = stream.split();
+                let restart = super::turn::restart(&mut writer, &hub, &place, &setting, summarize);
+                tokio::pin!(restart);
+                let mut byte = [0];
+                // A probe that goes away cancels the restart before it is kept.
+                tokio::select! {
+                    biased;
+                    read = reader.read(&mut byte) => {
+                        if read? == 0 {
+                            return Ok(());
+                        }
+                        store.extend_from_slice(&byte[..1]);
+                        restart.await
+                    }
+                    result = &mut restart => result,
+                }
+            }
             Frame::BenchmarkRequest {
+                setting,
                 messages,
                 max_tokens,
             } => {
                 tracing::info!("hub: received benchmark request");
-                let report = super::benchmark::measure(hub.clone(), messages, max_tokens).await;
+                let report =
+                    super::benchmark::measure(hub.clone(), setting, messages, max_tokens).await;
                 match report {
                     Err(error) => Err(error),
                     Ok(report) => {

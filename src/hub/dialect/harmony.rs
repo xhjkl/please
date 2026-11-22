@@ -14,6 +14,7 @@ use super::conversation::{
 };
 use super::piece::{Piece, encode_pieces, encode_text};
 use super::{Adapter as DialectAdapter, OutputParser as DialectOutputParser};
+use crate::protocol::Effort;
 use eyre::Result;
 use oco::Tokenizer;
 use serde_json::Value;
@@ -157,15 +158,13 @@ fn header(prompt: &mut Prompt, preamble: &[ConversationMessage]) -> usize {
     for message in preamble {
         match message {
             ConversationMessage::Effort(level) => {
-                effort = match level.as_str() {
-                    "high" => "high",
-                    "low" => "low",
-                    _ => "medium",
+                effort = match level {
+                    Effort::High => "high",
+                    Effort::Low => "low",
+                    Effort::Medium => "medium",
                 }
             }
-            ConversationMessage::System(text) | ConversationMessage::Developer(text) => {
-                instructions.push(text.trim())
-            }
+            ConversationMessage::Instructions(text) => instructions.push(text.trim()),
             ConversationMessage::Fact(text) => facts.push(text.trim()),
             _ => {}
         }
@@ -247,7 +246,7 @@ fn typescript(schema: &Value) -> String {
     }
 }
 
-/// Append a conversation entry; instructions arriving mid-conversation stay developer text.
+/// Append a conversation entry; the harness's word mid-conversation is developer text.
 fn conversation_message(prompt: &mut Prompt, message: &ConversationMessage) {
     let assistant = |channel| Header {
         author: "assistant",
@@ -256,9 +255,9 @@ fn conversation_message(prompt: &mut Prompt, message: &ConversationMessage) {
     };
     match message {
         ConversationMessage::Effort(_) => {}
-        ConversationMessage::System(content)
-        | ConversationMessage::Developer(content)
-        | ConversationMessage::Fact(content) => prompt.message(Header::of("developer"), content),
+        ConversationMessage::Instructions(content)
+        | ConversationMessage::Fact(content)
+        | ConversationMessage::Note(content) => prompt.message(Header::of("developer"), content),
         ConversationMessage::User(content) => prompt.message(Header::of("user"), content),
         ConversationMessage::Answer(content) => prompt.message(assistant("final"), content),
         ConversationMessage::Thinking(content) if content.is_empty() => {}

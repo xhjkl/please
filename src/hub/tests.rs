@@ -1,5 +1,24 @@
 use super::*;
+use crate::protocol::{Effort, Message, Place, Setting};
 use tokio::io::AsyncWriteExt;
+
+/// A request carrying `messages`, from nowhere in particular.
+fn request(messages: Vec<Message>) -> Frame {
+    Frame::Request {
+        place: Place {
+            host: "host".into(),
+            cwd: "/".into(),
+            session: "1@1".into(),
+        },
+        setting: Setting {
+            today: "2040-02-03".into(),
+            effort: Effort::Medium,
+            redirection: None,
+        },
+        id: 1,
+        messages,
+    }
+}
 
 #[tokio::test]
 async fn starting_hub_preserves_a_live_forwarding_socket() -> Result<()> {
@@ -65,7 +84,7 @@ async fn established_connection_survives_long_tool_waits() {
         }
     });
 
-    let request = Frame::Request { messages: vec![] };
+    let request = request(vec![]);
     let mut store = Vec::new();
     write_frame_to_stream(&mut client, &request).await.unwrap();
     let reply: Frame = read_frame_from_stream(&mut client, &mut store, None, None)
@@ -100,7 +119,7 @@ async fn idle_initial_connection_times_out() {
 #[tokio::test(start_paused = true)]
 async fn incomplete_request_on_established_connection_times_out() {
     let (mut client, mut server) = UnixStream::pair().unwrap();
-    let request = postcard::to_allocvec(&Frame::Request { messages: vec![] }).unwrap();
+    let request = postcard::to_allocvec(&request(vec![])).unwrap();
     client.write_all(&request[..1]).await.unwrap();
 
     // Observing socket readiness before starting the virtual frame deadline.
@@ -119,14 +138,12 @@ async fn incomplete_request_on_established_connection_times_out() {
 #[tokio::test]
 async fn buffered_request_is_delivered_before_disconnect() {
     let (client, mut server) = UnixStream::pair().unwrap();
-    let mut store = postcard::to_allocvec(&Frame::Request {
-        messages: vec![Message::User("already received".into())],
-    })
-    .unwrap();
+    let mut store =
+        postcard::to_allocvec(&request(vec![Message::User("already received".into())])).unwrap();
     drop(client);
 
     let request = wait_for_request(&mut server, &mut store).await.unwrap();
-    let Frame::Request { messages } = request else {
+    let Frame::Request { messages, .. } = request else {
         panic!("buffered request is delivered even after the peer closes");
     };
     assert!(matches!(messages.as_slice(), [Message::User(text)] if text == "already received"));

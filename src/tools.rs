@@ -31,6 +31,7 @@ pub use self::common::ParamType;
 
 mod apply_patch;
 mod command;
+mod find_related;
 mod list_files;
 mod read_file;
 
@@ -100,6 +101,7 @@ pub fn all_tools() -> ExposedTools {
     [
         tool!(list_files::SPEC, list_files::call),
         tool!(read_file::SPEC, read_file::call),
+        tool!(find_related::SPEC, find_related::call),
         tool!(apply_patch::SPEC, apply_patch::call),
     ]
     .into_iter()
