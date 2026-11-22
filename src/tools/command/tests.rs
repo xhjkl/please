@@ -36,7 +36,7 @@ async fn control(
 }
 
 fn command_id(result: &Value) -> u64 {
-    result["commandId"].as_u64().unwrap()
+    result["command_id"].as_u64().unwrap()
 }
 
 async fn wait_for_stdout(context: ToolContext<'_>, id: u64, text: &str) -> Value {
@@ -89,11 +89,11 @@ async fn captures_command_output_with_shape_for_history() {
     .await;
 
     assert_eq!(result["status"], "finished");
-    assert_eq!(result["exitCode"], 0);
+    assert_eq!(result["exit_code"], 0);
     assert_eq!(result["stdout"], "hello");
     assert_eq!(result["stderr"], "problem");
-    assert_eq!(result["stdoutBytesOmitted"], 0);
-    assert_eq!(result["stderrBytesOmitted"], 0);
+    assert_eq!(result["stdout_bytes_omitted"], 0);
+    assert_eq!(result["stderr_bytes_omitted"], 0);
 }
 
 #[tokio::test]
@@ -136,18 +136,18 @@ async fn overflowing_output_retains_each_streams_latest_bytes() {
     .await;
 
     assert_eq!(result["status"], "finished");
-    assert_eq!(result["exitCode"], 0);
+    assert_eq!(result["exit_code"], 0);
     for (stream, omitted, old, latest, fill) in [
         (
             "stdout",
-            "stdoutBytesOmitted",
+            "stdout_bytes_omitted",
             old_stdout,
             latest_stdout,
             b'x',
         ),
         (
             "stderr",
-            "stderrBytesOmitted",
+            "stderr_bytes_omitted",
             old_stderr,
             latest_stderr,
             b'y',
@@ -275,7 +275,7 @@ async fn kill_reports_finished_if_command_was_already_reaped() {
 
     let result = control(command_id(&started), Action::Kill, None, context).await;
     assert_eq!(result["status"], "finished");
-    assert_eq!(result["exitCode"], 0);
+    assert_eq!(result["exit_code"], 0);
     assert_eq!(result["stdout"], "after");
 }
 

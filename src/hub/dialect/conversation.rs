@@ -112,9 +112,9 @@ fn trim_command_stream(result: &mut Value) -> usize {
     };
     // Reducing the longer stream first; short diagnostics in the other remain visible.
     let (stream, counter) = if length("stdout") >= length("stderr") {
-        ("stdout", "stdoutBytesOmitted")
+        ("stdout", "stdout_bytes_omitted")
     } else {
-        ("stderr", "stderrBytesOmitted")
+        ("stderr", "stderr_bytes_omitted")
     };
     let Some(Value::String(output)) = result.get_mut(stream) else {
         return 0;
@@ -191,9 +191,12 @@ pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<Conversatio
         let worded = match message {
             Message::User(text) => ConversationMessage::User(text.clone()),
             Message::Input(data) => ConversationMessage::User(super::prompting::input(data)),
-            Message::Note(note @ Note::Restart { chunk, .. }) => {
-                let instructions = ConversationMessage::Note(super::prompting::note(note));
-                out.push(instructions);
+            // The draft is the model's own message, and the chunk is material, not instructions.
+            Message::Note(note @ Note::Restart { draft, chunk }) => {
+                out.push(ConversationMessage::Note(super::prompting::note(note)));
+                if let Some(draft) = draft {
+                    out.push(ConversationMessage::Answer(draft.clone()));
+                }
                 ConversationMessage::User(super::prompting::transcript(chunk))
             }
             Message::Note(note) => ConversationMessage::Note(super::prompting::note(note)),

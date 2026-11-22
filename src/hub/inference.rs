@@ -14,7 +14,7 @@ use std::ops::Range;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 
-mod clipping;
+pub(super) mod clipping;
 mod reuse;
 
 const MAX_GENERATED_TOKENS: usize = 8_192;
@@ -74,12 +74,14 @@ pub enum Start {
     Fresh,
 }
 
-/// What one request cost before its first prediction.
+/// What one request cost before its first prediction, and how its reply ended.
 #[derive(Debug, Clone, Copy)]
 pub struct Turn {
     pub start: Start,
     pub prompt_tokens: usize,
     pub reused_tokens: usize,
+    /// The reply ended by itself rather than at the output limit.
+    pub complete: bool,
 }
 
 /// Run file or allocation work off the async runtime.
@@ -278,6 +280,7 @@ pub async fn generate(
                 start,
                 prompt_tokens: tokens.len(),
                 reused_tokens: reused,
+                complete: false,
             };
             // Measured from taking the session, so it includes any head prefill.
             let seconds = started.elapsed().as_secs_f64();
@@ -326,7 +329,10 @@ pub async fn generate(
             if ended == Ended::Limit && max_tokens.is_none() {
                 eyre::bail!("model exceeded the {limit}-token output limit");
             }
-            Ok(turn)
+            Ok(turn.map(|turn| Turn {
+                complete: ended == Ended::Finished,
+                ..turn
+            }))
         }
         Err(error) => Err(error),
     }

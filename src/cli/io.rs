@@ -3,6 +3,8 @@ use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 #[cfg(unix)]
+use std::os::fd::AsFd;
+#[cfg(unix)]
 use std::path::Path;
 
 #[cfg(target_os = "macos")]
@@ -33,8 +35,14 @@ pub fn read_whole_stdin() -> eyre::Result<Option<String>> {
 pub fn stdout_redirection_path() -> Option<String> {
     const FD: i32 = 1; // STDOUT
 
-    // If stdout is a TTY, we are interactive.
-    if std::io::stdout().is_terminal() {
+    // A terminal, a pipe, or a device has no path worth naming.
+    let stdout = std::io::stdout();
+    let file = stdout.as_fd().try_clone_to_owned().map(std::fs::File::from);
+    if stdout.is_terminal()
+        || !file
+            .and_then(|file| file.metadata())
+            .is_ok_and(|m| m.is_file())
+    {
         return None;
     }
 
@@ -53,9 +61,6 @@ pub fn stdout_redirection_path() -> Option<String> {
         }
     };
 
-    // Prefer returning the absolute path even if metadata fails (e.g., unlinked after open).
-    // If metadata is available and confirms a regular file, that's ideal; otherwise still return.
-    let _ = std::fs::metadata(&path).ok();
     Some(path.to_string_lossy().to_string())
 }
 

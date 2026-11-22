@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 const ATTACHMENTS: &str = "...";
 /// Bodies up to this many bytes stay inside their entry.
 const INLINE: usize = 4096;
-/// The last request kept and where its messages begin, so a retried one is kept once.
+/// The last request kept, so a retried one is kept once.
 const APPLIED: &str = ".applied";
 
 /// One conversation's directory.
@@ -152,16 +152,15 @@ impl Chat {
         bail!("no entry {number}")
     }
 
-    /// The last request whose messages were kept, and the entry they begin at.
-    pub fn applied(&self) -> Option<(u64, u64)> {
+    /// The last request whose messages were kept.
+    pub fn applied(&self) -> Option<u64> {
         let text = std::fs::read_to_string(self.dir.join(APPLIED)).ok()?;
-        let (id, start) = text.trim().split_once(' ')?;
-        Some((id.parse().ok()?, start.parse().ok()?))
+        text.trim().parse().ok()
     }
 
-    /// Remember that request `id`'s messages are kept from entry `start` on.
-    pub fn set_applied(&self, id: u64, start: u64) -> Result<()> {
-        write(&self.dir, APPLIED, format!("{id} {start}").as_bytes())
+    /// Remember that request `id`'s messages are kept.
+    pub fn set_applied(&self, id: u64) -> Result<()> {
+        write(&self.dir, APPLIED, id.to_string().as_bytes())
     }
 
     /// The number the next entry gets.
@@ -406,8 +405,8 @@ mod tests {
         let mode = |path: &Path| std::fs::metadata(path).map(|m| m.permissions().mode() & 0o777);
         assert_eq!(mode(chat.dir())?, 0o700);
         assert_eq!(mode(&chat.dir().join("00000002"))?, 0o600);
-        chat.set_applied(42, 2)?;
-        assert_eq!(chat.applied(), Some((42, 2)));
+        chat.set_applied(42)?;
+        assert_eq!(chat.applied(), Some(42));
         Ok(())
     }
 }

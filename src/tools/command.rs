@@ -21,14 +21,12 @@ const CLEANUP_WAIT: Duration = Duration::from_secs(2);
 static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct Start {
     argv: Vec<String>,
     wait_seconds: Option<f64>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct Control {
     command_id: u64,
     action: Action,
@@ -95,13 +93,13 @@ impl Commands {
 
 fn tool_result(id: u64, observation: Observation) -> Value {
     let mut result = json!({
-        "commandId": id,
+        "command_id": id,
         "pid": observation.pid,
-        "runningFor": format!("{:.1}s", observation.elapsed.as_secs_f64()),
+        "running_for": format!("{:.1}s", observation.elapsed.as_secs_f64()),
         "stdout": observation.stdout.text,
-        "stdoutBytesOmitted": observation.stdout.omitted,
+        "stdout_bytes_omitted": observation.stdout.omitted,
         "stderr": observation.stderr.text,
-        "stderrBytesOmitted": observation.stderr.omitted,
+        "stderr_bytes_omitted": observation.stderr.omitted,
     });
     let Some(completion) = observation.completion else {
         result["ok"] = json!(false);
@@ -109,7 +107,7 @@ fn tool_result(id: u64, observation: Observation) -> Value {
         return result;
     };
     if let Some(error) = completion.output_error {
-        result["outputError"] = json!(error);
+        result["output_error"] = json!(error);
     }
     let exit = match completion.exit {
         Err(error) => {
@@ -119,9 +117,9 @@ fn tool_result(id: u64, observation: Observation) -> Value {
         }
         Ok(exit) => exit,
     };
-    result["exitCode"] = json!(exit.status.code());
+    result["exit_code"] = json!(exit.status.code());
     if let Some(signal) = exit.status.signal() {
-        result["exitSignal"] = json!(signal);
+        result["exit_signal"] = json!(signal);
     }
     let (signal, escalated) = match exit.cause {
         ExitCause::Interrupted => ("SIGINT", false),
@@ -135,7 +133,7 @@ fn tool_result(id: u64, observation: Observation) -> Value {
     };
     result["status"] = json!("killed");
     result["ok"] = json!(false);
-    result["kill"] = json!({ "signal": signal, "killedAfterGrace": escalated });
+    result["kill"] = json!({ "signal": signal, "killed_after_grace": escalated });
     result
 }
 
@@ -144,9 +142,9 @@ fn wait_duration(wait_seconds: Option<f64>) -> Result<Duration, &'static str> {
         return Ok(DEFAULT_WAIT);
     };
     if !wait_seconds.is_finite() || wait_seconds < 0.0 {
-        return Err("waitSeconds must be a finite non-negative number");
+        return Err("wait_seconds must be a finite non-negative number");
     }
-    Duration::try_from_secs_f64(wait_seconds).map_err(|_| "waitSeconds is too large to represent")
+    Duration::try_from_secs_f64(wait_seconds).map_err(|_| "wait_seconds is too large to represent")
 }
 
 async fn start(args: Start, context: ToolContext<'_>) -> Value {
@@ -169,7 +167,7 @@ async fn start(args: Start, context: ToolContext<'_>) -> Value {
 async fn control(args: Control, context: ToolContext<'_>) -> Value {
     let id = args.command_id;
     let Some(job) = context.commands.get(id) else {
-        return json!({ "error": format!("unknown commandId {id}") });
+        return json!({ "error": format!("unknown command_id {id}") });
     };
     let wait = match args.action {
         Action::Wait => match wait_duration(args.wait_seconds) {
@@ -187,16 +185,9 @@ async fn control(args: Control, context: ToolContext<'_>) -> Value {
     context.commands.observe(id, &job, wait).await
 }
 
-const WAIT_SECONDS: Param = Param {
-    name: "waitSeconds",
-    desc: "Seconds to wait before returning control to the model (default 40, use 0 to poll immediately)",
-    param_type: ParamType::Number,
-    required: false,
-};
-
 const START_SPEC: (&str, &str, &[Param]) = (
     RUN_NAME,
-    "Start a command by argv. A command that outlives waitSeconds returns a commandId. Use control_command to get more output or stop it.",
+    "Start a command by argv. A command that outlives wait_seconds returns a command_id. Use control_command to get more output or stop it.",
     &[
         Param {
             name: "argv",
@@ -204,7 +195,12 @@ const START_SPEC: (&str, &str, &[Param]) = (
             param_type: ParamType::StringArray,
             required: true,
         },
-        WAIT_SECONDS,
+        Param {
+            name: "wait_seconds",
+            desc: "Seconds to wait before returning control to the model (default 40, use 0 to poll immediately)",
+            param_type: ParamType::Number,
+            required: false,
+        },
     ],
 );
 
@@ -213,7 +209,7 @@ const CONTROL_SPEC: (&str, &str, &[Param]) = (
     "Collect the next stdout/stderr chunk from a command. Use wait to let it keep running or kill to stop it.",
     &[
         Param {
-            name: "commandId",
+            name: "command_id",
             desc: "Command handle returned by run_command",
             param_type: ParamType::Number,
             required: true,
@@ -224,7 +220,12 @@ const CONTROL_SPEC: (&str, &str, &[Param]) = (
             param_type: ParamType::Choice(&["wait", "kill"]),
             required: true,
         },
-        WAIT_SECONDS,
+        Param {
+            name: "wait_seconds",
+            desc: "With wait, seconds to wait before returning control to the model (default 40, use 0 to poll immediately); kill ignores it",
+            param_type: ParamType::Number,
+            required: false,
+        },
     ],
 );
 

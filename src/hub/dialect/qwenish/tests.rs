@@ -129,11 +129,11 @@ fn template_json_matches_python_separators() -> Result<()> {
 #[test]
 fn native_calls_preserve_strings_and_decode_arrays() -> Result<()> {
     let call = parse_call(
-        "<function=run_command>\n<parameter=argv>\n[\"printf\",\"hello ✓\"]\n</parameter>\n<parameter=waitSeconds>\n0\n</parameter>\n</function>",
+        "<function=run_command>\n<parameter=argv>\n[\"printf\",\"hello ✓\"]\n</parameter>\n<parameter=wait_seconds>\n0\n</parameter>\n</function>",
     )?;
     assert_eq!(
         call.arguments,
-        json!({"argv":["printf","hello ✓"],"waitSeconds":0})
+        json!({"argv":["printf","hello ✓"],"wait_seconds":0})
     );
     let call = parse_call(
         "<function=apply_patch>\n<parameter=path>\n123\n</parameter>\n<parameter=patch>\n  text\n\n</parameter>\n</function>",
@@ -144,7 +144,7 @@ fn native_calls_preserve_strings_and_decode_arrays() -> Result<()> {
 
 #[test]
 fn quoted_json_arguments_keep_tag_spellings_and_control_tokens() -> Result<()> {
-    let output = r#"¦</think>¦¦<tool_call>¦<function=run_command><parameter=argv>["printf","\"</parameter><parameter=waitSeconds></function>¦</tool_call>¦ <tool_call>"]</parameter><parameter=waitSeconds>0</parameter></function>¦</tool_call>¦"#;
+    let output = r#"¦</think>¦¦<tool_call>¦<function=run_command><parameter=argv>["printf","\"</parameter><parameter=wait_seconds></function>¦</tool_call>¦ <tool_call>"]</parameter><parameter=wait_seconds>0</parameter></function>¦</tool_call>¦"#;
     let (_, answer, calls) = stream(output)?;
     assert!(answer.is_empty());
     assert_eq!(
@@ -152,8 +152,8 @@ fn quoted_json_arguments_keep_tag_spellings_and_control_tokens() -> Result<()> {
         [ToolCall {
             name: "run_command".into(),
             arguments: json!({
-                "argv": ["printf", "\"</parameter><parameter=waitSeconds></function></tool_call> <tool_call>"],
-                "waitSeconds": 0,
+                "argv": ["printf", "\"</parameter><parameter=wait_seconds></function></tool_call> <tool_call>"],
+                "wait_seconds": 0,
             }),
         }]
     );

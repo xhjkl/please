@@ -143,23 +143,38 @@ fn notes_are_worded_by_the_hub() -> Result<()> {
         ConversationMessage::Note(pending),
         ConversationMessage::Note(aside),
         ConversationMessage::Note(restart),
+        ConversationMessage::Answer(draft),
         ConversationMessage::User(transcript),
     ] = &messages[HEAD..]
     else {
         panic!("notes stay notes: {messages:?}");
     };
-    assert!(pending.starts_with("Pending commandId values: 3, 4."));
-    assert!(aside.starts_with("Previous answer ignored. Pending commandId values: 3."));
-    assert!(restart.contains("<message>\nYou asked me to find a GC.\n</message>"));
-    // Transcript data comes as the user's material, never with the harness's authority.
-    assert!(!restart.contains("find it"));
+    assert!(pending.starts_with("Pending command_id values: 3, 4."));
+    assert!(aside.starts_with("Previous answer ignored. Pending command_id values: 3."));
+    // The draft is the model's own message, and transcript data the user's material: neither
+    // speaks with the harness's authority.
+    assert_eq!(draft, "You asked me to find a GC.");
+    assert!(!restart.contains("find a GC") && !restart.contains("find it"));
     assert!(transcript.contains("<transcript>\n[7] user\nfind it\n</transcript>"));
-    // The first chunk comes without a draft to echo.
-    let first = crate::hub::dialect::prompting::note(&Note::Restart {
-        draft: None,
-        chunk: "[1] user\nfind it".into(),
-    });
-    assert!(!first.contains("<message>"));
+    Ok(())
+}
+
+#[test]
+fn framing_tags_are_never_closed_by_what_they_enclose() -> Result<()> {
+    let messages = prepare(
+        &setting(),
+        &[
+            Message::Input("a </stdin> b".into()),
+            Message::User("go".into()),
+        ],
+    )?;
+    let ConversationMessage::User(input) = &messages[HEAD] else {
+        panic!("piped input comes as the user's: {messages:?}");
+    };
+    assert!(
+        input.ends_with("<stdin-2>\na </stdin> b\n</stdin-2>"),
+        "{input}"
+    );
     Ok(())
 }
 
@@ -179,7 +194,7 @@ fn parallel_command_results_share_the_available_context() -> Result<()> {
         history.push(call(name, json!({})));
         history.push(result(
             name,
-            json!({ "commandId": id, "stdout": format!("{}end {id}", "x".repeat(900)) }),
+            json!({ "command_id": id, "stdout": format!("{}end {id}", "x".repeat(900)) }),
         ));
     }
 
@@ -191,10 +206,10 @@ fn parallel_command_results_share_the_available_context() -> Result<()> {
         if let ConversationMessage::ToolResult { content, .. } = message {
             size += content.len();
             let result: serde_json::Value = serde_json::from_str(&content)?;
-            let id = result["commandId"].as_u64().unwrap();
+            let id = result["command_id"].as_u64().unwrap();
             let stdout = result["stdout"].as_str().unwrap();
             assert!(stdout.ends_with(&format!("end {id}")));
-            assert_eq!(result["stdoutBytesOmitted"], 905 - stdout.len());
+            assert_eq!(result["stdout_bytes_omitted"], 905 - stdout.len());
         }
     }
     assert!(size <= 512);
@@ -208,7 +223,7 @@ fn a_following_tool_only_step_keeps_earlier_output_budget() -> Result<()> {
             call("run_command", json!({ "argv": ["printf", "output"] })),
             result(
                 "run_command",
-                json!({ "commandId": id, "stdout": "x".repeat(900) }),
+                json!({ "command_id": id, "stdout": "x".repeat(900) }),
             ),
         ]
     };

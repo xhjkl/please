@@ -137,12 +137,12 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
         &all_tools(),
         ToolContext::new(&commands, None),
         "run_command",
-        json!({ "argv": ["sleep", "999"], "waitSeconds": 0 }),
+        json!({ "argv": ["sleep", "999"], "wait_seconds": 0 }),
     )
     .await
     .unwrap();
     assert_eq!(start["status"], "running");
-    let id = start["commandId"].as_u64().unwrap();
+    let id = start["command_id"].as_u64().unwrap();
 
     let (mut client, mut server) = UnixStream::pair()?;
     let hub = tokio::spawn(async move {
@@ -185,7 +185,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
             &mut server,
             &Frame::ToolCall {
                 name: "control_command".into(),
-                arguments_json: json!({ "commandId": id, "action": "kill" }).to_string(),
+                arguments_json: json!({ "command_id": id, "action": "kill" }).to_string(),
             },
         )
         .await?;

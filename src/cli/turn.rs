@@ -210,7 +210,7 @@ async fn execute_calls(
                 let results = invoke_batch(batch, approvals, tools, context).await;
                 for (call, result) in batch.iter().zip(&results) {
                     if kind_of(&call.name).has_command_output() {
-                        let id = result.get("commandId").and_then(Value::as_u64);
+                        let id = result.get("command_id").and_then(Value::as_u64);
                         let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
                         let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
                         display
@@ -224,7 +224,7 @@ async fn execute_calls(
 
         for (call, result) in batch.iter().zip(results) {
             let kind = kind_of(&call.name);
-            let command_id = result.get("commandId").and_then(Value::as_u64);
+            let command_id = result.get("command_id").and_then(Value::as_u64);
             if kind == ToolKind::RunCommand
                 && result["status"] == "running"
                 && let Some(id) = command_id

@@ -19,7 +19,7 @@ pub fn visible(history: &[Message], dropped: &[Range<usize>]) -> Vec<Message> {
 
 /// Indices where a user turn or an assistant step begins; cutting elsewhere would separate a
 /// tool call from its reasoning or result, or piped input from the request it came with.
-fn boundaries(history: &[Message]) -> Vec<usize> {
+pub fn boundaries(history: &[Message]) -> Vec<usize> {
     let tool = |message: &Message| matches!(message, Message::Call(_) | Message::Result(_));
     (1..history.len())
         .filter(|&index| match &history[index] {
