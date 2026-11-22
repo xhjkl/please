@@ -1,5 +1,5 @@
 //! Translate neutral probe history and generated tokens at the hub's dialect boundary.
-use super::{Dialect, conversation, harmony, qwenish};
+use super::{Dialect, conversation, harmony, inkling, qwenish};
 use crate::protocol::Message;
 use eyre::Result;
 use oco::Tokenizer;
@@ -51,6 +51,7 @@ impl Dialect {
     /// Select the codec without exposing it to the probe or inference loop.
     pub(in crate::hub) fn adapter(self) -> Box<dyn Adapter> {
         match self {
+            Self::Inkling => Box::new(inkling::Adapter),
             Self::Qwenish => Box::new(qwenish::Adapter),
             Self::Harmony => Box::new(harmony::Adapter),
         }

@@ -39,7 +39,7 @@ mod preamble;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use benchmark::run as benchmark;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use discovery::weights_dir;
+pub use discovery::model_paths;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use download::run_download as load_weights;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -61,6 +61,11 @@ pub async fn benchmark(_model_path: &str, _cases_path: &str) -> eyre::Result<()>
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub async fn load_weights(_which: Option<&str>) -> eyre::Result<()> {
+pub async fn load_weights() -> eyre::Result<()> {
     Err(eyre::eyre!(UNSUPPORTED))
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub fn model_paths(running: Option<std::path::PathBuf>) -> eyre::Result<Vec<std::path::PathBuf>> {
+    Ok(running.into_iter().collect())
 }

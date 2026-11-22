@@ -1,124 +1,95 @@
-//! Fetch the largest pinned dense Qwen that fits this machine.
-use super::dialect::Dialect;
+//! Fetch and verify the pinned Inkling checkpoint.
 use super::discovery;
-use eyre::{Result, eyre};
+use eyre::{Result, WrapErr, bail, eyre};
+use sha2::{Digest, Sha256};
+use std::fmt::Write;
+use std::io::Read;
 use std::path::Path;
 
 mod transfer;
 
-/// A pinned checkpoint and the exact size its download must reach.
-struct Model {
-    name: &'static str,
-    bytes: u64,
-    /// Lower bound for this parameter class, allowing rounded checkpoint size labels.
-    minimum_parameters: u64,
-    url: &'static str,
-}
+const FILENAME: &str = "Inkling-2-Mini-IQ4_NL.gguf";
+const BYTES: u64 = 17_627_940_768;
+const SHA256: &str = "cbdf3fa9dc50a4124977980f37da4f1fa764b0cfe800d275cd43d26ce2a81af4";
+const URL: &str = concat!(
+    "https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF/resolve/",
+    "e8a2cecf0e78914f07cc27b9be711a9b2c7561d9/",
+    "Inkling-2-Mini-IQ4_NL.gguf",
+);
 
-// Pinning single-file dense checkpoints; no MoE, split GGUFs, or repository snapshots.
-const MODELS: &[Model] = &[
-    Model {
-        name: "Qwen3.8-27B",
-        bytes: 16_056_478_688,
-        minimum_parameters: 24_000_000_000,
-        url: "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-Q4_0.gguf",
-    },
-    Model {
-        name: "Qwen3.5-9B",
-        bytes: 5_680_522_464,
-        minimum_parameters: 8_000_000_000,
-        url: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q4_K_M.gguf",
-    },
-    Model {
-        name: "Qwen3.5-4B",
-        bytes: 2_740_937_888,
-        minimum_parameters: 3_500_000_000,
-        url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
-    },
-    Model {
-        name: "Qwen3.5-2B",
-        bytes: 1_280_835_840,
-        minimum_parameters: 1_500_000_000,
-        url: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf",
-    },
-    Model {
-        name: "Qwen3.5-0.8B",
-        bytes: 532_517_120,
-        minimum_parameters: 600_000_000,
-        url: "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/Qwen3.5-0.8B-Q4_K_M.gguf",
-    },
-];
-
-/// Pick the largest pinned checkpoint within the memory budget; the list runs largest first.
-fn choose_best(budget: u64) -> Result<&'static Model> {
-    MODELS
-        .iter()
-        .find(|model| model.bytes <= budget)
-        .ok_or_else(|| eyre!("no supported dense Qwen fits the {budget}-byte memory budget"))
-}
-
-/// Accept only the dense Qwen family, so gpt-oss stays a fallback for existing weights.
-fn validate_request(which: Option<&str>) -> Result<()> {
-    if which.is_some_and(|which| !which.eq_ignore_ascii_case("qwen")) {
-        eyre::bail!("please load only downloads dense Qwen; usage: please load [qwen]");
-    }
-    Ok(())
-}
-
-/// Reuse a fitting installed Qwen of the chosen size, otherwise fetch just its pinned GGUF.
-pub async fn run_download(which: Option<&str>) -> Result<()> {
-    validate_request(which)?;
-    let budget = discovery::model_budget()?;
-    let model = choose_best(budget)?;
+/// Reuse a verified copy or publish the download after verifying its SHA-256.
+pub async fn run_download() -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let directory = discovery::weights_dir();
     std::fs::create_dir_all(&directory)?;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let lock = std::fs::File::options()
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
         .open(directory.join(".download.lock"))?;
-    // Holding the lock until publication keeps concurrent resumes from appending the same bytes.
+    // Holding the lock until publication serializes resumes of the same partial file.
     lock.try_lock()
         .map_err(|error| eyre!("cannot lock checkpoint downloads: {error}"))?;
-    let installed = discovery::installed_models(&directory, budget)?;
-    if let Some(installed) = installed.iter().find(|installed| {
-        installed.dialect == Dialect::Qwenish && installed.parameters >= model.minimum_parameters
-    }) {
-        eprintln!(
-            "please load: using existing {} at {}",
-            installed.name,
-            installed.path.display()
-        );
-        return Ok(());
-    }
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-    let filename = model
-        .url
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| eyre!("missing checkpoint filename"))?;
-    let target = directory.join(filename);
+    let target = directory.join(FILENAME);
     let exists = target.try_exists()?;
     if exists {
-        eyre::bail!(
-            "{} exists but is not a usable checkpoint; move it aside before retrying",
-            target.display()
+        verify_checkpoint(&target).await?;
+        eprintln!("please load: using verified {}", target.display());
+        return Ok(());
+    }
+
+    let budget = discovery::model_budget()?;
+    if BYTES > budget {
+        bail!("{FILENAME} requires {BYTES} bytes and exceeds the {budget}-byte memory budget");
+    }
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    let partial = target.with_extension("gguf.part");
+    eprintln!("please load: downloading {FILENAME} ({BYTES} bytes)");
+    download_one(URL, &partial, BYTES).await?;
+    verify_checkpoint(&partial).await?;
+    std::fs::rename(&partial, &target)?;
+    eprintln!("please load: ready: {}", target.display());
+    Ok(())
+}
+
+async fn verify_checkpoint(path: &Path) -> Result<()> {
+    eprintln!("please load: verifying SHA-256 of {}", path.display());
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || verify(&path, BYTES, SHA256)).await?
+}
+
+/// Hash a completed file with bounded memory.
+fn verify(path: &Path, bytes: u64, expected: &str) -> Result<()> {
+    let mut file = std::fs::File::open(path)
+        .wrap_err_with(|| format!("cannot open checkpoint {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if metadata.len() != bytes {
+        bail!(
+            "{} is {} bytes, expected {bytes}; move it aside before retrying",
+            path.display(),
+            metadata.len()
         );
     }
-    let partial = target.with_extension("gguf.part");
-    eprintln!(
-        "please load: {} ({} bytes; memory budget {} bytes)",
-        model.name, model.bytes, budget
-    );
-    download_one(model.url, &partial, model.bytes).await?;
-    let downloaded = discovery::inspect(partial.clone())?;
-    if downloaded.dialect != Dialect::Qwenish {
-        eyre::bail!("downloaded checkpoint is not dense Qwen");
+    let mut buffer = vec![0; 128 * 1024];
+    let mut hash = Sha256::new();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
     }
-    std::fs::rename(&partial, &target)?;
-    eprintln!("\nplease load: ready: {}", target.display());
+    let mut actual = String::with_capacity(64);
+    for byte in hash.finalize() {
+        write!(actual, "{byte:02x}")?;
+    }
+    if actual != expected {
+        bail!(
+            "{} has SHA-256 {actual}, expected {expected}; move it aside before retrying",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -133,22 +104,15 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[test]
-    fn only_dense_qwen_is_downloadable() -> Result<()> {
-        validate_request(None)?;
-        validate_request(Some("Qwen"))?;
-        for request in ["gpt", "gpt-oss", "gpt-oss-120b", "moe", "garbage"] {
-            assert!(validate_request(Some(request)).is_err());
-        }
-        for (index, model) in MODELS.iter().enumerate() {
-            assert_eq!(choose_best(model.bytes)?.name, model.name);
-            assert!(model.url.contains("Qwen"));
-            assert!(!model.url.contains("-A"));
-            if let Some(next) = MODELS.get(index + 1) {
-                assert_eq!(choose_best(model.bytes - 1)?.name, next.name);
-            }
-        }
-        assert!(choose_best(MODELS.last().unwrap().bytes - 1).is_err());
-        assert_eq!(choose_best(u64::MAX)?.name, MODELS[0].name);
+    fn verification_rejects_same_size_corruption() -> Result<()> {
+        let directory = crate::test_support::TempDir::new()?;
+        let path = directory.0.join("checkpoint.gguf.part");
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        std::fs::write(&path, b"abc")?;
+        verify(&path, 3, hash)?;
+        std::fs::write(&path, b"abb")?;
+        let result = verify(&path, 3, hash);
+        assert!(result.unwrap_err().to_string().contains("has SHA-256"));
         Ok(())
     }
     async fn server(response: String) -> Result<(String, tokio::task::JoinHandle<String>)> {

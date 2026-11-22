@@ -1,4 +1,4 @@
-//! Neutral conversation data shared by the two hub-side adapters.
+//! Neutral conversation data shared by the hub-side adapters.
 use crate::protocol::Message;
 use crate::tools::ParamType;
 use eyre::{Result, eyre};
@@ -55,7 +55,7 @@ pub enum Delta {
     Thinking(String),
 }
 
-/// Declare every tool as an OpenAI-style function schema, the form both chat templates consume.
+/// Declare every tool as an OpenAI-style function schema for the chat templates.
 pub fn tool_schemas() -> Vec<Value> {
     let mut tools: Vec<_> = crate::tools::all_tools().into_iter().collect();
     tools.sort_by_key(|(name, _)| *name);

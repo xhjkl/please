@@ -807,8 +807,8 @@ dependencies = [
 
 [[package]]
 name = "oco"
-version = "0.0.3"
-source = "git+https://github.com/xhjkl/oco?branch=main#0031c4f5f936f5e8c3562a2ec86432c8465c6fe4"
+version = "0.0.22"
+source = "git+https://github.com/xhjkl/oco?branch=main#336da2de7f61e52df6e146c6bb877ceb07d2c1b5"
 dependencies = [
  "block2",
  "bytemuck",
