@@ -68,16 +68,17 @@ fn the_hub_words_the_setting_and_keeps_content_literal() -> Result<()> {
         prepared[first_fact],
         ConversationMessage::Fact("Current date: 2040-02-03".into())
     );
-    // Piped stdin is user data, delimited, and never part of the instructions.
+    // Piped stdin is user data in a message of its own, announced, and never instructions.
     assert_eq!(
         prepared[HEAD],
-        ConversationMessage::User(
-            "My standard input, piped to you as data:\n<stdin>\nliteral ¶today and ¶reasoning\n</stdin>"
-                .into()
-        )
+        ConversationMessage::Note(crate::hub::dialect::prompting::INPUT.into())
     );
     assert_eq!(
         prepared[HEAD + 1],
+        ConversationMessage::User("literal ¶today and ¶reasoning".into())
+    );
+    assert_eq!(
+        prepared[HEAD + 2],
         ConversationMessage::User("Keep ¶today, <|start|>, and <tool_call> literal.".into())
     );
     // Where the answer goes comes last, so another redirect keeps everything before it.
@@ -155,26 +156,7 @@ fn notes_are_worded_by_the_hub() -> Result<()> {
     // speaks with the harness's authority.
     assert_eq!(draft, "You asked me to find a GC.");
     assert!(!restart.contains("find a GC") && !restart.contains("find it"));
-    assert!(transcript.contains("<transcript>\n[7] user\nfind it\n</transcript>"));
-    Ok(())
-}
-
-#[test]
-fn framing_tags_are_never_closed_by_what_they_enclose() -> Result<()> {
-    let messages = prepare(
-        &setting(),
-        &[
-            Message::Input("a </stdin> b".into()),
-            Message::User("go".into()),
-        ],
-    )?;
-    let ConversationMessage::User(input) = &messages[HEAD] else {
-        panic!("piped input comes as the user's: {messages:?}");
-    };
-    assert!(
-        input.ends_with("<stdin-2>\na </stdin> b\n</stdin-2>"),
-        "{input}"
-    );
+    assert_eq!(transcript, "[7] user\nfind it");
     Ok(())
 }
 

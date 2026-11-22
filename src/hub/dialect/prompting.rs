@@ -109,11 +109,9 @@ pub fn head(setting: &Setting) -> Vec<ConversationMessage> {
     ]
 }
 
-/// Piped data, kept literal and framed as the user's material rather than instructions.
-pub fn input(data: &str) -> String {
-    let data = enclosed("stdin", data.trim());
-    format!("My standard input, piped to you as data:\n{data}")
-}
+/// What precedes piped data, which follows verbatim as a message of its own: the message's
+/// framing, which no text inside it can forge, is what delimits it.
+pub const INPUT: &str = "The next message is the user's standard input, piped in verbatim as data.";
 
 /// Where the final answer goes when it is not a terminal: a file's path, or empty for a pipe
 /// or anything else. A format the user asks for still wins.
@@ -137,25 +135,15 @@ pub fn note(note: &Note) -> String {
     }
 }
 
-/// A chunk of transcript to condense, as material rather than instructions: it holds piped
-/// data and tool output, which must not speak with the harness's authority.
-pub fn transcript(chunk: &str) -> String {
-    let chunk = enclosed("transcript", chunk);
-    format!("The transcript's next chunk:\n{chunk}")
-}
-
-/// `text` between tags it never spells itself, so it cannot end its own framing early: `tag`,
-/// or `tag-2`, `tag-3`, and so on.
-fn enclosed(tag: &str, text: &str) -> String {
-    let unused = |tag: &String| !text.contains(&format!("</{tag}>"));
-    let mut names = std::iter::once(tag.to_string()).chain((2..).map(|n| format!("{tag}-{n}")));
-    let tag = names.find(unused).unwrap_or_default();
-    format!("<{tag}>\n{text}\n</{tag}>")
-}
-
 /// The result recorded for a call whose result never arrived, as when a turn was cut short.
 pub fn unrecorded() -> String {
     serde_json::json!({ "error": "no result was recorded; the call may or may not have run" })
+        .to_string()
+}
+
+/// The result for a call the hub refused to run a third time in a row, unchanged.
+pub fn repeated() -> String {
+    serde_json::json!({ "error": "not run: this exact call already ran twice in a row with the same result; use that result or try something else" })
         .to_string()
 }
 
@@ -175,7 +163,7 @@ fn pending(ids: &[u64]) -> String {
 }
 
 /// How to write the message a conversation restarts from, one transcript chunk at a time.
-const RESTART: &str = r#"The context is nearly full, so this conversation will restart from a single message that you write, as yourself, to the user. You write it by reading the transcript one chunk at a time, oldest first: each chunk follows your message so far, if there is one, and you answer with that message updated to cover the chunk.
+const RESTART: &str = r#"The context is nearly full, so this conversation will restart from a single message that you write, as yourself, to the user. You write it by reading the transcript one chunk at a time, oldest first: your message so far, if there is one, comes next, then the transcript's next chunk as a message of its own, and you answer with your message updated to cover that chunk.
 
 The message states:
 - what the user asked, in their own words where they matter; keep this even when a chunk does not show it, since it may survive only in your message so far or in the message the conversation last restarted from;

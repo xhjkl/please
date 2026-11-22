@@ -190,14 +190,17 @@ pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<Conversatio
     for message in history {
         let worded = match message {
             Message::User(text) => ConversationMessage::User(text.clone()),
-            Message::Input(data) => ConversationMessage::User(super::prompting::input(data)),
+            Message::Input(data) => {
+                out.push(ConversationMessage::Note(super::prompting::INPUT.into()));
+                ConversationMessage::User(data.clone())
+            }
             // The draft is the model's own message, and the chunk is material, not instructions.
             Message::Note(note @ Note::Restart { draft, chunk }) => {
                 out.push(ConversationMessage::Note(super::prompting::note(note)));
                 if let Some(draft) = draft {
                     out.push(ConversationMessage::Answer(draft.clone()));
                 }
-                ConversationMessage::User(super::prompting::transcript(chunk))
+                ConversationMessage::User(chunk.clone())
             }
             Message::Note(note) => ConversationMessage::Note(super::prompting::note(note)),
             Message::Thinking(text) => ConversationMessage::Thinking(text.clone()),

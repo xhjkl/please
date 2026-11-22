@@ -109,6 +109,23 @@ pub fn all_tools() -> ExposedTools {
     .collect()
 }
 
+/// What a tool's result says, without the fields a command's result changes on every call: its
+/// handle, process, and running time. `None` while a command still runs, since waiting on one
+/// is progress rather than repetition.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn outcome(result: &str) -> Option<Value> {
+    let mut value = serde_json::from_str(result).unwrap_or_else(|_| Value::String(result.into()));
+    if let Some(fields) = value.as_object_mut() {
+        if fields.get("status").and_then(Value::as_str) == Some("running") {
+            return None;
+        }
+        for field in ["command_id", "pid", "running_for"] {
+            fields.remove(field);
+        }
+    }
+    Some(value)
+}
+
 /// Invoke a tool with services scoped to this tool call.
 pub async fn invoke(
     tools: &ExposedTools,

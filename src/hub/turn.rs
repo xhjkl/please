@@ -109,15 +109,26 @@ pub async fn serve(
         if calls.is_empty() && pending {
             return write_frame_to_stream(sink, &Frame::Stop).await;
         }
+        // The hub answers its own calls, and refuses one that would only feed a loop.
+        let refused = |call: &ToolCall| repeats(&history, call);
         let (own, probe): (Vec<_>, Vec<_>) = calls
             .into_iter()
-            .partition(|call| call.name == transcript::RECALL);
+            .partition(|call| call.name == transcript::RECALL || refused(call));
         // The hub's calls and their results first, then the calls the probe answers.
         let mut kept = opening(step.thinking, step.answer);
         for call in &own {
-            write_frame_to_stream(sink, &Frame::Log(format!("recall {}", call.arguments))).await?;
+            let (line, content) = match refused(call) {
+                true => (
+                    format!("skipped a repeated {} call", call.name),
+                    prompting::repeated(),
+                ),
+                false => (
+                    format!("recall {}", call.arguments),
+                    transcript::recall(&chat, &call.arguments, page).to_string(),
+                ),
+            };
+            write_frame_to_stream(sink, &Frame::Log(line)).await?;
             kept.push(stored(call));
-            let content = transcript::recall(&chat, &call.arguments, page).to_string();
             kept.push(result(&call.name, content));
         }
         kept.extend(probe.iter().map(stored));
@@ -265,6 +276,27 @@ fn result(name: &str, content: String) -> Message {
         name: name.into(),
         content,
     })
+}
+
+/// Whether `call` would be the third in a row of the same call, the two before it having
+/// come to the same outcome: greedy decoding can repeat such a step forever.
+fn repeats(history: &[Message], call: &ToolCall) -> bool {
+    let arguments = call.arguments.to_string();
+    let mut open = std::collections::VecDeque::new();
+    let mut answered = Vec::new();
+    for message in history {
+        match message {
+            Message::Call(call) => open.push_back(call),
+            Message::Result(result) => answered.extend(open.pop_front().map(|call| (call, result))),
+            _ => {}
+        }
+    }
+    let [.., (first, earlier), (second, latest)] = answered.as_slice() else {
+        return false;
+    };
+    let same = |made: &&Call| made.name == call.name && made.arguments == arguments;
+    let outcome = |result: &ToolResult| crate::tools::outcome(&result.content);
+    same(first) && same(second) && outcome(earlier).is_some_and(|it| Some(it) == outcome(latest))
 }
 
 /// A result for each call `kept` ends with that never got one, as when a turn was cut short
@@ -481,6 +513,54 @@ mod tests {
         let (last, kept) = split(1)?;
         assert_eq!((last, kept), (Some(14), vec![]));
         Ok(())
+    }
+
+    #[test]
+    fn a_third_identical_call_with_an_unchanged_result_is_refused() {
+        let call = |name: &str, arguments| ToolCall {
+            name: name.into(),
+            arguments,
+        };
+        let grep = call(
+            "run_command",
+            serde_json::json!({"argv": ["grep", "x", "f"]}),
+        );
+        let step = |made: &ToolCall, content: &str| {
+            let thinking = Message::Thinking(String::new());
+            vec![thinking, stored(made), result(&made.name, content.into())]
+        };
+        let twice = [step(&grep, "none"), step(&grep, "none")].concat();
+        assert!(repeats(&twice, &grep));
+        // A changed result, another call between, or other arguments let it run.
+        assert!(!repeats(
+            &[step(&grep, "none"), step(&grep, "one")].concat(),
+            &grep
+        ));
+        let edit = call("apply_patch", serde_json::json!({"patch": "p"}));
+        let between = [step(&grep, "none"), step(&edit, "ok"), step(&grep, "none")].concat();
+        assert!(!repeats(&between, &grep));
+        assert!(!repeats(&step(&grep, "none"), &grep));
+        let other = call(
+            "run_command",
+            serde_json::json!({"argv": ["grep", "y", "f"]}),
+        );
+        assert!(!repeats(&twice, &other));
+        // A command's handle, process, and running time differ every time; a running one is
+        // being waited on.
+        let ran = |pid: u32, status: &str| {
+            let fields = serde_json::json!({"command_id": pid, "pid": pid, "status": status});
+            fields.to_string()
+        };
+        let finished = [
+            step(&grep, &ran(1, "finished")),
+            step(&grep, &ran(2, "finished")),
+        ];
+        assert!(repeats(&finished.concat(), &grep));
+        let running = [
+            step(&grep, &ran(1, "running")),
+            step(&grep, &ran(2, "running")),
+        ];
+        assert!(!repeats(&running.concat(), &grep));
     }
 
     #[test]
