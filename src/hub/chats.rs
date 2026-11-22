@@ -8,8 +8,9 @@
 //! with a trailing `~` (`00000012~`), which `rm *~` erases; until then recall still reads them.
 //! The harness's notes are not kept.
 //!
-//! Each place a probe runs in, a host, working directory, and terminal session, has its own
-//! conversation: the directory is named after the place, which its `where` file spells out.
+//! Each place a probe runs in, a machine and working directory, has its own conversation, kept
+//! from one run of please to the next: the directory is named after the place, which its
+//! `where` file spells out. `/new` starts the place over.
 //! Everything is private to its owner, and one hub at a time works on a conversation.
 use crate::protocol::{Call, Message, Place, ToolResult};
 use eyre::{Result, WrapErr, bail, eyre};
@@ -43,17 +44,13 @@ pub struct Entry {
 impl Chat {
     /// The conversation of `place`, recording where it is from when it starts.
     pub fn open(place: &Place) -> Result<Self> {
-        let Place { host, cwd, session } = place;
-        let key = format!("please chat\0{host}\0{cwd}\0{session}");
+        let Place { machine, cwd } = place;
+        let key = format!("please chat\0{machine}\0{cwd}");
         let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
         let dir = PathBuf::from(home).join(".please/chats");
         let chat = Self::at(dir.join(super::digest::name_of(key.as_bytes())))?;
         if !chat.dir.join("where").exists() {
-            write(
-                &chat.dir,
-                "where",
-                format!("{host}\n{cwd}\n{session}\n").as_bytes(),
-            )?;
+            write(&chat.dir, "where", format!("{cwd}\n{machine}\n").as_bytes())?;
         }
         Ok(chat)
     }

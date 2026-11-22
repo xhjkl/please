@@ -419,9 +419,8 @@ mod tests {
     #[test]
     fn conversations_keep_their_key_until_they_restart() {
         let place = Place {
-            host: "h".into(),
+            machine: "ssh-ed25519 AAAA".into(),
             cwd: "/".into(),
-            session: "1@2".into(),
         };
         assert_eq!(conversation(&place, 3), conversation(&place, 3));
         assert_ne!(conversation(&place, 3), conversation(&place, 9));

@@ -32,9 +32,8 @@ fn result(name: &str, content: serde_json::Value) -> Message {
 fn the_hub_words_the_setting_and_keeps_content_literal() -> Result<()> {
     let frame = Frame::Request {
         place: Place {
-            host: "box".into(),
+            machine: "ssh-ed25519 AAAA".into(),
             cwd: "/srv".into(),
-            session: "1@2".into(),
         },
         setting: setting(),
         id: 9,

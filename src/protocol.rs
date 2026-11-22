@@ -23,11 +23,10 @@ pub struct Setting {
 /// Where a probe runs; the hub keeps one conversation per place.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Place {
-    pub host: String,
+    /// The machine's SSH host key, or empty on a machine without one.
+    pub machine: String,
     /// The canonical working directory.
     pub cwd: String,
-    /// The terminal session, so each shell has its own conversation.
-    pub session: String,
 }
 
 /// One entry of a conversation, in terms no model's chat format dictates; the hub words and

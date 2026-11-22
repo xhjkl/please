@@ -4,9 +4,8 @@ use std::time::Duration;
 
 fn place() -> Place {
     Place {
-        host: "host".into(),
+        machine: "ssh-ed25519 AAAA".into(),
         cwd: "/".into(),
-        session: "1@1".into(),
     }
 }
 

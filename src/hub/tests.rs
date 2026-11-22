@@ -6,9 +6,8 @@ use tokio::io::AsyncWriteExt;
 fn request(messages: Vec<Message>) -> Frame {
     Frame::Request {
         place: Place {
-            host: "host".into(),
+            machine: "ssh-ed25519 AAAA".into(),
             cwd: "/".into(),
-            session: "1@1".into(),
         },
         setting: Setting {
             today: "2040-02-03".into(),

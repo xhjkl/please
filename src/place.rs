@@ -2,66 +2,37 @@
 use crate::protocol::Place;
 use eyre::Result;
 
-/// This host, working directory, and terminal session.
+/// Host keys in order of preference, as sshd keeps them on Linux and macOS.
+const HOST_KEYS: [&str; 3] = [
+    "/etc/ssh/ssh_host_ed25519_key.pub",
+    "/etc/ssh/ssh_host_ecdsa_key.pub",
+    "/etc/ssh/ssh_host_rsa_key.pub",
+];
+
+/// This machine and working directory.
 pub fn here() -> Result<Place> {
-    let host = nix::unistd::gethostname()?.to_string_lossy().into_owned();
     let cwd = std::env::current_dir()?.canonicalize()?;
     Ok(Place {
-        host,
+        machine: machine(),
         cwd: cwd.to_string_lossy().into_owned(),
-        session: session(),
     })
 }
 
-/// The terminal session: its leader (usually the login shell, or `login` itself) and when
-/// that started, so a later session reusing the process ID is another conversation. Without a
-/// start time the leader alone names it.
-fn session() -> String {
-    let leader = nix::unistd::getsid(None).map_or(0, |pid| pid.as_raw());
-    match started(leader) {
-        Some(started) => format!("{leader}@{started}"),
-        None => leader.to_string(),
-    }
+/// The machine's SSH host key, the identity `known_hosts` pins: the same from any terminal
+/// or client, unchanged by a new hostname, new after a re-image. Empty without one.
+fn machine() -> String {
+    let read = HOST_KEYS.iter().map(std::fs::read_to_string);
+    read.filter_map(|text| key(&text.ok()?))
+        .next()
+        .unwrap_or_default()
 }
 
-/// When process `pid` started, in microseconds since the epoch. The kernel's process table
-/// answers for any owner's process, as a session led by root's `login` needs.
-#[cfg(target_os = "macos")]
-fn started(pid: i32) -> Option<String> {
-    use nix::libc;
-    // `struct kinfo_proc` opens with `kp_proc.p_starttime`, a `struct timeval` (<sys/sysctl.h>,
-    // <sys/proc.h>); the record is 648 bytes on 64-bit macOS, and the buffer has room to spare.
-    let mut record = [0u64; 128];
-    let mut size = std::mem::size_of_val(&record);
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
-    // SAFETY: sysctl writes at most `size` bytes into the buffer.
-    let read = unsafe {
-        let (name, length) = (mib.as_mut_ptr(), mib.len() as u32);
-        let null = std::ptr::null_mut();
-        libc::sysctl(name, length, record.as_mut_ptr().cast(), &mut size, null, 0)
-    };
-    let (seconds, micros) = (record[0], record[1] & 0xffff_ffff);
-    (read == 0 && size >= 16 && seconds > 0).then(|| (seconds * 1_000_000 + micros).to_string())
-}
-
-/// When process `pid` started, in clock ticks after this boot, which the boot's ID names.
-#[cfg(target_os = "linux")]
-fn started(pid: i32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // The start time is the 22nd field; the command name before it may hold spaces.
-    let ticks = stat
-        .rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .to_string();
-    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
-    Some(format!("{ticks}/{}", boot.trim()))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn started(_pid: i32) -> Option<String> {
-    None
+/// A public key file's type and key; its comment, often `root@hostname`, is left out.
+fn key(text: &str) -> Option<String> {
+    let mut fields = text.split_whitespace();
+    let (kind, key) = (fields.next()?, fields.next()?);
+    let known = kind.starts_with("ssh-") || kind.starts_with("ecdsa-");
+    known.then(|| format!("{kind} {key}"))
 }
 
 #[cfg(test)]
@@ -69,11 +40,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn this_session_has_a_stable_identity() -> Result<()> {
-        assert_eq!(session(), session());
-        assert!(session().contains('@'), "{}", session());
-        let place = here()?;
-        assert!(!place.host.is_empty() && place.cwd.starts_with('/'));
+    fn a_machine_is_its_host_key_without_the_comment() -> Result<()> {
+        let text = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB root@box-17\n";
+        assert_eq!(
+            key(text).as_deref(),
+            Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB")
+        );
+        assert_eq!(key("not a key"), None);
+        assert_eq!(key(""), None);
+        assert_eq!(machine(), machine());
+        assert!(here()?.cwd.starts_with('/'));
         Ok(())
     }
 }
