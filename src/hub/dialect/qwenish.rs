@@ -4,8 +4,7 @@
 //! inserted by ID, so marker spellings inside user, stdin, or tool content stay ordinary text.
 //! Deliberate departures from the template: such literal markers are never promoted to
 //! control tokens; instructions that arrive mid-conversation become user messages instead of
-//! an error; and consecutive tool exchanges are grouped into one assistant step, because the
-//! probe history does not record where one step's calls end and the next begin.
+//! an error; and tool exchanges with no intervening assistant entry share one assistant step.
 use super::conversation::{ConversationMessage, Rendered, ToolCall, fit_command_results};
 use super::piece::{Piece, encode_pieces, encode_text, special};
 use super::{Adapter as DialectAdapter, OutputParser as DialectOutputParser};

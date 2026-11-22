@@ -261,6 +261,7 @@ fn conversation_message(prompt: &mut Prompt, message: &ConversationMessage) {
         | ConversationMessage::Fact(content) => prompt.message(Header::of("developer"), content),
         ConversationMessage::User(content) => prompt.message(Header::of("user"), content),
         ConversationMessage::Answer(content) => prompt.message(assistant("final"), content),
+        ConversationMessage::Thinking(content) if content.is_empty() => {}
         ConversationMessage::Thinking(content) => prompt.message(assistant("analysis"), content),
         ConversationMessage::ToolCall(ToolCall { name, arguments }) => {
             let recipient = format!("functions.{name}");

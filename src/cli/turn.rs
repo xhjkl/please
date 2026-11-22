@@ -1,10 +1,18 @@
 use eyre::{Result, eyre};
-use std::sync::Arc;
+use futures_util::future::join_all;
+use serde_json::{Value, json};
+use std::io;
+use std::time::Duration;
 use tokio::net::UnixStream;
+use tokio::signal::unix::{SignalKind, signal};
 
-use crate::display::Display;
-use crate::protocol::{Frame, Message, read_frame_from_stream};
-use crate::tools::{ToolContext, ToolKind, all_tools, kind_of, summarize_patch_for_preview};
+use crate::display::{Approval, Display};
+use crate::protocol::{
+    Frame, Message, ProtocolError, read_frame_from_stream, write_frame_to_stream,
+};
+use crate::tools::{
+    Commands, ExposedTools, ToolContext, ToolKind, all_tools, kind_of, summarize_patch_for_preview,
+};
 
 use super::connect::obtain_control_stream;
 
@@ -16,347 +24,333 @@ pub fn is_cancelled(error: &eyre::Report) -> bool {
     error.downcast_ref::<TurnCancelled>().is_some()
 }
 
+struct PendingToolCall {
+    name: String,
+    arguments: Value,
+}
+
 /// Run model and tool subturns on a connection, preserving history and command state.
 /// A complete model response resets the reconnect budget; a partial response does not.
-/// Return the final answer once all commands have settled.
-pub async fn attempt_turn_on_stream(
+async fn attempt_turn_on_stream(
     messages: &mut Vec<Message>,
-    context: ToolContext,
+    commands: &Commands,
     stream: &mut UnixStream,
     reconnect_attempts: &mut usize,
-    display: Arc<Display>,
+    display: &Display,
 ) -> Result<String> {
-    use tokio::io::AsyncWriteExt;
-
-    enum Phase {
-        Answering,
-        Thinking,
-    }
-
-    struct PendingToolCall {
-        name: String,
-        arguments: serde_json::Value,
-    }
-
     let tools = all_tools();
 
     loop {
-        let mut spinner = Some(display.start_spinning().await);
-        let running_command_pids = context.running_command_pids().await;
-        let must_settle_command = !running_command_pids.is_empty();
-
-        // Recording the reminder keeps history append-only, so the hub's session stays reusable;
-        // a retried subturn finds it already recorded.
-        if must_settle_command {
-            let reminder = settle_command_prompt(&running_command_pids);
-            let recorded =
-                matches!(messages.last(), Some(Message::Developer(text)) if *text == reminder);
-            if !recorded {
+        let command_ids = commands.pending_ids();
+        if !command_ids.is_empty() {
+            let reminder = pending_command_prompt(&command_ids);
+            // A retried subturn finds the same reminder already recorded in history.
+            if !matches!(messages.last(), Some(Message::Developer(text)) if *text == reminder) {
                 messages.push(Message::Developer(reminder));
             }
         }
+        let mut spinner = Some(display.start_spinning().await);
         let req = Frame::Request {
             messages: messages.clone(),
         };
-        let body = postcard::to_allocvec(&req).map_err(|e| eyre!(e))?;
-        stream.write_all(&body).await?;
+        write_frame_to_stream(stream, &req).await?;
 
         let mut store = Vec::with_capacity(4096);
-        let mut phase = Phase::Answering;
-        let mut final_answer = String::new();
+        let mut thinking = None;
         let mut answer = String::new();
         let mut reasoning = String::new();
         let mut calls = Vec::new();
         let mut tool_parse_error = None;
 
-        // Stream frames for this subturn
         loop {
-            let frame: Frame = tokio::select! {
-                frame = read_frame_from_stream(stream, &mut store, None, None) => {
-                    frame.map_err(|error| eyre!(error))?
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    let _ = stream.shutdown().await;
-                    context.kill_running_commands().await;
-                    return Err(eyre!(TurnCancelled));
-                }
-            };
-            // Stop spinner before streaming output so its line clear cannot erase the first token.
+            let frame = read_frame_from_stream(stream, &mut store, None, None).await?;
+            // Stop the spinner before its line clear can erase streamed output.
             if let Some(spinner) = spinner.take() {
                 spinner.stop().await;
             }
             match frame {
-                Frame::Log(line) => {
-                    let _ = display.show_log(&line).await;
-                }
+                Frame::Log(line) => display.show_log(&line).await,
                 Frame::Answer(delta) => {
-                    if must_settle_command {
-                        final_answer.push_str(&delta);
-                        answer.push_str(&delta);
-                        continue;
+                    if command_ids.is_empty() {
+                        thinking = None;
+                        display.show_answer(&delta);
                     }
-                    if matches!(phase, Phase::Thinking) {
-                        let _ = display.end_thinking().await;
-                    }
-                    phase = Phase::Answering;
-                    let _ = display.show_delta(&delta).await;
-                    final_answer.push_str(&delta);
                     answer.push_str(&delta);
                 }
                 Frame::Thinking(delta) => {
-                    if must_settle_command {
-                        reasoning.push_str(&delta);
-                        continue;
+                    if thinking.is_none() {
+                        thinking = display.thinking_line();
                     }
-                    if !matches!(phase, Phase::Thinking) {
-                        let _ = display.start_thinking().await;
+                    if let Some(line) = &thinking {
+                        line.show(&delta);
                     }
-                    phase = Phase::Thinking;
-                    let _ = display.show_delta(&delta).await;
                     reasoning.push_str(&delta);
                 }
                 Frame::ToolCall {
                     name,
                     arguments_json,
-                } => match serde_json::from_str(&arguments_json) {
-                    Ok(arguments) => calls.push(PendingToolCall { name, arguments }),
-                    Err(error) => {
-                        tool_parse_error =
-                            Some(format!("error parsing tool call arguments: {error}"));
+                } => {
+                    let arguments = serde_json::from_str::<Value>(&arguments_json);
+                    match arguments {
+                        Err(error) => {
+                            tool_parse_error =
+                                Some(format!("error parsing tool call arguments: {error}"))
+                        }
+                        Ok(arguments) if !arguments.is_object() => {
+                            tool_parse_error = Some("tool call arguments must be an object".into());
+                        }
+                        Ok(arguments) => calls.push(PendingToolCall { name, arguments }),
                     }
-                },
-                Frame::ToolCallParseError(error) => {
-                    tool_parse_error = Some(error);
                 }
+                Frame::ToolCallParseError(error) => tool_parse_error = Some(error),
                 Frame::Stop => {
                     *reconnect_attempts = 0;
                     break;
                 }
                 Frame::Error(error) => return Err(eyre!(error)),
-                Frame::Request { .. }
-                | Frame::ModelInfoRequest
-                | Frame::ModelInfo { .. }
-                | Frame::BenchmarkRequest { .. }
-                | Frame::BenchmarkResult(_)
-                | Frame::Hello { .. }
-                | Frame::Welcome
-                | Frame::Busy => {
-                    return Err(eyre!("unexpected hub frame: {frame:?}"));
-                }
+                _ => return Err(eyre!("unexpected hub frame: {frame:?}")),
             }
         }
 
-        if matches!(phase, Phase::Thinking) {
-            let _ = display.end_thinking().await;
-        }
-        // Ending only a streamed answer keeps tool-only subturns from adding blank stdout lines.
-        if !answer.is_empty() && !must_settle_command {
-            let _ = display.end_answer().await;
+        drop(thinking);
+        if command_ids.is_empty() && !answer.is_empty() {
+            display.end_answer();
         }
 
-        let missing_required_control = must_settle_command
-            && !calls
-                .iter()
-                .any(|call| kind_of(&call.name).is_control_command());
-
-        // If present, preserve reasoning across subturns without displaying it to the user.
-        if !reasoning.is_empty() && !missing_required_control {
-            messages.push(Message::Reasoning(reasoning));
-        }
-        // Preserve assistant-visible content across subturns.
-        if !answer.is_empty() && !must_settle_command {
-            messages.push(Message::Assistant(answer));
-        }
-        if let Some(error) = tool_parse_error {
-            let payload = serde_json::json!({
-                "tool": "tool_call_parse_error",
-                "result": { "error": error },
-            });
-            messages.push(Message::Tool(payload.to_string()));
-            continue;
-        }
-        if missing_required_control {
+        if tool_parse_error.is_none() && calls.is_empty() && !command_ids.is_empty() {
             messages.push(Message::Developer(format!(
-                "Previous response ignored: {}",
-                settle_command_prompt(&running_command_pids)
+                "Previous answer ignored. {}",
+                pending_command_prompt(&command_ids)
             )));
             continue;
         }
+
+        if !command_ids.is_empty() {
+            if calls.is_empty() {
+                answer.clear();
+            } else if !answer.is_empty() {
+                // While jobs are pending, visible text alongside calls is progress on stderr.
+                eprintln!("{answer}");
+            }
+        }
+
+        // Recording empty reasoning gives a tool-only response its own assistant step.
+        if !reasoning.is_empty() || answer.is_empty() && !calls.is_empty() {
+            messages.push(Message::Reasoning(reasoning));
+        }
+        if !answer.is_empty() {
+            messages.push(Message::Assistant(answer.clone()));
+        }
+        if let Some(error) = tool_parse_error {
+            let payload = json!({ "tool": "tool_call_parse_error", "result": { "error": error } });
+            messages.push(Message::Tool(payload.to_string()));
+            continue;
+        }
         if calls.is_empty() {
-            // The turn is complete, return the final answer.
-            context.kill_running_commands().await;
-            return Ok(final_answer);
+            return Ok(answer);
         }
 
-        // Execute tools and append tool results to history, then continue the loop
-        for call in calls {
-            let name = call.name;
-            let args = call.arguments;
-            let kind = kind_of(&name);
-
-            // Show pretty formatted function call
-            let _ = display.show_tool_call(&name, &args).await;
-
-            if must_settle_command && !kind.is_control_command() {
-                let tool_payload = serde_json::json!({
-                    "tool": name,
-                    "arguments": args,
-                    "result": { "error": format!("{} required while a command is running", crate::tools::CONTROL_COMMAND_NAME) }
-                });
-                messages.push(Message::Tool(tool_payload.to_string()));
-                continue;
-            }
-
-            let approved = gate_risky_if_needed(&display, kind, &args).await;
-            if !approved {
-                let tool_payload = serde_json::json!({
-                    "tool": name,
-                    "arguments": args,
-                    "result": { "error": "user denied" }
-                });
-                messages.push(Message::Tool(tool_payload.to_string()));
-                continue;
-            }
-
-            let starts_command = kind.starts_command(&args);
-            // Only newly-started commands get a live output pane for streaming stdout/stderr.
-            let execution_pane = if starts_command {
-                display.start_executing()
-            } else {
-                None
-            };
-            let context =
-                context.with_live_output(execution_pane.as_ref().map(|pane| pane.sender()));
-            let streamed = starts_command && execution_pane.is_some();
-            let result = tokio::select! {
-                result = crate::tools::invoke(&tools, context.clone(), &name, args.clone()) => {
-                    result.unwrap_or_else(|error| serde_json::json!({ "error": error }))
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    drop(execution_pane);
-                    context.kill_running_commands().await;
-                    return Err(eyre!(TurnCancelled));
-                }
-            };
-
-            drop(execution_pane);
-
-            if !streamed && kind.has_command_output() {
-                // For plain display mode, forward stdout/stderr all at once.
-                if let Some(obj) = result.as_object() {
-                    let stdout = obj.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
-                    let stderr = obj.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
-                    display.show_tool_output(&name, stdout, stderr).await;
-                }
-            }
-
-            let tool_payload =
-                serde_json::json!({ "tool": name, "arguments": args.clone(), "result": result });
-            messages.push(Message::Tool(tool_payload.to_string()));
-        }
-        // Loop continues: send a new Request with updated history to get the assistant to use the tool results
+        execute_calls(&calls, &tools, commands, display, messages).await;
     }
 }
 
-/// Run a single turn while tapping the answer stream to collect a full string.
-/// Send a prompt to the hub and multiplex streamed frames to display channels.
-/// This may reconnect to the hub if the connection is lost.
-/// Reasoning, tool exchanges, and the answer are appended to `messages`, so the next turn's
-/// history extends exactly what the hub already consumed. Returns the final answer string.
-pub async fn run_turn(
-    stream: &mut UnixStream,
-    display: Arc<Display>,
+/// Collect approvals in call order, then run adjacent command calls together.
+/// Other tools stay in order with respect to commands and each other.
+async fn execute_calls(
+    calls: &[PendingToolCall],
+    tools: &ExposedTools,
+    commands: &Commands,
+    display: &Display,
     messages: &mut Vec<Message>,
-) -> Result<String> {
-    use std::time::Duration;
-    fn is_disconnect(e: &eyre::Report) -> bool {
-        if let Some(pe) = e.downcast_ref::<crate::protocol::ProtocolError>() {
-            return matches!(pe, crate::protocol::ProtocolError::Disconnect);
+) {
+    for batch in calls.chunk_by(|left, right| {
+        kind_of(&left.name).has_command_output() && kind_of(&right.name).has_command_output()
+    }) {
+        let mut approvals = Vec::with_capacity(batch.len());
+        for call in batch {
+            display.show_tool_call(&call.name, &call.arguments).await;
+            let approval = approve_call(display, call).await;
+            approvals.push(approval);
         }
-        if let Some(ioe) = e.downcast_ref::<std::io::Error>() {
-            use std::io::ErrorKind::*;
-            return matches!(
-                ioe.kind(),
-                BrokenPipe | ConnectionReset | ConnectionAborted | UnexpectedEof
-            );
-        }
-        false
-    }
 
-    let max_reconnect_attempts = 6;
-    let mut reconnect_attempts = 0;
-    let context = ToolContext::default();
-
-    loop {
-        let result = attempt_turn_on_stream(
-            messages,
-            context.clone(),
-            stream,
-            &mut reconnect_attempts,
-            display.clone(),
-        )
-        .await;
-        match result {
-            Err(e) => {
-                if !is_disconnect(&e) {
-                    context.kill_running_commands().await;
-                    return Err(e);
-                }
-                if reconnect_attempts >= max_reconnect_attempts {
-                    context.kill_running_commands().await;
-                    return Err(e);
-                }
-
-                tokio::time::sleep(Duration::from_millis(1u64 << reconnect_attempts)).await;
-
-                let mut new_stream = obtain_control_stream().await?;
-                std::mem::swap(stream, &mut new_stream);
-
-                reconnect_attempts += 1;
+        // A single command can use the live pane without mixing its bytes with another job.
+        let pane = match (batch, approvals.as_slice()) {
+            ([call], [Approval::Approved]) if kind_of(&call.name).has_command_output() => {
+                display.execution_pane()
             }
-            Ok(s) => return Ok(s),
+            _ => None,
+        };
+        let results = match pane {
+            Some((live, pane)) => {
+                let context = ToolContext::new(commands, Some(&live));
+                pane.render(invoke_batch(batch, approvals, tools, context))
+                    .await
+            }
+            None => {
+                let context = ToolContext::new(commands, None);
+                let results = invoke_batch(batch, approvals, tools, context).await;
+                for (call, result) in batch.iter().zip(&results) {
+                    if kind_of(&call.name).has_command_output() {
+                        let id = result.get("commandId").and_then(Value::as_u64);
+                        let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
+                        let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
+                        display
+                            .show_tool_output(&call.name, id, stdout, stderr)
+                            .await;
+                    }
+                }
+                results
+            }
+        };
+
+        for (call, result) in batch.iter().zip(results) {
+            let kind = kind_of(&call.name);
+            let command_id = result.get("commandId").and_then(Value::as_u64);
+            if kind == ToolKind::RunCommand
+                && result["status"] == "running"
+                && let Some(id) = command_id
+            {
+                eprintln!("command {id} running (PID {})", result["pid"]);
+            }
+            let payload =
+                json!({ "tool": call.name, "arguments": call.arguments, "result": result });
+            messages.push(Message::Tool(payload.to_string()));
         }
     }
 }
 
-fn settle_command_prompt(pids: &[u32]) -> String {
-    let pids = pids
+async fn invoke_batch(
+    calls: &[PendingToolCall],
+    approvals: Vec<Approval>,
+    tools: &ExposedTools,
+    context: ToolContext<'_>,
+) -> Vec<Value> {
+    join_all(
+        calls
+            .iter()
+            .zip(approvals)
+            .map(|(call, approval)| async move {
+                match approval {
+                    Approval::Denied(reason) => {
+                        json!({ "error": "user denied", "reason": reason })
+                    }
+                    Approval::Unavailable(reason) => {
+                        json!({ "error": "approval unavailable", "reason": reason })
+                    }
+                    Approval::Approved => {
+                        let result = crate::tools::invoke(
+                            tools,
+                            context,
+                            &call.name,
+                            call.arguments.clone(),
+                        )
+                        .await;
+                        result.unwrap_or_else(|error| json!({ "error": error }))
+                    }
+                }
+            }),
+    )
+    .await
+}
+
+async fn approve_call(display: &Display, call: &PendingToolCall) -> Approval {
+    let kind = kind_of(&call.name);
+    match kind {
+        ToolKind::RunCommand if kind.starts_command(&call.arguments) => {
+            display.confirm(&call.name, "").await
+        }
+        ToolKind::ApplyPatch => {
+            let preview = call
+                .arguments
+                .get("patch")
+                .and_then(Value::as_str)
+                .and_then(summarize_patch_for_preview)
+                .unwrap_or_default();
+            display.confirm(&call.name, &preview).await
+        }
+        _ => Approval::Approved,
+    }
+}
+
+fn pending_command_prompt(ids: &[u64]) -> String {
+    let ids = ids
         .iter()
-        .map(u32::to_string)
+        .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "Command pid(s) {pids} are still running. Call {} now with action=\"wait\" or action=\"kill\"; do not answer the user yet.",
+        "Pending commandId values: {ids}. You can continue other work. Before answering, collect a final result for each with {} and action=\"wait\" or action=\"kill\".",
         crate::tools::CONTROL_COMMAND_NAME
     )
 }
 
-async fn gate_risky_if_needed(display: &Display, kind: ToolKind, args: &serde_json::Value) -> bool {
-    match kind {
-        ToolKind::RunCommand => {
-            let argv: Vec<String> = args
-                .get("argv")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|s| s.as_str().map(|t| t.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if argv.is_empty() {
-                return true;
-            }
-            display.confirm_run_command_execution(&argv).await
-        }
-        ToolKind::ApplyPatch => {
-            let preview = match args.get("patch").and_then(|v| v.as_str()) {
-                Some(patch) => summarize_patch_for_preview(patch).unwrap_or_default(),
-                None => String::new(),
-            };
-            display.confirm_apply_patch_edits(&preview).await
-        }
-        ToolKind::ControlCommand | ToolKind::Other => true,
+/// Cancel the whole conversation turn on SIGINT, including approval, reconnects, and tool waits.
+pub async fn run_turn(
+    stream: &mut Option<UnixStream>,
+    display: &Display,
+    messages: &mut Vec<Message>,
+) -> Result<String> {
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let commands = Commands::default();
+    let result = tokio::select! {
+        biased;
+        _ = interrupt.recv() => Err(TurnCancelled.into()),
+        result = run_with_reconnect(stream, display, messages, &commands) => result,
+    };
+    if result.is_err() {
+        // Closing the socket stops the hub's request and leaves the REPL free to reconnect.
+        let connection = stream.take();
+        drop(connection);
     }
+    commands.shutdown().await;
+    result
+}
+
+async fn run_with_reconnect(
+    stream: &mut Option<UnixStream>,
+    display: &Display,
+    messages: &mut Vec<Message>,
+    commands: &Commands,
+) -> Result<String> {
+    let mut reconnect_attempts = 0;
+    loop {
+        let connection = match stream {
+            Some(connection) => connection,
+            None => stream.insert(obtain_control_stream().await?),
+        };
+        let result = attempt_turn_on_stream(
+            messages,
+            commands,
+            connection,
+            &mut reconnect_attempts,
+            display,
+        )
+        .await;
+        let Err(error) = result else { return result };
+        if reconnect_attempts >= 6 || !is_disconnect(&error) {
+            return Err(error);
+        }
+
+        let connection = stream.take();
+        drop(connection);
+        tokio::time::sleep(Duration::from_millis(1u64 << reconnect_attempts)).await;
+        reconnect_attempts += 1;
+    }
+}
+
+fn is_disconnect(error: &eyre::Report) -> bool {
+    let io_error = match error.downcast_ref::<ProtocolError>() {
+        Some(ProtocolError::Disconnect) => return true,
+        Some(ProtocolError::Io(error)) => Some(error),
+        _ => error.downcast_ref::<io::Error>(),
+    };
+    io_error.is_some_and(|error| {
+        use io::ErrorKind::*;
+        matches!(
+            error.kind(),
+            BrokenPipe | ConnectionReset | ConnectionAborted | UnexpectedEof
+        )
+    })
 }
 
 #[cfg(test)]

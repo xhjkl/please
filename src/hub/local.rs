@@ -213,7 +213,23 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
             }
             Frame::Request { messages } => {
                 tracing::info!("hub: received inference request");
-                serve_one_turn(stream, hub.clone(), connection, &messages).await
+                let (mut reader, mut writer) = stream.split();
+                let turn = serve_one_turn(&mut writer, hub.clone(), connection, &messages);
+                tokio::pin!(turn);
+                let mut byte = [0];
+                tokio::select! {
+                    biased;
+                    read = reader.read(&mut byte) => {
+                        let read = read?;
+                        // Dropping the receiver stops generation even when there are no deltas.
+                        if read == 0 {
+                            return Ok(());
+                        }
+                        store.extend_from_slice(&byte[..read]);
+                        turn.await
+                    }
+                    result = &mut turn => result,
+                }
             }
             Frame::BenchmarkRequest {
                 messages,

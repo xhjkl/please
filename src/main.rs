@@ -1,5 +1,6 @@
 //! Command-line entrypoint. Both the CLI and hub start here.
 use eyre::Result;
+use std::process::ExitCode;
 
 mod cli;
 mod display;
@@ -12,6 +13,6 @@ mod test_support;
 mod tools;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     cli::run().await
 }

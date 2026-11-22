@@ -1,4 +1,5 @@
-use super::common::{Param, ParamType, ToolContext, resolve_path_within_cwd};
+use super::ToolContext;
+use super::common::{Param, ParamType, resolve_path_within_cwd};
 use serde::Deserialize;
 use std::io::Read;
 
@@ -13,7 +14,7 @@ fn default_max_bytes() -> usize {
     512 * 1024
 }
 
-pub async fn call(args: Args, _context: ToolContext) -> serde_json::Value {
+pub async fn call(args: Args, _context: ToolContext<'_>) -> serde_json::Value {
     let res = (|| -> Result<String, String> {
         let rel = resolve_path_within_cwd(&args.path).map_err(|e| e.to_string())?;
         let file = std::fs::File::open(rel).map_err(|e| e.to_string())?;

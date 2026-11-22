@@ -1,5 +1,7 @@
 use eyre::Result;
+use std::process::ExitCode;
 use std::sync::Arc;
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::cli::io;
 use crate::cli::specials;
@@ -9,10 +11,16 @@ use crate::protocol::{HubBusy, Message};
 
 use super::connect::obtain_control_stream;
 use super::repl::interact_forever;
-use super::turn::run_turn;
+use super::turn::{TurnCancelled, is_cancelled, run_turn};
 
 /// sysexits' temporary failure: the user is invited to retry later.
-const EX_TEMPFAIL: i32 = 75;
+const EX_TEMPFAIL: u8 = 75;
+const INTERRUPTED: u8 = 130;
+
+enum Conversation {
+    Interactive,
+    OneShot(String),
+}
 
 /// Initialize the UI pipeline and spawn the renderer.
 /// Returns channels the rest of the app can use to stream status and content.
@@ -24,14 +32,14 @@ fn start_display() -> Result<Arc<display::Display>> {
 
 /// CLI entrypoint: decide between hub mode, REPL, or one-shot batch prompt.
 /// Keeps top-level flow readable while deferring details to real implementations.
-pub async fn run() -> Result<()> {
+pub async fn run() -> Result<ExitCode> {
     // Start display; all user-visible output goes through it
     let display = start_display()?;
 
     // One-shot specials (help/version/load) should exit early before any UI/hub work.
     let did_handle_specials = specials::handle_specials_if_needed().await?;
     if did_handle_specials {
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     let stdout_is_tty = atty::is(atty::Stream::Stdout);
@@ -51,31 +59,43 @@ pub async fn run() -> Result<()> {
         collected
     };
 
-    // Step into interactive mode only when both stdout and stderr are teletype devices and the user provided no prompt.
-    let interactive = stdout_is_tty && stderr_is_tty && stdin_is_tty && prompt.is_empty();
-    match converse(display, history, prompt, interactive).await {
-        // Stepping aside for the probe the hub serves: nothing changes until that one exits.
+    let conversation = if stdout_is_tty && stderr_is_tty && stdin_is_tty && prompt.is_empty() {
+        Conversation::Interactive
+    } else {
+        Conversation::OneShot(prompt)
+    };
+    match converse(&display, history, conversation).await {
         Err(error) if error.downcast_ref::<HubBusy>().is_some() => {
             eprintln!("please: {error}");
-            std::process::exit(EX_TEMPFAIL);
+            Ok(ExitCode::from(EX_TEMPFAIL))
         }
-        conversed => conversed,
+        Err(error) if is_cancelled(&error) => {
+            eprintln!("\nplease: turn cancelled");
+            Ok(ExitCode::from(INTERRUPTED))
+        }
+        Err(error) => Err(error),
+        Ok(()) => Ok(ExitCode::SUCCESS),
     }
 }
 
 /// Connect to the hub, maybe starting a new hub process, and hold the conversation.
 async fn converse(
-    display: Arc<display::Display>,
+    display: &display::Display,
     mut history: Vec<Message>,
-    prompt: String,
-    interactive: bool,
+    conversation: Conversation,
 ) -> Result<()> {
+    let mut interrupt = signal(SignalKind::interrupt())?;
     let little_snake = display.start_spinning().await;
-    let stream = obtain_control_stream().await;
+    let stream = tokio::select! {
+        biased;
+        _ = interrupt.recv() => Err(TurnCancelled.into()),
+        stream = obtain_control_stream() => stream,
+    };
     little_snake.stop().await;
+    drop(interrupt);
 
     // If there are no weights, show the onboarding and exit.
-    let mut stream = match stream {
+    let stream = match stream {
         Err(error) if error.downcast_ref::<crate::hub::NoWeights>().is_some() => {
             display.show_onboarding().await;
             return Err(error);
@@ -83,16 +103,13 @@ async fn converse(
         Err(error) => return Err(error),
         Ok(stream) => stream,
     };
+    let mut stream = Some(stream);
 
-    if interactive {
-        interact_forever(&mut stream, display, history).await?
-    } else {
-        // One-shot: append the user turn to the initial history and infer once.
-        history.push(Message::User(prompt));
-        match run_turn(&mut stream, display, &mut history).await {
-            Ok(_) => {}
-            Err(error) if super::turn::is_cancelled(&error) => return Ok(()),
-            Err(error) => return Err(error),
+    match conversation {
+        Conversation::Interactive => interact_forever(&mut stream, display, history).await?,
+        Conversation::OneShot(prompt) => {
+            history.push(Message::User(prompt));
+            run_turn(&mut stream, display, &mut history).await?;
         }
     }
 

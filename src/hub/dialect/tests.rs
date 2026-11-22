@@ -82,6 +82,64 @@ fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
 }
 
 #[test]
+fn parallel_command_results_share_the_available_context() -> Result<()> {
+    let mut history = vec![Message::User("run both".into())];
+    for (id, name) in [(1, "run_command"), (2, "control_command")] {
+        let payload = json!({
+            "tool": name,
+            "arguments": {},
+            "result": { "commandId": id, "stdout": format!("{}end {id}", "x".repeat(900)) },
+        });
+        history.push(Message::Tool(payload.to_string()));
+    }
+
+    let mut messages = prepare(&history)?;
+    conversation::fit_command_results(&mut messages, 1024, |content| Ok(content.len()))?;
+
+    let mut size = 0;
+    for message in messages {
+        if let ConversationMessage::ToolResult { content, .. } = message {
+            size += content.len();
+            let result: serde_json::Value = serde_json::from_str(&content)?;
+            let id = result["commandId"].as_u64().unwrap();
+            let stdout = result["stdout"].as_str().unwrap();
+            assert!(stdout.ends_with(&format!("end {id}")));
+            assert_eq!(result["stdoutBytesOmitted"], 905 - stdout.len());
+        }
+    }
+    assert!(size <= 512);
+    Ok(())
+}
+
+#[test]
+fn a_following_tool_only_step_keeps_earlier_output_budget() -> Result<()> {
+    let command = |id| {
+        Message::Tool(
+            json!({
+                "tool": "run_command",
+                "arguments": { "argv": ["printf", "output"] },
+                "result": { "commandId": id, "stdout": "x".repeat(900) },
+            })
+            .to_string(),
+        )
+    };
+    let mut history = vec![
+        Message::User("Run both in sequence.".into()),
+        Message::Reasoning(String::new()),
+        command(1),
+    ];
+    let mut before = prepare(&history)?;
+    conversation::fit_command_results(&mut before, 1024, |content| Ok(content.len()))?;
+
+    history.extend([Message::Reasoning(String::new()), command(2)]);
+    let mut after = prepare(&history)?;
+    conversation::fit_command_results(&mut after, 1024, |content| Ok(content.len()))?;
+
+    assert_eq!(&after[..before.len()], before);
+    Ok(())
+}
+
+#[test]
 fn context_cannot_reappear_in_conversation_content() {
     let prepared = prepare(&[Message::User("hello".into()), Message::Context(context())]);
     assert!(prepared.is_err());

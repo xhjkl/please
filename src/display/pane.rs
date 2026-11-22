@@ -1,68 +1,49 @@
-use std::sync::Arc;
+use std::future::Future;
 
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use super::{Display, Phase};
+use super::Display;
 
-pub struct ExecutionPane {
-    display: Arc<Display>,
-    sender: UnboundedSender<String>,
-    task: Option<JoinHandle<()>>,
-}
+/// Live output for one tool invocation, driven by the same task as the turn.
+pub struct ExecutionPane(UnboundedReceiver<String>);
 
 impl ExecutionPane {
-    pub fn sender(&self) -> UnboundedSender<String> {
-        self.sender.clone()
+    pub async fn render<T>(mut self, invocation: impl Future<Output = T>) -> T {
+        tokio::pin!(invocation);
+        let result = tokio::select! {
+            result = &mut invocation => result,
+            () = self.drain() => invocation.await,
+        };
+        self.0.close();
+        self.drain().await;
+        result
+    }
+
+    async fn drain(&mut self) {
+        while let Some(chunk) = self.0.recv().await {
+            let _ = crossterm::execute!(
+                std::io::stderr(),
+                SetForegroundColor(Color::DarkYellow),
+                Print(chunk),
+                ResetColor,
+            );
+        }
     }
 }
 
 impl Drop for ExecutionPane {
     fn drop(&mut self) {
-        let _ = self.task.take().map(|task| {
-            tokio::spawn(async move {
-                task.abort();
-                let _ = task.await;
-            })
-        });
         let _ = crossterm::execute!(std::io::stderr(), Print("\n"));
-        *self.display.phase.write().unwrap() = Phase::Answering;
     }
 }
 
 impl Display {
-    pub fn start_executing(self: &Arc<Self>) -> Option<ExecutionPane> {
-        if !self.caps.colorful {
+    pub fn execution_pane(&self) -> Option<(UnboundedSender<String>, ExecutionPane)> {
+        if !self.stderr_is_tty {
             return None;
         }
-        *self.phase.write().unwrap() = Phase::Executing;
-
-        let (sender, mut rx) = unbounded_channel::<String>();
-        let display = Arc::clone(self);
-        let display_for_task = Arc::clone(&display);
-        let task = tokio::spawn(async move {
-            while let Some(chunk) = rx.recv().await {
-                display_for_task.append_execution_output(&chunk);
-            }
-        });
-
-        Some(ExecutionPane {
-            display,
-            sender,
-            task: Some(task),
-        })
-    }
-
-    fn append_execution_output(&self, chunk: &str) {
-        if chunk.is_empty() {
-            return;
-        }
-        let _ = crossterm::execute!(
-            std::io::stderr(),
-            SetForegroundColor(Color::DarkYellow),
-            Print(chunk),
-            ResetColor
-        );
+        let (sender, receiver) = unbounded_channel();
+        Some((sender, ExecutionPane(receiver)))
     }
 }

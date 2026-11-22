@@ -91,7 +91,7 @@ pub fn tool_schemas() -> Vec<Value> {
 
 /// Halve the longer output stream of a command result, counting the dropped bytes.
 /// Returns how many bytes were dropped; zero means nothing is left to trim.
-pub fn trim_command_stream(result: &mut Value) -> usize {
+fn trim_command_stream(result: &mut Value) -> usize {
     let length = |stream| {
         result
             .get(stream)
@@ -117,34 +117,54 @@ pub fn trim_command_stream(result: &mut Value) -> usize {
     start
 }
 
-/// Shorten every command result longer than half the tail budget, keeping its newest output.
-/// Trimming each result on its own, whether or not it is the latest, keeps the rendering of
-/// earlier turns unchanged, so a kept session still holds them as a prefix.
+/// Give each tool exchange half the tail budget for command results, keeping the newest output.
+/// Trimming per exchange keeps earlier rendered steps reusable as a prefix.
 pub fn fit_command_results(
     messages: &mut [ConversationMessage],
     tail_budget: usize,
     count: impl Fn(&str) -> Result<usize>,
 ) -> Result<()> {
-    for message in messages {
-        let ConversationMessage::ToolResult { name, content } = message else {
-            continue;
-        };
-        if !crate::tools::kind_of(name).has_command_output() {
+    let command_result = |message: &ConversationMessage| {
+        matches!(message, ConversationMessage::ToolResult { name, .. }
+            if crate::tools::kind_of(name).has_command_output())
+    };
+    let exchanges = messages.split_mut(|message| {
+        !matches!(
+            message,
+            ConversationMessage::ToolCall(_) | ConversationMessage::ToolResult { .. }
+        )
+    });
+    for exchange in exchanges {
+        let count_results = exchange
+            .iter()
+            .filter(|message| command_result(message))
+            .count();
+        if count_results == 0 {
             continue;
         }
-        let mut result: Value = serde_json::from_str(content)?;
-        loop {
-            let tokens = count(content)?;
-            if tokens <= tail_budget / 2 {
-                break;
+        let per_result = tail_budget / 2 / count_results;
+        for message in exchange
+            .iter_mut()
+            .filter(|message| command_result(message))
+        {
+            let ConversationMessage::ToolResult { content, .. } = message else {
+                unreachable!();
+            };
+            let mut tokens = count(content)?;
+            if tokens <= per_result {
+                continue;
             }
-            if trim_command_stream(&mut result) == 0 {
-                if tokens + 64 > tail_budget {
-                    eyre::bail!("command result metadata exceeds available context");
+            let mut result: Value = serde_json::from_str(content)?;
+            while tokens > per_result {
+                if trim_command_stream(&mut result) == 0 {
+                    if tokens + 64 > tail_budget {
+                        eyre::bail!("command result metadata exceeds available context");
+                    }
+                    break;
                 }
-                break;
+                *content = serde_json::to_string(&result)?;
+                tokens = count(content)?;
             }
-            *content = serde_json::to_string(&result)?;
         }
     }
     Ok(())

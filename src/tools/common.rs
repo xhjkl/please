@@ -1,52 +1,6 @@
 use std::fs;
-use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::pin::Pin;
-use std::sync::Arc;
 use std::{env, io};
-use tokio::sync::mpsc::UnboundedSender;
-
-/// Shared command state for one assistant turn, with live output scoped to a tool call.
-#[derive(Clone)]
-pub struct ToolContext {
-    running_commands: Arc<super::run_command::RunningCommands>,
-    live_output: Option<UnboundedSender<String>>,
-}
-
-impl ToolContext {
-    pub fn with_live_output(&self, live_output: Option<UnboundedSender<String>>) -> Self {
-        Self {
-            running_commands: self.running_commands.clone(),
-            live_output,
-        }
-    }
-
-    pub fn live_output(&self) -> Option<UnboundedSender<String>> {
-        self.live_output.clone()
-    }
-
-    pub fn running_commands(&self) -> Arc<super::run_command::RunningCommands> {
-        self.running_commands.clone()
-    }
-
-    pub async fn kill_running_commands(&self) {
-        self.running_commands.kill_all().await;
-    }
-
-    /// Pids for subprocesses still owned by this assistant turn.
-    pub async fn running_command_pids(&self) -> Vec<u32> {
-        self.running_commands.pids().await
-    }
-}
-
-impl Default for ToolContext {
-    fn default() -> Self {
-        Self {
-            running_commands: Arc::new(super::run_command::RunningCommands::default()),
-            live_output: None,
-        }
-    }
-}
 
 #[cfg_attr(
     not(all(target_os = "macos", target_arch = "aarch64")),
@@ -70,63 +24,6 @@ pub struct Param {
     pub desc: &'static str,
     pub param_type: ParamType,
     pub required: bool,
-}
-
-/// Anything that can be called with a `serde_json::Value` payload and a context.
-pub type AsyncFn = Box<
-    dyn Fn(
-            serde_json::Value,
-            ToolContext,
-        ) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Adapt a typed async handler to an LLM/tool-call friendly `Fn(Value, ToolContext) -> Future<Value>`.
-/// The context carries shared turn state and optional live output for this call.
-/// That keeps strongly-typed ergonomics at the edges; the closure is `Arc`-cloned for reuse.
-/// Use this when registering typed tools behind a single uniform entrypoint expected by function-calling runtimes.
-///
-/// ```rust,ignore
-/// #[derive(serde::Deserialize)]
-/// struct Hello { name: String }
-///
-/// async fn hello(
-///     args: Hello,
-///     _context: ToolContext,
-/// ) -> serde_json::Value {
-///     serde_json::json!({ "hi": args.name })
-/// }
-///
-/// // Expose a uniform tool-call shape for the model loop
-/// let wrapped = with_args(hello);
-///
-/// // Invoke with raw JSON like a function-calling payload
-/// let out = wrapped(serde_json::json!({ "name": "Ada" }), ToolContext::default()).await;
-/// assert_eq!(out, serde_json::json!({ "hi": "Ada" }));
-///
-/// // Invalid inputs yield a normalized error object
-/// let err = wrapped(serde_json::json!({ "name": 123 }), ToolContext::default()).await;
-/// assert!(err.get("error").is_some());
-/// ```
-pub fn with_args<Args, Fut, F>(f: F) -> AsyncFn
-where
-    Args: serde::de::DeserializeOwned + Send + 'static,
-    F: Fn(Args, ToolContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = serde_json::Value> + Send + 'static,
-{
-    let f = Arc::new(f);
-    Box::new(move |args: serde_json::Value, context: ToolContext| {
-        let args = serde_json::from_value::<Args>(args).map_err(|e| e.to_string());
-        let args = match args {
-            Ok(args) => args,
-            Err(error) => {
-                return Box::pin(async move { serde_json::json!({ "error": error }) });
-            }
-        };
-        let f = Arc::clone(&f);
-        Box::pin(async move { (f)(args, context).await })
-    })
 }
 
 /// Resolve a user-supplied path to a relative path confined to the current working

@@ -1,50 +1,79 @@
 use eyre::{Result, eyre};
-use std::sync::Arc;
 use tokio::net::UnixStream;
+use tokio::signal::unix::{SignalKind, signal};
 
-use crate::display::Display;
+use crate::display::{Display, read_terminal_line};
 use crate::protocol::{HubBusy, Message};
 
-use super::connect::obtain_control_stream;
 use super::turn::run_turn;
 
 /// Read requests until an empty line or end of input, carrying the whole conversation.
 pub async fn interact_forever(
-    stream: &mut UnixStream,
-    display: Arc<Display>,
+    stream: &mut Option<UnixStream>,
+    display: &Display,
     history: Vec<Message>,
 ) -> Result<()> {
-    use rustyline::error::ReadlineError::{Eof, Interrupted};
+    use rustyline::error::{
+        ReadlineError::{Eof, Interrupted, Signal},
+        Signal::Interrupt,
+    };
 
-    let mut rl = rustyline::DefaultEditor::new().map_err(|e| eyre!(e))?;
+    let term = std::env::var("TERM").unwrap_or_default();
+    // Rustyline uses a blocking cooked read on these terminals.
+    let mut editor = if ["dumb", "cons25", "emacs"]
+        .iter()
+        .any(|name| term.eq_ignore_ascii_case(name))
+    {
+        None
+    } else {
+        Some(rustyline::DefaultEditor::new()?)
+    };
     let mut history = history;
     loop {
-        let line = match rl.readline(">> ") {
-            Ok(line) => line,
-            Err(Eof) | Err(Interrupted) => break,
-            Err(e) => return Err(eyre!(e)),
+        let line = if let Some(editor) = editor.as_mut() {
+            let input = editor.readline(">> ");
+            match input {
+                Ok(line) => line,
+                Err(Eof) => break,
+                Err(Interrupted | Signal(Interrupt)) => continue,
+                Err(e) => return Err(eyre!(e)),
+            }
+        } else {
+            let mut interrupt = signal(SignalKind::interrupt())?;
+            crossterm::execute!(std::io::stderr(), crossterm::style::Print(">> "))?;
+            tokio::select! {
+                biased;
+                _ = interrupt.recv() => {
+                    eprintln!();
+                    continue;
+                }
+                input = read_terminal_line() => input?,
+            }
         };
         let line = line.trim();
         if line.is_empty() {
             break;
         }
-        rl.add_history_entry(line).ok();
+        if let Some(editor) = editor.as_mut() {
+            let _ = editor.add_history_entry(line);
+        }
 
         // A finished turn keeps everything it appended, so the next prompt extends it.
         let before = history.len();
         history.push(Message::User(line.to_string()));
-        match run_turn(stream, display.clone(), &mut history).await {
+        match run_turn(stream, display, &mut history).await {
             Ok(_) => {}
             // Another probe took the hub while this one reconnected; the caller steps aside.
             Err(error) if error.downcast_ref::<HubBusy>().is_some() => return Err(error),
             // A cancelled or failed turn leaves no trace, and the conversation goes on.
             Err(error) => {
                 history.truncate(before);
-                if !super::turn::is_cancelled(&error) {
+                if super::turn::is_cancelled(&error) {
+                    eprintln!("\nplease: turn cancelled");
+                } else {
                     eprintln!("please: {error:#}");
                 }
                 eprintln!();
-                *stream = obtain_control_stream().await?;
                 continue;
             }
         }

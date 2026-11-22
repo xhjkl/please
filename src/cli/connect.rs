@@ -63,6 +63,7 @@ async fn start_hub(path: &Path) -> Result<UnixStream> {
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
+    cmd.process_group(0);
     let mut child = cmd.spawn()?;
     let connected = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
