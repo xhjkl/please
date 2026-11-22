@@ -1,4 +1,5 @@
 use eyre::Result;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::signal::unix::{SignalKind, signal};
@@ -42,9 +43,9 @@ pub async fn run() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let stdout_is_tty = atty::is(atty::Stream::Stdout);
-    let stderr_is_tty = atty::is(atty::Stream::Stderr);
-    let stdin_is_tty = atty::is(atty::Stream::Stdin);
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let stderr_is_tty = std::io::stderr().is_terminal();
+    let stdin_is_tty = std::io::stdin().is_terminal();
     let stdout_redirection_path =
         (!stdout_is_tty).then(|| io::stdout_redirection_path().unwrap_or_default());
     let stdin_content = io::read_whole_stdin()?;

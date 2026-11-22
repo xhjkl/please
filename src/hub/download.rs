@@ -2,9 +2,9 @@
 use super::dialect::Dialect;
 use super::discovery;
 use eyre::{Result, eyre};
-use futures_util::StreamExt;
 use std::path::Path;
-use tokio::io::AsyncWriteExt;
+
+mod transfer;
 
 /// A pinned checkpoint and the exact size its download must reach.
 struct Model {
@@ -108,102 +108,30 @@ pub async fn run_download(which: Option<&str>) -> Result<()> {
         );
     }
     let partial = target.with_extension("gguf.part");
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("please/", env!("CARGO_PKG_VERSION")))
-        .tls_backend_rustls()
-        .build()?;
     eprintln!(
         "please load: {} ({} bytes; memory budget {} bytes)",
         model.name, model.bytes, budget
     );
-    download_one(&client, model.url, &partial, model.bytes).await?;
+    download_one(model.url, &partial, model.bytes).await?;
     let downloaded = discovery::inspect(partial.clone())?;
     if downloaded.dialect != Dialect::Qwenish {
         eyre::bail!("downloaded checkpoint is not dense Qwen");
     }
-    tokio::fs::rename(&partial, &target).await?;
+    std::fs::rename(&partial, &target)?;
     eprintln!("\nplease load: ready: {}", target.display());
     Ok(())
 }
 
-/// Resume into a hidden partial file and verify the pinned size before it becomes discoverable.
-async fn download_one(
-    client: &reqwest::Client,
-    url: &str,
-    path: &Path,
-    expected: u64,
-) -> Result<()> {
-    let metadata = tokio::fs::metadata(path).await;
-    let mut offset = match metadata {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error.into()),
-        Ok(metadata) => metadata.len(),
-    };
-    if offset == expected {
-        return Ok(());
-    }
-    if offset > expected {
-        eyre::bail!("partial download exceeds expected size: {}", path.display());
-    }
-    let mut request = client.get(url);
-    if offset > 0 {
-        request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
-    }
-    let response = request.send().await?;
-    let status = response.status();
-    match status {
-        reqwest::StatusCode::OK => offset = 0,
-        reqwest::StatusCode::PARTIAL_CONTENT => {
-            let range = response
-                .headers()
-                .get(reqwest::header::CONTENT_RANGE)
-                .and_then(|value| value.to_str().ok());
-            let expected_range = format!("bytes {offset}-{}/{expected}", expected - 1);
-            if range != Some(expected_range.as_str()) {
-                eyre::bail!("unexpected download Content-Range: {range:?}");
-            }
-        }
-        _ => return Err(eyre!("download failed: {status}")),
-    }
-    if let Some(length) = response.content_length()
-        && length != expected - offset
-    {
-        eyre::bail!(
-            "download size changed: expected {} bytes, got {length}",
-            expected - offset
-        );
-    }
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(offset == 0)
-        .append(offset > 0)
-        .open(path)
-        .await?;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if chunk.len() as u64 > expected - offset {
-            eyre::bail!("download exceeds expected size");
-        }
-        file.write_all(&chunk).await?;
-        offset += chunk.len() as u64;
-        eprint!(
-            "\rplease load: {offset}/{expected} bytes ({:.1}%)",
-            offset as f64 * 100.0 / expected as f64
-        );
-    }
-    file.flush().await?;
-    if offset != expected {
-        eyre::bail!("download size mismatch: expected {expected}, got {offset}");
-    }
-    file.sync_all().await?;
-    Ok(())
+async fn download_one(url: &str, path: &Path, expected: u64) -> Result<()> {
+    let url = url.to_owned();
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || transfer::fetch(&url, &path, expected)).await?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[test]
     fn only_dense_qwen_is_downloadable() -> Result<()> {
         validate_request(None)?;
@@ -224,7 +152,6 @@ mod tests {
         Ok(())
     }
     async fn server(response: String) -> Result<(String, tokio::task::JoinHandle<String>)> {
-        use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let task = tokio::spawn(async move {
@@ -247,21 +174,49 @@ mod tests {
     async fn download_resumes_and_handles_ignored_ranges() -> Result<()> {
         let directory = crate::test_support::TempDir::new()?;
         let path = directory.0.join("model.gguf.part");
-        let client = reqwest::Client::new();
         for response in [
             "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 3-5/6\r\nConnection: close\r\n\r\ndef",
             "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef",
         ] {
             std::fs::write(&path, b"abc")?;
             let (url, task) = server(response.to_string()).await?;
-            download_one(&client, &url, &path, 6).await?;
+            download_one(&url, &path, 6).await?;
             let request = task.await?;
             assert!(request.to_lowercase().contains("range: bytes=3-"));
             let bytes = std::fs::read(&path)?;
             assert_eq!(bytes, b"abcdef");
         }
         // A complete partial file needs no network request before structural validation.
-        download_one(&client, "http://127.0.0.1:1/unreachable", &path, 6).await?;
+        download_one("http://127.0.0.1:1/unreachable", &path, 6).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_follows_redirects_and_discards_trailers() -> Result<()> {
+        let directory = crate::test_support::TempDir::new()?;
+        let path = directory.0.join("model.gguf.part");
+        std::fs::write(&path, b"abc")?;
+        let (target, final_request) = server(
+            concat!(
+                "HTTP/1.1 103 Early Hints\r\nLink: </model.gguf>\r\n\r\n",
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-5/6\r\n",
+                "Transfer-Encoding: chunked\r\nTrailer: X-Trailer\r\nConnection: close\r\n\r\n",
+                "3\r\ndef\r\n0\r\nX-Trailer: metadata\r\n\r\n",
+            )
+            .to_string(),
+        )
+        .await?;
+        let (url, redirect_request) = server(format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nskip",
+        )).await?;
+
+        download_one(&url, &path, 6).await?;
+
+        for request in [redirect_request.await?, final_request.await?] {
+            assert!(request.to_lowercase().contains("range: bytes=3-"));
+        }
+        let bytes = std::fs::read(&path)?;
+        assert_eq!(bytes, b"abcdef");
         Ok(())
     }
 
@@ -269,7 +224,6 @@ mod tests {
     async fn failed_or_misaligned_download_keeps_existing_bytes() -> Result<()> {
         let directory = crate::test_support::TempDir::new()?;
         let path = directory.0.join("model.gguf.part");
-        let client = reqwest::Client::new();
         for response in [
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\nConnection: close\r\n\r\nerr",
             "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 0-2/6\r\nConnection: close\r\n\r\nabc",
@@ -277,7 +231,7 @@ mod tests {
         ] {
             std::fs::write(&path, b"abc")?;
             let (url, task) = server(response.to_string()).await?;
-            let result = download_one(&client, &url, &path, 6).await;
+            let result = download_one(&url, &path, 6).await;
             assert!(result.is_err());
             task.await?;
             let bytes = std::fs::read(&path)?;

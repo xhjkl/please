@@ -8,6 +8,7 @@ pub use spinner::Spinner;
 pub use terminal::read_line as read_terminal_line;
 
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use std::io::IsTerminal;
 
 /// Display interface used by CLI components.
 pub struct Display {
@@ -160,8 +161,8 @@ impl Display {
 
 /// Create a streaming display. Prefer colorful UI on TTY stderr; fallback to plain printing.
 pub fn make_display() -> Display {
-    let stderr_is_tty = atty::is(atty::Stream::Stderr);
-    let stdin_is_tty = atty::is(atty::Stream::Stdin);
+    let stderr_is_tty = std::io::stderr().is_terminal();
+    let stdin_is_tty = std::io::stdin().is_terminal();
 
     // CLI is the only consumer today; readout is enabled for foreground hub runs.
     let hub_runs_in_foreground =

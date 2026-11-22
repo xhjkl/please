@@ -1,33 +1,25 @@
 use eyre::eyre;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 #[cfg(unix)]
 use std::path::Path;
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::os::fd::BorrowedFd;
-
-#[cfg(unix)]
-use nix::unistd::isatty;
 
 #[cfg(target_os = "macos")]
 use nix::fcntl::{FcntlArg, fcntl};
 
-fn stdin_is_tty() -> bool {
-    atty::is(atty::Stream::Stdin)
-}
-
 /// If stdin is not a TTY, read it fully as a single UTF-8 string.
 /// Returns `None` when stdin is a TTY or when the input is empty/whitespace.
 pub fn read_whole_stdin() -> eyre::Result<Option<String>> {
-    if stdin_is_tty() {
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
         return Ok(None);
     }
     let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .map_err(|e| eyre!(e))?;
+    stdin.read_to_string(&mut buf).map_err(|e| eyre!(e))?;
     if buf.trim().is_empty() {
         Ok(None)
     } else {
@@ -42,8 +34,7 @@ pub fn stdout_redirection_path() -> Option<String> {
     const FD: i32 = 1; // STDOUT
 
     // If stdout is a TTY, we are interactive.
-    let fd_ref = unsafe { BorrowedFd::borrow_raw(FD) };
-    if isatty(fd_ref).ok()? {
+    if std::io::stdout().is_terminal() {
         return None;
     }
 
