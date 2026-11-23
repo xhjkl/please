@@ -60,7 +60,8 @@ pub(super) async fn measure(
     let connection = hub.connect();
     let first = exchange(&hub, connection, &setting, messages.clone(), max_tokens).await?;
     let mut follow_up = messages;
-    follow_up.extend(first.reply());
+    let next = follow_up.len() as u64 + 1;
+    follow_up.extend(first.reply(next));
     let second = exchange(&hub, connection, &setting, follow_up, max_tokens).await?;
     let report = serde_json::json!({
         "model": hub.path, "load_seconds": hub.load_seconds,
@@ -142,8 +143,9 @@ async fn exchange(
 }
 
 impl Exchange {
-    /// What the probe would append before its next request; tools are never executed here.
-    fn reply(&self) -> Vec<Message> {
+    /// What the probe would append before its next request, its calls numbered as the hub
+    /// would number their entries from `next`; tools are never executed here.
+    fn reply(&self, next: u64) -> Vec<Message> {
         let mut messages = Vec::new();
         if !self.thinking.is_empty() {
             messages.push(Message::Thinking(self.thinking.clone()));
@@ -153,11 +155,14 @@ impl Exchange {
         }
         let calls = self.calls.as_deref().unwrap_or_default();
         for call in calls {
+            let id = next + messages.len() as u64;
             messages.push(Message::Call(Call {
+                id,
                 name: call.name.clone(),
                 arguments: call.arguments.to_string(),
             }));
             messages.push(Message::Result(ToolResult {
+                id,
                 name: call.name.clone(),
                 content: r#"{"error":"the benchmark does not execute tools"}"#.into(),
             }));

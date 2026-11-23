@@ -21,10 +21,12 @@ fn tool_loop() -> Vec<ConversationMessage> {
     let tool = |name: &str, arguments: serde_json::Value, result: serde_json::Value| {
         [
             Message::Call(Call {
+                id: 1,
                 name: name.into(),
                 arguments: arguments.to_string(),
             }),
             Message::Result(ToolResult {
+                id: 1,
                 name: name.into(),
                 content: result.to_string(),
             }),

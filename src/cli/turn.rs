@@ -26,6 +26,7 @@ pub fn is_cancelled(error: &eyre::Report) -> bool {
 }
 
 struct PendingToolCall {
+    id: u64,
     name: String,
     arguments: Value,
 }
@@ -91,6 +92,8 @@ async fn attempt_turn_on_stream(
         let mut answer = String::new();
         let mut calls = Vec::new();
         let mut malformed = Vec::new();
+        // Call IDs in the order the model made the calls, which their results keep.
+        let mut order = Vec::new();
 
         loop {
             let frame = read_frame_from_stream(stream, &mut store, None, None).await?;
@@ -121,15 +124,19 @@ async fn attempt_turn_on_stream(
                     }
                 }
                 Frame::ToolCall {
+                    id,
                     name,
                     arguments_json,
                 } => {
+                    order.push(id);
                     // Only an object reaches a tool: approval reads the same fields the tool does.
                     match serde_json::from_str::<Value>(&arguments_json) {
-                        Ok(arguments) if arguments.is_object() => {
-                            calls.push(PendingToolCall { name, arguments })
-                        }
-                        _ => malformed.push(name),
+                        Ok(arguments) if arguments.is_object() => calls.push(PendingToolCall {
+                            id,
+                            name,
+                            arguments,
+                        }),
+                        _ => malformed.push((id, name)),
                     }
                 }
                 Frame::Stop => {
@@ -146,12 +153,13 @@ async fn attempt_turn_on_stream(
             display.end_answer();
         }
 
-        let refused = malformed.into_iter().map(|name| {
+        let refused = malformed.into_iter().map(|(id, name)| {
             let content = json!({ "error": "tool call arguments must be a JSON object" });
-            Message::Result(ToolResult {
+            ToolResult {
+                id,
                 name,
                 content: content.to_string(),
-            })
+            }
         });
         let refused: Vec<_> = refused.collect();
         if calls.is_empty() && refused.is_empty() && !command_ids.is_empty() {
@@ -169,7 +177,8 @@ async fn attempt_turn_on_stream(
 
         let mut results = refused;
         results.extend(execute_calls(&calls, &tools, commands, display).await);
-        *pending = Pending::new(results);
+        results.sort_by_key(|result| order.iter().position(|&id| id == result.id));
+        *pending = Pending::new(results.into_iter().map(Message::Result).collect());
     }
 }
 
@@ -180,8 +189,8 @@ async fn execute_calls(
     tools: &ExposedTools,
     commands: &Commands,
     display: &Display,
-) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(calls.len());
+) -> Vec<ToolResult> {
+    let mut answers = Vec::with_capacity(calls.len());
     for batch in calls.chunk_by(|left, right| {
         kind_of(&left.name).has_command_output() && kind_of(&right.name).has_command_output()
     }) {
@@ -231,13 +240,14 @@ async fn execute_calls(
             {
                 eprintln!("command {id} running (PID {})", result["pid"]);
             }
-            messages.push(Message::Result(ToolResult {
+            answers.push(ToolResult {
+                id: call.id,
                 name: call.name.clone(),
                 content: result.to_string(),
-            }));
+            });
         }
     }
-    messages
+    answers
 }
 
 async fn invoke_batch(

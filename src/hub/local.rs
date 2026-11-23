@@ -44,7 +44,7 @@ async fn bind_listener(path: &std::path::Path) -> Result<(UnixListener, std::fs:
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(path.with_extension("lock"))?;
+        .open(path.with_file_name(".socket.lock"))?;
     lock.try_lock()
         .map_err(|error| eyre!("hub already owns {}: {error}", path.display()))?;
     cleanup_stale_socket(path).await?;

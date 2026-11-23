@@ -14,7 +14,7 @@ pub const RECALL_SPEC: (&str, &str, &[Param]) = (
     &[
         Param {
             name: "entry",
-            desc: "Entry number, such as 12, or an attachment name such as [ybndrfg8]; omit to list every entry",
+            desc: "Entry number, such as 12; omit to list every entry",
             param_type: ParamType::String,
             required: false,
         },
@@ -43,7 +43,7 @@ pub fn recall(chat: &Chat, arguments: &Value, page: usize) -> Value {
         None | Some(Value::Null) => None,
         Some(Value::String(name)) => Some(name.clone()),
         Some(Value::Number(number)) => Some(number.to_string()),
-        Some(_) => return json!({ "error": "entry must be a number or an attachment name" }),
+        Some(_) => return json!({ "error": "entry must be an entry number" }),
     };
     let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let read = match entry {
@@ -155,8 +155,10 @@ fn kind_and_body(message: &Message) -> (String, &str) {
         Message::Input(data) => ("piped input".into(), data),
         Message::Thinking(text) => ("reasoning".into(), text),
         Message::Answer(text) => ("answer".into(), text),
-        Message::Call(Call { name, arguments }) => (format!("call {name}"), arguments),
-        Message::Result(ToolResult { name, content }) => (format!("result of {name}"), content),
+        Message::Call(Call {
+            name, arguments, ..
+        }) => (format!("call {name}"), arguments),
+        Message::Result(ToolResult { name, content, .. }) => (format!("result of {name}"), content),
         Message::Note(_) => ("note".into(), ""),
     }
 }
@@ -178,10 +180,12 @@ mod tests {
             Message::User("find me a gc implementation in this codebase".into()),
             Message::Thinking("x".repeat(2000)),
             Message::Call(Call {
+                id: 3,
                 name: "list_files".into(),
                 arguments: r#"{"path":"./core"}"#.into(),
             }),
             Message::Result(ToolResult {
+                id: 3,
                 name: "list_files".into(),
                 content: "alloc.rs\n".repeat(400),
             }),
@@ -219,9 +223,9 @@ mod tests {
         let list = list.as_str().unwrap();
         assert!(list.starts_with("1 user, 44 characters (before a restart): find me a gc"));
         assert!(list.ends_with("6 answer, 26 characters: You asked me to find a GC."));
-        // A long entry comes back whole, attachment and all, a page at a time.
+        // A long entry comes back whole, a page at a time.
         let page = recall(&chat, &json!({"entry": 4, "offset": 10}), RECALLED);
-        let length = "result list_files\n\n".len() + "alloc.rs\n".len() * 400;
+        let length = "result list_files 3\n\n".len() + "alloc.rs\n".len() * 400;
         assert_eq!(page["from"].as_u64(), Some(10));
         assert_eq!(page["length"].as_u64(), Some(length as u64));
         let first = recall(&chat, &json!({"entry": 1}), RECALLED);

@@ -62,10 +62,12 @@ fn tool_step_renders_like_the_chat_template() -> Result<()> {
     let call = |path: &str| {
         [
             Message::Call(Call {
+                id: 1,
                 name: "read_file".into(),
                 arguments: json!({"path": path, "max_bytes": 10}).to_string(),
             }),
             Message::Result(ToolResult {
+                id: 1,
                 name: "read_file".into(),
                 content: path.repeat(2),
             }),

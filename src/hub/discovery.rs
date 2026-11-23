@@ -37,7 +37,8 @@ pub fn inspect(path: PathBuf) -> Result<Model> {
     })
 }
 
-/// Inspect only completed files in the weights directory; tilde backups and partial downloads stay hidden.
+/// Inspect the weights directory's `.gguf` files alone: a download still in progress
+/// (`.gguf.part`) or a checkpoint renamed to any other extension stays out of the choice.
 fn installed_models(directory: &Path) -> Result<Vec<Model>> {
     let entries = std::fs::read_dir(directory);
     let entries = match entries {

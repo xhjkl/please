@@ -67,16 +67,18 @@ pub enum Note {
 }
 
 /// A named tool invocation with its arguments as a JSON object's text (postcard cannot carry
-/// `serde_json::Value`).
+/// `serde_json::Value`), under an ID unique within its conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
+    pub id: u64,
     pub name: String,
     pub arguments: String,
 }
 
-/// A tool's output as text, JSON for structured results.
+/// A tool's output as text, JSON for structured results, under the ID of the call it answers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
+    pub id: u64,
     pub name: String,
     pub content: String,
 }
@@ -103,7 +105,9 @@ pub enum Frame {
     Restarted(String),
     Answer(String),
     Thinking(String),
+    /// A call for the probe to answer with a result under the same `id`.
     ToolCall {
+        id: u64,
         name: String,
         /// Tool arguments encoded as JSON text because postcard cannot deserialize `serde_json::Value`.
         arguments_json: String,

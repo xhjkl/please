@@ -27,7 +27,7 @@ async fn next_request(server: &mut UnixStream, store: &mut Vec<u8>) -> Result<Ve
 
 fn result_of(messages: &[Message], tool: &str) -> Option<Value> {
     messages.iter().find_map(|message| match message {
-        Message::Result(ToolResult { name, content }) if name == tool => {
+        Message::Result(ToolResult { name, content, .. }) if name == tool => {
             serde_json::from_str(content).ok()
         }
         _ => None,
@@ -45,6 +45,7 @@ async fn completed_subturn_resets_budget_before_later_disconnect() {
         write_frame_to_stream(
             &mut server,
             &Frame::ToolCall {
+                id: 2,
                 name: "list_files".into(),
                 arguments_json: serde_json::json!({ "path": ".", "max_depth": 0 }).to_string(),
             },
@@ -87,6 +88,60 @@ async fn completed_subturn_resets_budget_before_later_disconnect() {
     assert_eq!(reconnect_attempts, 0);
     // A retry after reconnecting resends the result the hub never answered, under one ID.
     assert!(result_of(&pending.messages, "list_files").is_some());
+    hub.await.unwrap();
+}
+
+#[tokio::test]
+async fn results_answer_their_calls_by_id_in_call_order() {
+    let display = crate::display::make_display();
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let hub = tokio::spawn(async move {
+        let mut store = Vec::new();
+        next_request(&mut server, &mut store).await.unwrap();
+        let listing = json!({ "path": ".", "max_depth": 0 }).to_string();
+        let calls = [(5, "list_files", listing), (6, "read_file", "[]".into())];
+        for (id, name, arguments_json) in calls {
+            let name = name.into();
+            let call = Frame::ToolCall {
+                id,
+                name,
+                arguments_json,
+            };
+            write_frame_to_stream(&mut server, &call).await.unwrap();
+        }
+        write_frame_to_stream(&mut server, &Frame::Stop)
+            .await
+            .unwrap();
+        // The refused call's result still follows the one before it.
+        let messages = next_request(&mut server, &mut store).await.unwrap();
+        let answered: Vec<_> = messages
+            .iter()
+            .map(|message| match message {
+                Message::Result(result) => (result.id, result.name.as_str()),
+                _ => (0, ""),
+            })
+            .collect();
+        assert_eq!(answered, [(5, "list_files"), (6, "read_file")]);
+        assert!(result_of(&messages, "read_file").unwrap()["error"].is_string());
+    });
+    let (place, setting) = (place(), setting());
+    let scene = Scene {
+        place: &place,
+        setting: &setting,
+    };
+    let mut pending = Pending::new(vec![Message::User("hello".into())]);
+    let mut reconnect_attempts = 0;
+    let commands = Commands::default();
+    let attempt = attempt_turn_on_stream(
+        scene,
+        &mut pending,
+        &commands,
+        &mut client,
+        &mut reconnect_attempts,
+        &display,
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), attempt).await;
+    assert!(result.expect("the hub hears the results").is_err());
     hub.await.unwrap();
 }
 
@@ -162,6 +217,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
         write_frame_to_stream(
             &mut server,
             &Frame::ToolCall {
+                id: 3,
                 name: "list_files".into(),
                 arguments_json: json!({ "path": ".", "max_depth": 0 }).to_string(),
             },
@@ -184,6 +240,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
         write_frame_to_stream(
             &mut server,
             &Frame::ToolCall {
+                id: 6,
                 name: "control_command".into(),
                 arguments_json: json!({ "command_id": id, "action": "kill" }).to_string(),
             },

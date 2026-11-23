@@ -2,15 +2,18 @@
 //!
 //! A conversation is a directory of plain-text entries named by eight-digit sequence numbers,
 //! so they list in order. An entry is its kind on the first line (`user`, `input`, `thinking`,
-//! `answer`, `call TOOL`, or `result TOOL`), a blank line, and the body verbatim. A body
-//! longer than 4 KiB lives in the `...` subdirectory under the name of its bytes, and the
-//! entry holds `[name]` instead. Restarting sets the entries so far aside as backups named
-//! with a trailing `~` (`00000012~`), which `rm *~` erases; until then recall still reads them.
-//! The harness's notes are not kept.
+//! `answer`, `call TOOL ID`, or `result TOOL ID`), a blank line, and the body verbatim, however
+//! long. A call's ID is the number of the entry that first kept it, so a call carried across a
+//! restart still names its original, and the result answering it repeats the ID; the result
+//! recorded for calls the model wrote but could not be parsed has its own entry's number.
+//! The `...` subdirectory is for what an entry cannot hold as text, such as pictures; nothing
+//! is kept there yet. Restarting sets the entries so far aside in the `old` subdirectory, which
+//! `rm -r old` erases; until then recall still reads them. The harness's notes are not kept.
 //!
 //! Each place a probe runs in, a machine and working directory, has its own conversation, kept
 //! from one run of please to the next: the directory is named after the place, which its
-//! `where` file spells out. `/new` starts the place over.
+//! `.where` file spells out. `/new` starts the place over. Everything besides the entries and
+//! `old` is a dotfile, so the directory lists as the conversation alone.
 //! Everything is private to its owner, and one hub at a time works on a conversation.
 use crate::protocol::{Call, Message, Place, ToolResult};
 use eyre::{Result, WrapErr, bail, eyre};
@@ -19,12 +22,14 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-/// Where large bodies live, inside a conversation's directory.
+/// Where what an entry cannot hold as text will live, inside a conversation's directory.
 const ATTACHMENTS: &str = "...";
-/// Bodies up to this many bytes stay inside their entry.
-const INLINE: usize = 4096;
-/// The last request kept, so a retried one is kept once.
-const APPLIED: &str = ".applied";
+/// Where a restart sets the entries so far aside, inside a conversation's directory.
+const OLD: &str = "old";
+/// The place a conversation is from: its working directory, then its machine.
+const WHERE: &str = ".where";
+/// The ID of the last request kept, so a retried one is kept once.
+const REQUEST: &str = ".request";
 
 /// One conversation's directory.
 #[derive(Debug, Clone)]
@@ -36,7 +41,7 @@ pub struct Chat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub number: u64,
-    /// Set aside by a restart.
+    /// Set aside in `old` by a restart.
     pub backup: bool,
     pub message: Message,
 }
@@ -49,19 +54,15 @@ impl Chat {
         let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
         let dir = PathBuf::from(home).join(".please/chats");
         let chat = Self::at(dir.join(super::digest::name_of(key.as_bytes())))?;
-        if !chat.dir.join("where").exists() {
-            write(&chat.dir, "where", format!("{cwd}\n{machine}\n").as_bytes())?;
+        if !chat.dir.join(WHERE).exists() {
+            write(&chat.dir, WHERE, format!("{cwd}\n{machine}\n").as_bytes())?;
         }
         Ok(chat)
     }
 
     /// The conversation stored at `dir`, created if missing.
     pub fn at(dir: PathBuf) -> Result<Self> {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir.join(ATTACHMENTS))
-            .wrap_err_with(|| format!("cannot create {}", dir.display()))?;
+        make_dir(&dir.join(ATTACHMENTS))?;
         Ok(Self { dir })
     }
 
@@ -105,62 +106,51 @@ impl Chat {
     pub fn append(&self, messages: &[Message]) -> Result<()> {
         let mut number = self.next()?;
         for message in messages {
-            let Some(text) = self.encode(message)? else {
+            let Some(text) = encode(message)? else {
                 continue;
             };
-            write(&self.dir, &file_name(number, false), text.as_bytes())?;
+            write(&self.dir, &file_name(number), text.as_bytes())?;
             number += 1;
         }
         Ok(())
     }
 
-    /// Continue from `messages` alone, setting every entry so far aside as a backup. The new
+    /// Continue from `messages` alone, setting every entry so far aside in `old`. The new
     /// entries come first, so a failure midway never leaves the conversation empty.
     pub fn restart(&self, messages: &[Message]) -> Result<()> {
+        make_dir(&self.dir.join(OLD))?;
         let before = self.names()?;
         self.append(messages)?;
         for (number, backup) in before {
             if !backup {
-                let from = self.dir.join(file_name(number, false));
-                std::fs::rename(&from, self.dir.join(file_name(number, true)))?;
+                std::fs::rename(self.path(number, false), self.path(number, true))?;
             }
         }
         Ok(())
     }
 
-    /// An entry's kind and body, attachments resolved, by its number; or an attachment.
+    /// An entry's text as it lies on disk, by its number, whether or not it is set aside.
     pub fn read(&self, name: &str) -> Result<String> {
         let name = name.trim().trim_start_matches('[').trim_end_matches(']');
-        if super::digest::is_name(name) {
-            let path = self.dir.join(ATTACHMENTS).join(name);
+        let number: u64 = name.parse().map_err(|_| eyre!("no entry named {name}"))?;
+        for backup in [false, true] {
+            let path = self.path(number, backup);
             if path.exists() {
                 return Ok(std::fs::read_to_string(path)?);
-            }
-        }
-        let number: u64 = name
-            .trim_end_matches('~')
-            .parse()
-            .map_err(|_| eyre!("no entry or attachment named {name}"))?;
-        for backup in [false, true] {
-            let path = self.dir.join(file_name(number, backup));
-            if path.exists() {
-                let message = self.decode(&std::fs::read_to_string(path)?)?;
-                let (header, body) = header_and_body(&message);
-                return Ok(format!("{header}\n\n{body}"));
             }
         }
         bail!("no entry {number}")
     }
 
-    /// The last request whose messages were kept.
-    pub fn applied(&self) -> Option<u64> {
-        let text = std::fs::read_to_string(self.dir.join(APPLIED)).ok()?;
+    /// The ID of the last request whose messages were kept.
+    pub fn last_request(&self) -> Option<u64> {
+        let text = std::fs::read_to_string(self.dir.join(REQUEST)).ok()?;
         text.trim().parse().ok()
     }
 
     /// Remember that request `id`'s messages are kept.
-    pub fn set_applied(&self, id: u64) -> Result<()> {
-        write(&self.dir, APPLIED, id.to_string().as_bytes())
+    pub fn set_last_request(&self, id: u64) -> Result<()> {
+        write(&self.dir, REQUEST, id.to_string().as_bytes())
     }
 
     /// The number the next entry gets.
@@ -168,12 +158,26 @@ impl Chat {
         Ok(self.names()?.last().map_or(0, |&(number, _)| number) + 1)
     }
 
-    /// Entry numbers in order, with whether each is a backup.
+    /// Where entry `number` lies: in the conversation, or set aside in `old`.
+    fn path(&self, number: u64, backup: bool) -> PathBuf {
+        match backup {
+            true => self.dir.join(OLD).join(file_name(number)),
+            false => self.dir.join(file_name(number)),
+        }
+    }
+
+    /// Entry numbers in order, with whether each is set aside; `old` may have been erased.
     fn names(&self) -> Result<Vec<(u64, bool)>> {
         let mut names = Vec::new();
-        for item in std::fs::read_dir(&self.dir)? {
-            if let Some(name) = item?.file_name().to_str().and_then(parse_name) {
-                names.push(name);
+        for (dir, backup) in [(self.dir.join(OLD), true), (self.dir.clone(), false)] {
+            let items = match std::fs::read_dir(&dir) {
+                Err(error) if backup && error.kind() == std::io::ErrorKind::NotFound => continue,
+                items => items?,
+            };
+            for item in items {
+                if let Some(number) = item?.file_name().to_str().and_then(parse_name) {
+                    names.push((number, backup));
+                }
             }
         }
         names.sort();
@@ -186,9 +190,9 @@ impl Chat {
             if !wanted(backup) {
                 continue;
             }
-            let path = self.dir.join(file_name(number, backup));
+            let path = self.path(number, backup);
             let read = std::fs::read_to_string(&path).map_err(eyre::Report::from);
-            match read.and_then(|text| self.decode(&text)) {
+            match read.and_then(|text| decode(&text)) {
                 Ok(message) => entries.push(Entry {
                     number,
                     backup,
@@ -199,92 +203,92 @@ impl Chat {
         }
         Ok(entries)
     }
-
-    /// An entry's text, with a long body moved to an attachment; `None` for notes.
-    fn encode(&self, message: &Message) -> Result<Option<String>> {
-        if matches!(message, Message::Note(_)) {
-            return Ok(None);
-        }
-        let (header, body) = header_and_body(message);
-        if header.ends_with(' ') {
-            bail!("a tool call or result needs a name to be kept");
-        }
-        // A short body spelled like a reference is attached too, so it reads back as written.
-        if body.len() <= INLINE && reference(body).is_none() {
-            return Ok(Some(format!("{header}\n\n{body}")));
-        }
-        let name = super::digest::name_of(body.as_bytes());
-        let attachments = self.dir.join(ATTACHMENTS);
-        if !attachments.join(&name).exists() {
-            write(&attachments, &name, body.as_bytes())?;
-        }
-        Ok(Some(format!("{header}\n\n[{name}]")))
-    }
-
-    /// Parse an entry, reading its body back from the attachment it names.
-    fn decode(&self, text: &str) -> Result<Message> {
-        let (header, body) = text.split_once("\n\n").unwrap_or((text.trim_end(), ""));
-        let body = match reference(body) {
-            Some(name) => std::fs::read_to_string(self.dir.join(ATTACHMENTS).join(name))
-                .wrap_err_with(|| format!("missing attachment {name}"))?,
-            None => body.to_string(),
-        };
-        let (kind, name) = header.split_once(' ').unwrap_or((header, ""));
-        let name = name.to_string();
-        Ok(match kind {
-            "user" => Message::User(body),
-            "input" => Message::Input(body),
-            "thinking" => Message::Thinking(body),
-            "answer" => Message::Answer(body),
-            "call" if !name.is_empty() => Message::Call(Call {
-                name,
-                arguments: body,
-            }),
-            "result" if !name.is_empty() => Message::Result(ToolResult {
-                name,
-                content: body,
-            }),
-            _ => bail!("unknown entry kind {header:?}"),
-        })
-    }
 }
 
-/// An entry's first line and body.
-fn header_and_body(message: &Message) -> (String, &str) {
-    match message {
+/// An entry's text; `None` for notes.
+fn encode(message: &Message) -> Result<Option<String>> {
+    let tool = |name: &str| match name.is_empty() || name.contains('\n') {
+        true => bail!("a tool call or result needs a one-line name to be kept"),
+        false => Ok(()),
+    };
+    let (header, body) = match message {
+        Message::Note(_) => return Ok(None),
         Message::User(text) => ("user".into(), text),
         Message::Input(data) => ("input".into(), data),
         Message::Thinking(text) => ("thinking".into(), text),
         Message::Answer(text) => ("answer".into(), text),
-        Message::Call(Call { name, arguments }) => (format!("call {name}"), arguments),
-        Message::Result(ToolResult { name, content }) => (format!("result {name}"), content),
-        Message::Note(_) => ("note".into(), ""),
-    }
-}
-
-/// The attachment a body names, if it is a reference.
-fn reference(body: &str) -> Option<&str> {
-    body.strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .filter(|name| super::digest::is_name(name))
-}
-
-/// An entry's file name: its number, zero-padded to sort, and `~` once set aside.
-fn file_name(number: u64, backup: bool) -> String {
-    format!("{number:08}{}", if backup { "~" } else { "" })
-}
-
-/// The number of an entry's file name and whether it is a backup.
-fn parse_name(name: &str) -> Option<(u64, bool)> {
-    let (digits, backup) = match name.strip_suffix('~') {
-        Some(digits) => (digits, true),
-        None => (name, false),
+        Message::Call(Call {
+            id,
+            name,
+            arguments,
+        }) => {
+            tool(name)?;
+            (format!("call {name} {id}"), arguments)
+        }
+        Message::Result(ToolResult { id, name, content }) => {
+            tool(name)?;
+            (format!("result {name} {id}"), content)
+        }
     };
-    let digits_only = digits.len() >= 8 && digits.bytes().all(|byte| byte.is_ascii_digit());
-    digits_only
-        .then(|| digits.parse().ok())
-        .flatten()
-        .map(|n| (n, backup))
+    Ok(Some(format!("{header}\n\n{body}")))
+}
+
+/// Parse an entry. A tool's name runs from the kind to the ID, so it may hold spaces.
+fn decode(text: &str) -> Result<Message> {
+    let (header, body) = text.split_once("\n\n").unwrap_or((text.trim_end(), ""));
+    let body = body.to_string();
+    let (kind, rest) = header.split_once(' ').unwrap_or((header, ""));
+    let tool = || -> Result<(u64, String)> {
+        let (name, id) = rest
+            .rsplit_once(' ')
+            .filter(|(name, _)| !name.is_empty())
+            .ok_or_else(|| eyre!("a {kind} entry needs a tool name and an ID"))?;
+        let id = id.parse().map_err(|_| eyre!("{id:?} is not a call ID"))?;
+        Ok((id, name.to_string()))
+    };
+    Ok(match kind {
+        "user" => Message::User(body),
+        "input" => Message::Input(body),
+        "thinking" => Message::Thinking(body),
+        "answer" => Message::Answer(body),
+        "call" => {
+            let (id, name) = tool()?;
+            Message::Call(Call {
+                id,
+                name,
+                arguments: body,
+            })
+        }
+        "result" => {
+            let (id, name) = tool()?;
+            Message::Result(ToolResult {
+                id,
+                name,
+                content: body,
+            })
+        }
+        _ => bail!("unknown entry kind {header:?}"),
+    })
+}
+
+/// An entry's file name: its number, zero-padded to sort.
+fn file_name(number: u64) -> String {
+    format!("{number:08}")
+}
+
+/// The number an entry's file name holds.
+fn parse_name(name: &str) -> Option<u64> {
+    let digits_only = name.len() >= 8 && name.bytes().all(|byte| byte.is_ascii_digit());
+    digits_only.then(|| name.parse().ok()).flatten()
+}
+
+/// Create a private directory, with any missing above it.
+fn make_dir(dir: &Path) -> Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .wrap_err_with(|| format!("cannot create {}", dir.display()))
 }
 
 /// Write a private file whole: a reader never sees it half written.
@@ -315,10 +319,12 @@ mod tests {
             Message::Note(Note::Pending(vec![3])),
             Message::Thinking("I'll list the files.\n\nThen read.".into()),
             Message::Call(Call {
+                id: 4,
                 name: "list_files".into(),
                 arguments: r#"{"path":"."}"#.into(),
             }),
             Message::Result(ToolResult {
+                id: 4,
                 name: "list_files".into(),
                 content: "core\nlang\ngc\n".repeat(1000),
             }),
@@ -339,16 +345,27 @@ mod tests {
         let user = std::fs::read_to_string(chat.dir().join("00000002"))?;
         assert_eq!(user, "user\n\nfind me a gc implementation");
         let call = std::fs::read_to_string(chat.dir().join("00000004"))?;
-        assert_eq!(call, "call list_files\n\n{\"path\":\".\"}");
-        // The long result went to an attachment the entry names.
-        let result = std::fs::read_to_string(chat.dir().join("00000005"))?;
-        let name = result.strip_prefix("result list_files\n\n[").unwrap();
-        let name = name.strip_suffix(']').unwrap();
-        assert!(chat.dir().join("...").join(name).exists());
+        assert_eq!(call, "call list_files 4\n\n{\"path\":\".\"}");
+        // However long, the result lies inside its entry, under its call's ID.
+        let result = format!("result list_files 4\n\n{}", "core\nlang\ngc\n".repeat(1000));
         assert_eq!(
-            chat.read(&format!("[{name}]"))?,
-            "core\nlang\ngc\n".repeat(1000)
+            std::fs::read_to_string(chat.dir().join("00000005"))?,
+            result
         );
+        assert_eq!(chat.read("[5]")?, result);
+        // Text bodies never go to the attachments.
+        let listed = |dir: &Path| {
+            let names = std::fs::read_dir(dir)?
+                .map(|item| item.map(|item| item.file_name().to_string_lossy().into_owned()));
+            let mut names = names.collect::<std::io::Result<Vec<_>>>()?;
+            names.sort();
+            Ok::<_, std::io::Error>(names)
+        };
+        let entries = [
+            "...", "00000001", "00000002", "00000003", "00000004", "00000005", "00000006",
+        ];
+        assert_eq!(listed(chat.dir())?, entries);
+        assert!(listed(&chat.dir().join(ATTACHMENTS))?.is_empty());
         Ok(())
     }
 
@@ -360,7 +377,7 @@ mod tests {
         let summary = Message::Answer("You asked me to find a GC; next I'll read ./gc.".into());
         chat.restart(std::slice::from_ref(&summary))?;
         assert_eq!(chat.messages()?, std::slice::from_ref(&summary));
-        assert!(chat.dir().join("00000002~").exists());
+        assert!(chat.dir().join("old/00000002").exists());
         assert!(chat.dir().join("00000007").exists());
         assert_eq!(chat.read("2")?, "user\n\nfind me a gc implementation");
         chat.append(&[Message::User("thanks".into())])?;
@@ -368,6 +385,10 @@ mod tests {
         assert_eq!(entries.len(), 8);
         assert_eq!(entries.iter().filter(|entry| entry.backup).count(), 6);
         assert_eq!(entries.last().map(|entry| entry.number), Some(8));
+        // Erasing what was set aside leaves the conversation and its numbering be.
+        std::fs::remove_dir_all(chat.dir().join("old"))?;
+        assert_eq!(chat.entries()?.len(), 2);
+        assert_eq!(chat.next()?, 9);
         Ok(())
     }
 
@@ -379,34 +400,41 @@ mod tests {
         std::fs::write(chat.dir().join(".00000001.partial"), "user\n\nhalf")?;
         assert!(chat.messages()?.is_empty());
         std::fs::write(chat.dir().join("00000001"), "letter\n\nhi")?;
-        std::fs::write(chat.dir().join("00000002~"), "")?;
+        std::fs::create_dir(chat.dir().join("old"))?;
+        std::fs::write(chat.dir().join("old/00000002"), "")?;
+        std::fs::write(chat.dir().join("00000003"), "call list_files\n\n{}")?;
         chat.append(&[Message::User("still here".into())])?;
         assert_eq!(chat.messages()?, [Message::User("still here".into())]);
         // A restart sets entries aside without reading them.
         chat.restart(&[])?;
-        assert!(chat.messages()?.is_empty() && chat.dir().join("00000001~").exists());
+        assert!(chat.messages()?.is_empty() && chat.dir().join("old/00000001").exists());
         Ok(())
     }
 
     #[test]
-    fn literal_references_names_and_privacy_survive() -> Result<()> {
+    fn odd_names_and_privacy_survive() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new()?;
         let chat = Chat::at(dir.0.join("chat"))?;
-        let literal = format!("[{}]", crate::hub::digest::name_of(b"x"));
-        chat.append(&[Message::User(literal.clone())])?;
-        chat.append(&[Message::Answer("x".into())])?;
-        assert_eq!(chat.messages()?[0], Message::User(literal));
-        let nameless = Message::Call(Call {
-            name: String::new(),
+        let spaced = Message::Call(Call {
+            id: 1,
+            name: "list files 2".into(),
             arguments: "{}".into(),
+        });
+        chat.append(std::slice::from_ref(&spaced))?;
+        chat.append(&[Message::Answer("x".into())])?;
+        assert_eq!(chat.messages()?[0], spaced);
+        let nameless = Message::Result(ToolResult {
+            id: 1,
+            name: String::new(),
+            content: "{}".into(),
         });
         assert!(chat.append(&[nameless]).is_err());
         let mode = |path: &Path| std::fs::metadata(path).map(|m| m.permissions().mode() & 0o777);
         assert_eq!(mode(chat.dir())?, 0o700);
         assert_eq!(mode(&chat.dir().join("00000002"))?, 0o600);
-        chat.set_applied(42)?;
-        assert_eq!(chat.applied(), Some(42));
+        chat.set_last_request(42)?;
+        assert_eq!(chat.last_request(), Some(42));
         Ok(())
     }
 }

@@ -16,6 +16,7 @@ const HEAD: usize = 4;
 
 fn call(name: &str, arguments: serde_json::Value) -> Message {
     Message::Call(Call {
+        id: 1,
         name: name.into(),
         arguments: arguments.to_string(),
     })
@@ -23,6 +24,7 @@ fn call(name: &str, arguments: serde_json::Value) -> Message {
 
 fn result(name: &str, content: serde_json::Value) -> Message {
     Message::Result(ToolResult {
+        id: 1,
         name: name.into(),
         content: content.to_string(),
     })
@@ -101,6 +103,7 @@ fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
         &[
             call("read_file", arguments.clone()),
             Message::Result(ToolResult {
+                id: 1,
                 name: "read_file".into(),
                 content: text.into(),
             }),
@@ -163,6 +166,7 @@ fn notes_are_worded_by_the_hub() -> Result<()> {
 #[test]
 fn stored_calls_need_json_arguments() {
     let broken = Message::Call(Call {
+        id: 1,
         name: "read_file".into(),
         arguments: "{path:".into(),
     });

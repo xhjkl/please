@@ -97,11 +97,16 @@ pub async fn serve(
         }
         let key = conversation(place, chat.generation()?);
         let step = generate(Some(&mut *sink), engine, key, setting, &history, None).await?;
+        let mut kept = opening(step.thinking, step.answer);
+        // A call's ID is the number of the entry that first keeps it.
+        let first = chat.next()?;
+        let entry = |kept: &[Message]| first + kept.len() as u64;
         let calls = match step.calls {
             Ok(calls) => calls,
             Err(error) => {
-                let mut kept = opening(step.thinking, step.answer);
-                kept.push(result("tool_call_parse_error", prompting::unparsed(&error)));
+                // No call is kept for what could not be parsed, so its result has its own ID.
+                let content = prompting::unparsed(&error);
+                kept.push(result(entry(&kept), "tool_call_parse_error", content));
                 chat.append(&kept)?;
                 continue;
             }
@@ -115,7 +120,6 @@ pub async fn serve(
             .into_iter()
             .partition(|call| call.name == transcript::RECALL || refused(call));
         // The hub's calls and their results first, then the calls the probe answers.
-        let mut kept = opening(step.thinking, step.answer);
         for call in &own {
             let (line, content) = match refused(call) {
                 true => (
@@ -128,18 +132,25 @@ pub async fn serve(
                 ),
             };
             write_frame_to_stream(sink, &Frame::Log(line)).await?;
-            kept.push(stored(call));
-            kept.push(result(&call.name, content));
+            let id = entry(&kept);
+            kept.push(stored(call, id));
+            kept.push(result(id, &call.name, content));
         }
-        kept.extend(probe.iter().map(stored));
+        let mut sent = Vec::with_capacity(probe.len());
+        for call in probe {
+            let id = entry(&kept);
+            kept.push(stored(&call, id));
+            sent.push((id, call));
+        }
         chat.append(&kept)?;
-        if !probe.is_empty() || own.is_empty() {
-            for call in probe {
+        if !sent.is_empty() || own.is_empty() {
+            for (id, call) in sent {
                 let arguments_json = serde_json::to_string(&call.arguments)?;
                 let name = call.name;
                 write_frame_to_stream(
                     sink,
                     &Frame::ToolCall {
+                        id,
                         name,
                         arguments_json,
                     },
@@ -185,7 +196,7 @@ async fn lock(chat: &Chat) -> Result<std::fs::File> {
 /// Keep request `id`'s messages unless a retry already did, answering first any calls the
 /// conversation ends with that the request does not answer.
 fn keep_arrivals(chat: &Chat, id: u64, incoming: Vec<Message>) -> Result<()> {
-    let retried = chat.applied() == Some(id);
+    let retried = chat.last_request() == Some(id);
     let answers = !retried && matches!(incoming.first(), Some(Message::Result(_)));
     let mut arriving = match answers {
         true => vec![],
@@ -195,7 +206,7 @@ fn keep_arrivals(chat: &Chat, id: u64, incoming: Vec<Message>) -> Result<()> {
         arriving.extend(incoming);
     }
     chat.append(&arriving)?;
-    chat.set_applied(id)
+    chat.set_last_request(id)
 }
 
 /// Split a conversation for its restart into the entries its message is folded from and the
@@ -264,15 +275,17 @@ fn opening(thinking: String, answer: String) -> Vec<Message> {
     kept
 }
 
-fn stored(call: &ToolCall) -> Message {
+fn stored(call: &ToolCall, id: u64) -> Message {
     Message::Call(Call {
+        id,
         name: call.name.clone(),
         arguments: call.arguments.to_string(),
     })
 }
 
-fn result(name: &str, content: String) -> Message {
+fn result(id: u64, name: &str, content: String) -> Message {
     Message::Result(ToolResult {
+        id,
         name: name.into(),
         content,
     })
@@ -282,12 +295,16 @@ fn result(name: &str, content: String) -> Message {
 /// come to the same outcome: greedy decoding can repeat such a step forever.
 fn repeats(history: &[Message], call: &ToolCall) -> bool {
     let arguments = call.arguments.to_string();
-    let mut open = std::collections::VecDeque::new();
+    let mut made = std::collections::HashMap::new();
     let mut answered = Vec::new();
     for message in history {
         match message {
-            Message::Call(call) => open.push_back(call),
-            Message::Result(result) => answered.extend(open.pop_front().map(|call| (call, result))),
+            Message::Call(call) => {
+                made.insert(call.id, call);
+            }
+            Message::Result(result) => {
+                answered.extend(made.get(&result.id).map(|&call| (call, result)))
+            }
             _ => {}
         }
     }
@@ -310,7 +327,7 @@ fn unanswered(kept: &[Message]) -> Vec<Message> {
     kept[kept.len() - open..]
         .iter()
         .map(|message| match message {
-            Message::Call(call) => result(&call.name, prompting::unrecorded()),
+            Message::Call(call) => result(call.id, &call.name, prompting::unrecorded()),
             _ => unreachable!("only calls end the conversation here"),
         })
         .collect()
@@ -424,8 +441,9 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    fn call(name: &str) -> Message {
+    fn call(id: u64, name: &str) -> Message {
         Message::Call(Call {
+            id,
             name: name.into(),
             arguments: "{}".into(),
         })
@@ -436,18 +454,18 @@ mod tests {
         let kept = vec![
             Message::User("go".into()),
             Message::Thinking(String::new()),
-            call("apply_patch"),
-            call("run_command"),
+            call(3, "apply_patch"),
+            call(4, "run_command"),
         ];
         let answers = unanswered(&kept);
-        let names: Vec<_> = answers
+        let answered: Vec<_> = answers
             .iter()
             .map(|message| match message {
-                Message::Result(result) => result.name.as_str(),
-                _ => "",
+                Message::Result(result) => (result.id, result.name.as_str()),
+                _ => (0, ""),
             })
             .collect();
-        assert_eq!(names, ["apply_patch", "run_command"]);
+        assert_eq!(answered, [(3, "apply_patch"), (4, "run_command")]);
         let Message::Result(first) = &answers[0] else {
             unreachable!()
         };
@@ -462,18 +480,23 @@ mod tests {
         chat.append(&[
             Message::User("first".into()),
             Message::Thinking(String::new()),
-            call("read_file"),
+            call(3, "read_file"),
         ])?;
         // Results answer the dangling call.
-        let results = vec![result("read_file", "x".into())];
+        let results = vec![result(3, "read_file", "x".into())];
         keep_arrivals(&chat, 7, results.clone())?;
         keep_arrivals(&chat, 7, results)?;
         assert_eq!(chat.messages()?.len(), 4);
         // A new request after a step whose calls never got results answers them first.
-        chat.append(&[Message::Thinking(String::new()), call("run_command")])?;
+        chat.append(&[Message::Thinking(String::new()), call(6, "run_command")])?;
         keep_arrivals(&chat, 8, vec![Message::User("next".into())])?;
         let messages = chat.messages()?;
-        assert!(matches!(&messages[6], Message::Result(result) if result.name == "run_command"));
+        let answer = Message::Result(ToolResult {
+            id: 6,
+            name: "run_command".into(),
+            content: prompting::unrecorded(),
+        });
+        assert_eq!(messages[6], answer);
         assert_eq!(messages[7], Message::User("next".into()));
         Ok(())
     }
@@ -487,8 +510,9 @@ mod tests {
         chat.append(&[Message::Input("data".into()), Message::User("now".into())])?;
         for step in 0..3 {
             let content = format!("step {step}");
-            chat.append(&[Message::Thinking(content.clone()), call("read_file")])?;
-            chat.append(&[result("read_file", content)])?;
+            let id = chat.next()? + 1;
+            chat.append(&[Message::Thinking(content.clone()), call(id, "read_file")])?;
+            chat.append(&[result(id, "read_file", content)])?;
         }
         // Entries 1 and 2 are set aside, 3 is the restart message, and the turn is 4 to 14.
         let split = |most: usize| {
@@ -525,9 +549,16 @@ mod tests {
             "run_command",
             serde_json::json!({"argv": ["grep", "x", "f"]}),
         );
+        let ids = std::cell::Cell::new(0);
         let step = |made: &ToolCall, content: &str| {
             let thinking = Message::Thinking(String::new());
-            vec![thinking, stored(made), result(&made.name, content.into())]
+            ids.set(ids.get() + 1);
+            let id = ids.get();
+            vec![
+                thinking,
+                stored(made, id),
+                result(id, &made.name, content.into()),
+            ]
         };
         let twice = [step(&grep, "none"), step(&grep, "none")].concat();
         assert!(repeats(&twice, &grep));

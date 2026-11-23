@@ -101,10 +101,12 @@ mod tests {
         for step in 0..steps {
             history.push(Message::Thinking(format!("{request} {step}")));
             history.push(Message::Call(Call {
+                id: step as u64,
                 name: "read_file".into(),
                 arguments: "{}".into(),
             }));
             history.push(Message::Result(ToolResult {
+                id: step as u64,
                 name: "read_file".into(),
                 content: format!("{request} {step}"),
             }));
@@ -180,10 +182,12 @@ mod tests {
         for step in 0..8 {
             history.push(Message::Thinking(format!("step {step}")));
             history.push(Message::Call(Call {
+                id: step as u64,
                 name: "read_file".into(),
                 arguments: "{}".into(),
             }));
             history.push(Message::Result(ToolResult {
+                id: step as u64,
                 name: "read_file".into(),
                 content: format!("{step}"),
             }));
