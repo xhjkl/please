@@ -62,16 +62,23 @@ pub fn contains_patch_syntax(s: &str) -> bool {
             .any(|line| line.trim().starts_with("***") && parse_header(line).is_some())
 }
 
+/// Find the first `*** Begin Patch` or `*** End Patch` line from `from`, in any case or spacing.
+/// Nothing looser counts: `*** Add File: src/patch/frontend.rs` names "end" and "patch" too.
 fn find_marker(lines: &[&str], from: usize, which: Marker) -> Option<usize> {
-    let word = match which {
-        Marker::Begin => "begin",
-        Marker::End => "end",
+    let marker = match which {
+        Marker::Begin => "***beginpatch",
+        Marker::End => "***endpatch",
     };
-    let found = lines[from..].iter().position(|line| {
-        let line = line.trim().to_ascii_lowercase();
-        line.starts_with("***") && line.contains(word) && line.contains("patch")
-    })?;
+    let found = lines[from..]
+        .iter()
+        .position(|line| squeezed(line) == marker)?;
     Some(from + found)
+}
+
+/// Lowercase a line and drop its whitespace, to compare it with a marker in any case or spacing.
+fn squeezed(line: &str) -> String {
+    let line: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    line.to_ascii_lowercase()
 }
 
 /// The operation a header line starts and the path it names.
@@ -185,16 +192,11 @@ fn parse_add_block(lines: &[&str], i: &mut usize, end: usize) -> (String, bool) 
     (out.join("\n"), no_newline)
 }
 
-/// Recognize the "No newline at end of file" marker tolerantly: "no", "new", and "line" in
-/// order, in any case or spacing, with the conventional leading backslash optional.
-fn is_no_newline_comment_line(s: &str) -> bool {
-    let lower = s.to_ascii_lowercase();
-    let mut rest = lower.as_str();
-    for term in ["no", "new", "line"] {
-        let Some(found) = rest.find(term) else {
-            return false;
-        };
-        rest = &rest[found + term.len()..];
-    }
-    true
+/// Recognize the `\ No newline at end of file` marker in any case or spacing, its backslash
+/// and its "at end of file" optional. Nothing else counts, so content like `// Normalize
+/// newlines` stays content.
+fn is_no_newline_comment_line(line: &str) -> bool {
+    let line = squeezed(line);
+    let line = line.strip_prefix('\\').unwrap_or(&line);
+    matches!(line.strip_prefix("nonewline"), Some("" | "atendoffile"))
 }

@@ -368,3 +368,41 @@ fn relaxed_trailing_whitespace_matching() {
     let out = apply_hunk(before, &h).expect("apply");
     assert_eq!(out, "line 1x\nline 2y\n");
 }
+
+#[test]
+fn only_the_end_marker_itself_ends_a_patch() {
+    let patch = "*** Begin Patch\n*** Add File: src/patch/frontend.rs\nfn end() {}\n*** Add File: src/patch/backend.rs\nfn begin() {}\n***  END   patch\n";
+    let ops = parse_patch_ops(patch).unwrap();
+    let mut files = BTreeMap::<String, String>::new();
+    let results = execute_patch_ops_in_memory(&mut files, ops);
+    assert_eq!(results.len(), 2);
+    assert_eq!(files.get("src/patch/frontend.rs").unwrap(), "fn end() {}\n");
+    assert_eq!(
+        files.get("src/patch/backend.rs").unwrap(),
+        "fn begin() {}\n"
+    );
+    assert!(parse_patch_ops("*** Begin Patch\n*** End of the patch\n").is_err());
+}
+
+#[test]
+fn context_naming_newlines_is_no_newline_marker() {
+    let patch = "*** Begin Patch\n*** Update File: text.text\n@@\n// Normalize newlines\n- a\n+ b\n*** End Patch\n";
+    let ops = parse_patch_ops(patch).unwrap();
+    let before = "// Normalize newlines\na\n".to_string();
+    let mut files = BTreeMap::from([("text.text".to_string(), before)]);
+    execute_patch_ops_in_memory(&mut files, ops);
+    assert_eq!(
+        files.get("text.text").unwrap(),
+        "// Normalize newlines\nb\n"
+    );
+
+    let patch =
+        "*** Begin Patch\n*** Add File: notes.text\nhello\n// no newline here\n*** End Patch\n";
+    let ops = parse_patch_ops(patch).unwrap();
+    let mut files = BTreeMap::<String, String>::new();
+    execute_patch_ops_in_memory(&mut files, ops);
+    assert_eq!(
+        files.get("notes.text").unwrap(),
+        "hello\n// no newline here\n"
+    );
+}
