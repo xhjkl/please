@@ -1,5 +1,6 @@
 //! Template output shared by the dialects, which insert control tokens by ID so their
 //! spellings inside user, stdin, or tool content stay ordinary text.
+use super::conversation::Rendered;
 use eyre::{Result, eyre};
 use oco::Tokenizer;
 
@@ -10,21 +11,26 @@ pub enum Piece {
     Marker(&'static str),
 }
 
-/// Encode one text run; control-token spellings inside it stay ordinary text.
-pub fn encode_text(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
-    tokenizer.encode(text).map_err(|error| eyre!(error))
-}
-
 /// Encode pieces in order, each text run on its own, inserting control tokens by ID.
 pub fn encode_pieces(tokenizer: &Tokenizer, pieces: &[Piece]) -> Result<Vec<u32>> {
     let mut tokens = Vec::new();
     for piece in pieces {
         match piece {
-            Piece::Text(text) => tokens.extend(encode_text(tokenizer, text)?),
+            Piece::Text(text) => tokens.extend(tokenizer.encode(text)?),
             Piece::Marker(spelling) => tokens.push(special(tokenizer, spelling)?),
         }
     }
     Ok(tokens)
+}
+
+/// Encode a prompt whose first `head` pieces are its static head; pieces encode on their own,
+/// so the head's tokens are a prefix of the whole.
+pub fn encode_prompt(tokenizer: &Tokenizer, pieces: &[Piece], head: usize) -> Result<Rendered> {
+    let (head, tail) = pieces.split_at(head);
+    let mut tokens = encode_pieces(tokenizer, head)?;
+    let preamble = tokens.len();
+    tokens.extend(encode_pieces(tokenizer, tail)?);
+    Ok(Rendered { tokens, preamble })
 }
 
 /// Look up a control token a template needs, failing for checkpoints without it.
@@ -32,4 +38,16 @@ pub fn special(tokenizer: &Tokenizer, spelling: &str) -> Result<u32> {
     tokenizer
         .special_token(spelling)
         .ok_or_else(|| eyre!("checkpoint is missing {spelling}"))
+}
+
+/// Spell pieces out, control tokens included, as a template's string output reads.
+#[cfg(test)]
+pub fn spelled(pieces: &[Piece]) -> String {
+    pieces
+        .iter()
+        .map(|piece| match piece {
+            Piece::Text(text) => text.as_str(),
+            Piece::Marker(spelling) => spelling,
+        })
+        .collect()
 }

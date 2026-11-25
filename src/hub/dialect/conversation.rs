@@ -1,4 +1,5 @@
 //! Neutral conversation data shared by the hub-side adapters.
+use super::prompting;
 use crate::protocol::{Effort, Message, Note, Setting};
 use crate::tools::ParamType;
 use eyre::{Result, WrapErr};
@@ -32,14 +33,19 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-impl ConversationMessage {
-    /// Leading entries that dialects fold into their header.
-    pub fn is_preamble(&self) -> bool {
+/// Split off the leading entries that dialects fold into their header.
+pub fn split_preamble(
+    messages: &[ConversationMessage],
+) -> (&[ConversationMessage], &[ConversationMessage]) {
+    let preamble = messages.iter().take_while(|message| {
         matches!(
-            self,
-            Self::Effort(_) | Self::Instructions(_) | Self::Fact(_)
+            message,
+            ConversationMessage::Effort(_)
+                | ConversationMessage::Instructions(_)
+                | ConversationMessage::Fact(_)
         )
-    }
+    });
+    messages.split_at(preamble.count())
 }
 
 /// Encoded prompt and how many of its leading tokens are the same for every invocation
@@ -136,10 +142,6 @@ pub fn fit_command_results(
     tail_budget: usize,
     count: impl Fn(&str) -> Result<usize>,
 ) -> Result<()> {
-    let command_result = |message: &ConversationMessage| {
-        matches!(message, ConversationMessage::ToolResult { name, .. }
-            if crate::tools::kind_of(name).has_command_output())
-    };
     let exchanges = messages.split_mut(|message| {
         !matches!(
             message,
@@ -147,21 +149,22 @@ pub fn fit_command_results(
         )
     });
     for exchange in exchanges {
-        let count_results = exchange
-            .iter()
-            .filter(|message| command_result(message))
-            .count();
-        if count_results == 0 {
+        let contents: Vec<_> = exchange
+            .iter_mut()
+            .filter_map(|message| match message {
+                ConversationMessage::ToolResult { name, content }
+                    if crate::tools::kind_of(name).has_command_output() =>
+                {
+                    Some(content)
+                }
+                _ => None,
+            })
+            .collect();
+        if contents.is_empty() {
             continue;
         }
-        let per_result = tail_budget / 2 / count_results;
-        for message in exchange
-            .iter_mut()
-            .filter(|message| command_result(message))
-        {
-            let ConversationMessage::ToolResult { content, .. } = message else {
-                unreachable!();
-            };
+        let per_result = tail_budget / 2 / contents.len();
+        for content in contents {
             let mut tokens = count(content)?;
             if tokens <= per_result {
                 continue;
@@ -186,23 +189,23 @@ pub fn fit_command_results(
 /// facts, the conversation itself, and where the answer goes last, so a different redirect
 /// leaves everything before it reusable.
 pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<ConversationMessage>> {
-    let mut out = super::prompting::head(setting);
+    let mut out = prompting::head(setting);
     for message in history {
         let worded = match message {
             Message::User(text) => ConversationMessage::User(text.clone()),
             Message::Input(data) => {
-                out.push(ConversationMessage::Note(super::prompting::INPUT.into()));
+                out.push(ConversationMessage::Note(prompting::INPUT.into()));
                 ConversationMessage::User(data.clone())
             }
             // The draft is the model's own message, and the chunk is material, not instructions.
             Message::Note(note @ Note::Restart { draft, chunk }) => {
-                out.push(ConversationMessage::Note(super::prompting::note(note)));
+                out.push(ConversationMessage::Note(prompting::note(note)));
                 if let Some(draft) = draft {
                     out.push(ConversationMessage::Answer(draft.clone()));
                 }
                 ConversationMessage::User(chunk.clone())
             }
-            Message::Note(note) => ConversationMessage::Note(super::prompting::note(note)),
+            Message::Note(note) => ConversationMessage::Note(prompting::note(note)),
             Message::Thinking(text) => ConversationMessage::Thinking(text.clone()),
             Message::Answer(text) => ConversationMessage::Answer(text.clone()),
             Message::Call(call) => ConversationMessage::ToolCall(ToolCall {
@@ -218,9 +221,7 @@ pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<Conversatio
         out.push(worded);
     }
     if let Some(target) = &setting.redirection {
-        out.push(ConversationMessage::Note(super::prompting::redirection(
-            target,
-        )));
+        out.push(ConversationMessage::Note(prompting::redirection(target)));
     }
     Ok(out)
 }

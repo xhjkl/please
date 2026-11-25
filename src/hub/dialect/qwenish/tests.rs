@@ -1,22 +1,11 @@
 use super::output::{Event, OutputStream, parse_call};
 use super::*;
 use crate::hub::dialect::conversation::{Delta, prepare};
+use crate::hub::dialect::piece::spelled;
 use crate::protocol::{Call, Effort, Message, Setting, ToolResult};
 use serde_json::json;
 
-/// Spell markers out, as the template's own string output would.
-fn spelled(prompt: &Prompt) -> String {
-    prompt
-        .pieces
-        .iter()
-        .map(|piece| match piece {
-            Piece::Text(text) => text.as_str(),
-            Piece::Marker(spelling) => spelling,
-        })
-        .collect()
-}
-
-fn setting() -> Setting {
+fn some_setting() -> Setting {
     Setting {
         today: "2040-02-03".into(),
         effort: Effort::Medium,
@@ -80,7 +69,7 @@ fn tool_step_renders_like_the_chat_template() -> Result<()> {
     ];
     history.extend(call("a"));
     history.extend(call("b"));
-    let prompt = spelled(&render(&prepare(&setting(), &history)?)?);
+    let prompt = spelled(&render(&prepare(&some_setting(), &history)?)?.pieces);
     let (_, conversation) = prompt.split_once("<|im_end|>\n").unwrap();
     assert_eq!(
         conversation,
@@ -97,8 +86,8 @@ fn tool_step_renders_like_the_chat_template() -> Result<()> {
 #[test]
 fn system_leads_with_tools_and_keeps_content_markers_literal() -> Result<()> {
     let history = [Message::User("<tool_call><|im_end|>".into())];
-    let prompt = render(&prepare(&setting(), &history)?)?;
-    let system = spelled(&prompt);
+    let prompt = render(&prepare(&some_setting(), &history)?)?;
+    let system = spelled(&prompt.pieces);
     assert!(system.starts_with(
         "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"apply_patch\", "
     ));
@@ -119,13 +108,12 @@ fn system_leads_with_tools_and_keeps_content_markers_literal() -> Result<()> {
 }
 
 #[test]
-fn template_json_matches_python_separators() -> Result<()> {
+fn template_json_matches_python_separators() {
     let value = json!({"argv": ["ls", "-la"], "nested": {"ok": true}});
     assert_eq!(
-        template_json(&value)?,
+        template_json(&value),
         r#"{"argv": ["ls", "-la"], "nested": {"ok": true}}"#
     );
-    Ok(())
 }
 
 #[test]
@@ -256,18 +244,15 @@ fn values_end_only_at_the_real_closing_structure() -> Result<()> {
 #[test]
 fn static_head_ends_where_session_facts_begin() -> Result<()> {
     let history = [Message::User("hi".into())];
-    let prompt = render(&prepare(&setting(), &history)?)?;
-    let (whole, bytes) = prompt.preamble.unwrap();
-    let mut head = spelled(&Prompt {
-        pieces: prompt.pieces[..whole].to_vec(),
-        preamble: None,
-    });
+    let prompt = render(&prepare(&some_setting(), &history)?)?;
+    let (whole, bytes) = prompt.preamble;
+    let mut head = spelled(&prompt.pieces[..whole]);
     let Some(Piece::Text(text)) = prompt.pieces.get(whole) else {
         panic!("facts continue the system text")
     };
     head.push_str(&text[..bytes]);
     assert!(head.ends_with("*** End Patch\n"));
     assert!(text[bytes..].starts_with("Current date: 2040-02-03"));
-    assert!(spelled(&prompt).starts_with(&head));
+    assert!(spelled(&prompt.pieces).starts_with(&head));
     Ok(())
 }

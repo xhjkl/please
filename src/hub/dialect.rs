@@ -29,4 +29,6 @@ mod inkling;
 mod piece;
 pub(super) mod prompting;
 mod qwenish;
+#[cfg(test)]
+mod tests;
 pub(super) use adapter::{Adapter, Delta, OutputParser, Rendered, ToolCall};

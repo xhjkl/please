@@ -56,7 +56,7 @@ impl OutputParser for Parser<'_> {
             self.stream.marker(marker);
             return Ok(deltas);
         }
-        let text = self.decoder.push(token).map_err(|error| eyre!(error))?;
+        let text = self.decoder.push(token)?;
         Ok(self.stream.text(&text).into_iter().collect())
     }
 

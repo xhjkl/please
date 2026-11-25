@@ -1,6 +1,6 @@
 //! Inkling 2 chat framing from the checkpoint's `tokenizer.chat_template`.
-use super::conversation::{ConversationMessage, Rendered, ToolCall, fit_command_results};
-use super::piece::{Piece, encode_pieces, encode_text};
+use super::conversation::{ConversationMessage, Rendered, ToolCall, split_preamble};
+use super::piece::{Piece, encode_prompt};
 use super::{Adapter as DialectAdapter, OutputParser};
 use crate::protocol::Effort;
 use eyre::{Result, eyre};
@@ -112,11 +112,7 @@ fn render(messages: &[ConversationMessage]) -> Result<(Vec<Piece>, usize)> {
         "<|content_xml|>",
         &declarations,
     );
-    let head = messages
-        .iter()
-        .take_while(|message| message.is_preamble())
-        .count();
-    let (head, mut rest) = messages.split_at(head);
+    let (head, mut rest) = split_preamble(messages);
     let mut level = crate::protocol::Effort::High;
     let mut preamble = None;
     for message in head {
@@ -163,21 +159,9 @@ fn render(messages: &[ConversationMessage]) -> Result<(Vec<Piece>, usize)> {
 pub struct Adapter;
 
 impl DialectAdapter for Adapter {
-    fn encode(
-        &self,
-        tokenizer: &Tokenizer,
-        mut messages: Vec<ConversationMessage>,
-        tail_budget: usize,
-    ) -> Result<Rendered> {
-        fit_command_results(&mut messages, tail_budget, |text| {
-            Ok(encode_text(tokenizer, text)?.len())
-        })?;
-        let (pieces, head) = render(&messages)?;
-        let mut tokens = encode_pieces(tokenizer, &pieces[..head])?;
-        let preamble = tokens.len();
-        let tail = encode_pieces(tokenizer, &pieces[head..])?;
-        tokens.extend(tail);
-        Ok(Rendered { tokens, preamble })
+    fn encode(&self, tokenizer: &Tokenizer, messages: &[ConversationMessage]) -> Result<Rendered> {
+        let (pieces, head) = render(messages)?;
+        encode_prompt(tokenizer, &pieces, head)
     }
 
     fn output_parser<'a>(&self, tokenizer: &'a Tokenizer) -> Result<Box<dyn OutputParser + 'a>> {

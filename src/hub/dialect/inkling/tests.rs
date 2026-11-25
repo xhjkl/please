@@ -1,4 +1,5 @@
 use super::*;
+use crate::hub::dialect::piece::{special, spelled};
 use ConversationMessage::*;
 
 #[test]
@@ -56,13 +57,7 @@ fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Resul
         Piece::Text("Current date: 2040-02-03".into())
     );
 
-    let transcript: String = pieces[5..]
-        .iter()
-        .map(|piece| match piece {
-            Piece::Marker(marker) => *marker,
-            Piece::Text(text) => text.as_str(),
-        })
-        .collect();
+    let transcript = spelled(&pieces[5..]);
     // Captured from the pinned GGUF's `tokenizer.chat_template` with these messages
     // and no declarations.
     assert_eq!(
@@ -125,10 +120,9 @@ fn literal_markers_in_content_stay_text() -> Result<()> {
 #[test]
 #[ignore = "requires Metal and an Inkling checkpoint at INKLING_PATH"]
 fn literal_markers_stay_text_on_the_checkpoint_tokenizer() -> Result<()> {
-    use crate::hub::dialect::piece::special;
     let path = std::env::var_os("INKLING_PATH");
     let path = path.ok_or_else(|| eyre!("set INKLING_PATH to the checkpoint path"))?;
-    let weights = oco::load(path).map_err(|error| eyre!(error))?;
+    let weights = oco::load(path)?;
     let tokenizer = weights.tokenizer();
     let ids = SPELLED
         .iter()
@@ -136,8 +130,8 @@ fn literal_markers_stay_text_on_the_checkpoint_tokenizer() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let controls = |tokens: &[u32]| tokens.iter().filter(|token| ids.contains(token)).count();
     let spelled = SPELLED.concat();
-    assert_eq!(controls(&encode_text(tokenizer, &spelled)?), 0);
-    let prompt = |text: &str| Adapter.encode(tokenizer, carrying(text), 8_192);
+    assert_eq!(controls(&tokenizer.encode(&spelled)?), 0);
+    let prompt = |text: &str| Adapter.encode(tokenizer, &carrying(text));
     let literal = format!(r#"{{"stdin":"{spelled}"}}"#);
     assert_eq!(
         controls(&prompt(&literal)?.tokens),
@@ -146,7 +140,7 @@ fn literal_markers_stay_text_on_the_checkpoint_tokenizer() -> Result<()> {
 
     let mut parser = super::output::Parser::new(tokenizer)?;
     let mut tokens = vec![special(tokenizer, MODEL)?, special(tokenizer, TEXT)?];
-    tokens.extend(encode_text(tokenizer, &spelled)?);
+    tokens.extend(tokenizer.encode(&spelled)?);
     tokens.push(special(tokenizer, END)?);
     let mut answer = String::new();
     for token in tokens {

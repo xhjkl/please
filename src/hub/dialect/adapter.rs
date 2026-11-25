@@ -9,7 +9,8 @@ pub use conversation::{Delta, Rendered, ToolCall};
 
 /// Stateful codec selected once when the hub loads its checkpoint.
 pub trait Adapter: Send + Sync {
-    /// Word the setting and conversation, then encode them in the selected dialect.
+    /// Word the setting and conversation, fit command results to `tail_budget`, then encode
+    /// them in the selected dialect.
     fn render(
         &self,
         tokenizer: &Tokenizer,
@@ -17,17 +18,15 @@ pub trait Adapter: Send + Sync {
         history: &[Message],
         tail_budget: usize,
     ) -> Result<Rendered> {
-        let messages = conversation::prepare(setting, history)?;
-        self.encode(tokenizer, messages, tail_budget)
+        let mut messages = conversation::prepare(setting, history)?;
+        conversation::fit_command_results(&mut messages, tail_budget, |text| {
+            Ok(tokenizer.encode(text)?.len())
+        })?;
+        self.encode(tokenizer, &messages)
     }
 
-    /// Encode prepared history, trimming the latest command result to fit `tail_budget`.
-    fn encode(
-        &self,
-        tokenizer: &Tokenizer,
-        messages: Vec<ConversationMessage>,
-        tail_budget: usize,
-    ) -> Result<Rendered>;
+    /// Encode prepared history in this dialect.
+    fn encode(&self, tokenizer: &Tokenizer, messages: &[ConversationMessage]) -> Result<Rendered>;
     /// Start decoding one response that continues the rendered prompt.
     fn output_parser<'a>(&self, tokenizer: &'a Tokenizer) -> Result<Box<dyn OutputParser + 'a>>;
     /// Whether generation ends at this token.
@@ -52,7 +51,3 @@ impl Dialect {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

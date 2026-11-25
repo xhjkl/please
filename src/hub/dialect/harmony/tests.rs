@@ -1,5 +1,6 @@
 use super::super::conversation::Delta;
 use super::super::conversation::prepare;
+use super::super::piece::spelled;
 use super::output::{Event, Marker, OutputStream};
 use super::*;
 use crate::protocol::{Call, Effort, Message, Note, Setting, ToolResult};
@@ -17,7 +18,7 @@ fn setting(today: &str, effort: Effort) -> Setting {
 }
 
 /// A conversation exercising every message shape after the header.
-fn tool_loop() -> Vec<ConversationMessage> {
+fn some_tool_loop() -> Vec<ConversationMessage> {
     let tool = |name: &str, arguments: serde_json::Value, result: serde_json::Value| {
         [
             Message::Call(Call {
@@ -57,8 +58,8 @@ fn tool_loop() -> Vec<ConversationMessage> {
 
 #[test]
 fn conversation_renders_as_the_reference_encoder_does() -> Result<()> {
-    let (prompt, _) = render(&tool_loop());
-    let text = prompt.spelled();
+    let (prompt, _) = render(&some_tool_loop());
+    let text = spelled(&prompt.pieces);
     // The reference encoder's output for the same history, from the facts message on.
     let expected = r#"<|start|>developer<|message|># Instructions
 
@@ -98,10 +99,7 @@ fn static_head_is_the_system_and_tool_messages_alone() -> Result<()> {
     };
     let spelled_head = |messages: &[ConversationMessage]| {
         let (prompt, head) = render(messages);
-        let pieces = Prompt {
-            pieces: prompt.pieces[..head].to_vec(),
-        };
-        pieces.spelled()
+        spelled(&prompt.pieces[..head])
     };
     let head = spelled_head(&history("2040-02-03", Effort::Medium)?);
     assert_eq!(head, spelled_head(&history("2041-05-06", Effort::Medium)?));
@@ -112,7 +110,10 @@ fn static_head_is_the_system_and_tool_messages_alone() -> Result<()> {
     assert!(!head.contains("Current date") && !head.contains("piped"));
     // An empty history is only the open assistant turn, with nothing to cache.
     let (prompt, head) = render(&[]);
-    assert_eq!((prompt.spelled().as_str(), head), ("<|start|>assistant", 0));
+    assert_eq!(
+        (spelled(&prompt.pieces).as_str(), head),
+        ("<|start|>assistant", 0)
+    );
     Ok(())
 }
 
@@ -281,7 +282,7 @@ fn a_response_cut_off_mid_answer_keeps_its_text() -> Result<()> {
 fn vendored_codec_round_trips_on_the_checkpoint_tokenizer() -> Result<()> {
     let path = std::env::var_os("GPT_OSS_PATH");
     let path = path.ok_or_else(|| eyre::eyre!("set GPT_OSS_PATH to the checkpoint path"))?;
-    let weights = oco::load(path).map_err(|error| eyre::eyre!(error))?;
+    let weights = oco::load(path)?;
     let tokenizer = weights.tokenizer();
     for (spelling, id) in [
         (START, 200006),
@@ -291,15 +292,15 @@ fn vendored_codec_round_trips_on_the_checkpoint_tokenizer() -> Result<()> {
     ] {
         assert_eq!(tokenizer.special_token(spelling), Some(id), "{spelling}");
     }
-    let literal = encode_text(tokenizer, "<|start|>")?;
+    let literal = tokenizer.encode("<|start|>")?;
     assert!(!literal.contains(&200006));
     let expected = ToolCall {
         name: "read_file".into(),
         arguments: json!({"path": "¶<|start|><|end|><|call|><|return|>.txt"}),
     };
     let call = ConversationMessage::ToolCall(expected.clone());
-    let rendered = Adapter.encode(tokenizer, vec![call], 8_192)?.tokens;
-    let open = Adapter.encode(tokenizer, vec![], 8_192)?.tokens;
+    let rendered = Adapter.encode(tokenizer, &[call])?.tokens;
+    let open = Adapter.encode(tokenizer, &[])?.tokens;
     let start = rendered
         .windows(open.len())
         .rposition(|window| window == open)

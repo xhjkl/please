@@ -16,7 +16,7 @@ use oco::Tokenizer;
 pub struct OutputParser<'a> {
     tokenizer: &'a Tokenizer,
     decoder: oco::Decoder<'a>,
-    markers: [(u32, Marker); 7],
+    markers: Vec<(u32, Marker)>,
     stream: OutputStream,
 }
 
@@ -32,7 +32,7 @@ impl<'a> OutputParser<'a> {
         Ok(Self {
             tokenizer,
             decoder: tokenizer.decoder(),
-            markers: markers.try_into().expect("one ID per marker"),
+            markers,
             stream: OutputStream::new(start),
         })
     }
@@ -40,10 +40,8 @@ impl<'a> OutputParser<'a> {
     /// Hand the stream whatever an unfinished character left in the decoder, as the reference
     /// keeps undecodable bytes in the message they ended.
     fn flush(&mut self) {
-        let rest = std::mem::replace(&mut self.decoder, self.tokenizer.decoder()).finish();
-        if !rest.is_empty() {
-            self.stream.tail(&rest);
-        }
+        let decoder = std::mem::replace(&mut self.decoder, self.tokenizer.decoder());
+        self.stream.tail(&decoder.finish());
     }
 }
 
@@ -54,7 +52,7 @@ impl super::DialectOutputParser for OutputParser<'_> {
             self.flush();
             return self.stream.push(token, Event::Marker(marker));
         }
-        let text = self.decoder.push(token).map_err(|error| eyre!(error))?;
+        let text = self.decoder.push(token)?;
         self.stream.push(token, Event::Text(&text))
     }
 
@@ -183,9 +181,7 @@ impl OutputStream {
             }
             (State::Idle, _) => {
                 let start = self.start;
-                return Err(eyre!(
-                    "Unexpected token {token} while expecting start token {start}"
-                ));
+                bail!("Unexpected token {token} while expecting start token {start}");
             }
             (State::Header { text, first }, Event::Marker(Marker::Message)) => {
                 let header = parse_header(text, *first)?;
@@ -241,9 +237,7 @@ impl OutputStream {
     pub(super) fn finish(&mut self) -> Result<Vec<ToolCall>> {
         match self.state {
             State::Header { .. } => {
-                return Err(eyre!(
-                    "Unexpected EOS while waiting for message header to complete"
-                ));
+                bail!("Unexpected EOS while waiting for message header to complete");
             }
             State::Content { .. } => self.close(),
             State::Idle => {}
@@ -263,7 +257,8 @@ impl OutputStream {
 
     /// Complete the message being read, remembering it if it calls a tool.
     fn close(&mut self) {
-        if let State::Content { header, text } = std::mem::replace(&mut self.state, State::Idle)
+        let state = std::mem::replace(&mut self.state, State::Idle);
+        if let State::Content { header, text } = state
             && header.assistant
             && let Some(recipient) = header.recipient
         {

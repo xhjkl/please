@@ -9,10 +9,8 @@
 //! form the developer message, as gpt-oss's chat template places them. Unlike that template,
 //! the preamble's own "Current date" line stays in the instructions rather than moving into
 //! the system message.
-use super::conversation::{
-    ConversationMessage, Rendered, ToolCall, fit_command_results, tool_schemas,
-};
-use super::piece::{Piece, encode_pieces, encode_text};
+use super::conversation::{ConversationMessage, Rendered, ToolCall, split_preamble, tool_schemas};
+use super::piece::{Piece, encode_prompt};
 use super::{Adapter as DialectAdapter, OutputParser as DialectOutputParser};
 use crate::protocol::Effort;
 use eyre::Result;
@@ -104,27 +102,6 @@ impl Prompt {
         let call = header.author == "assistant" && header.recipient.is_some();
         self.marker(if call { CALL } else { END });
     }
-
-    /// Encode every piece, also returning how many tokens the first `head` pieces produced;
-    /// pieces encode independently, so the head's tokens are a prefix of the whole.
-    fn encode(&self, tokenizer: &Tokenizer, head: usize) -> Result<(Vec<u32>, usize)> {
-        let mut tokens = encode_pieces(tokenizer, &self.pieces[..head])?;
-        let preamble = tokens.len();
-        tokens.extend(encode_pieces(tokenizer, &self.pieces[head..])?);
-        Ok((tokens, preamble))
-    }
-
-    /// Spell the pieces out, control tokens included, as the encoder's output decodes.
-    #[cfg(test)]
-    fn spelled(&self) -> String {
-        self.pieces
-            .iter()
-            .map(|piece| match piece {
-                Piece::Text(text) => text.as_str(),
-                Piece::Marker(spelling) => spelling,
-            })
-            .collect()
-    }
 }
 
 /// Render a whole history, opening with the canonical system and developer messages and
@@ -133,12 +110,9 @@ fn render(messages: &[ConversationMessage]) -> (Prompt, usize) {
     let mut prompt = Prompt::default();
     let mut head = 0;
     if !messages.is_empty() {
-        let preamble = messages
-            .iter()
-            .take_while(|message| message.is_preamble())
-            .count();
-        head = header(&mut prompt, &messages[..preamble]);
-        for message in &messages[preamble..] {
+        let (preamble, rest) = split_preamble(messages);
+        head = header(&mut prompt, preamble);
+        for message in rest {
             conversation_message(&mut prompt, message);
         }
     }
@@ -147,10 +121,11 @@ fn render(messages: &[ConversationMessage]) -> (Prompt, usize) {
     (prompt, head)
 }
 
-/// Canonical system message with the requested effort, then please's instructions and tools,
-/// then a second developer message with this invocation's facts. Keeping the facts out of the
-/// first developer message leaves the tool declarations in the static, cacheable head while the
-/// facts keep developer authority. Returns how many pieces the first two messages took.
+/// Append the canonical system message with the requested effort, then please's instructions
+/// and tools, then a second developer message with this invocation's facts. Keeping the facts
+/// out of the first developer message leaves the tool declarations in the static, cacheable
+/// head while the facts keep developer authority. Returns how many pieces the first two
+/// messages took.
 fn header(prompt: &mut Prompt, preamble: &[ConversationMessage]) -> usize {
     let mut effort = "medium";
     let mut instructions = Vec::new();
@@ -289,18 +264,9 @@ fn conversation_message(prompt: &mut Prompt, message: &ConversationMessage) {
 pub struct Adapter;
 
 impl DialectAdapter for Adapter {
-    fn encode(
-        &self,
-        tokenizer: &Tokenizer,
-        mut messages: Vec<ConversationMessage>,
-        tail_budget: usize,
-    ) -> Result<Rendered> {
-        fit_command_results(&mut messages, tail_budget, |text| {
-            Ok(encode_text(tokenizer, text)?.len())
-        })?;
-        let (prompt, head) = render(&messages);
-        let (tokens, preamble) = prompt.encode(tokenizer, head)?;
-        Ok(Rendered { tokens, preamble })
+    fn encode(&self, tokenizer: &Tokenizer, messages: &[ConversationMessage]) -> Result<Rendered> {
+        let (prompt, head) = render(messages);
+        encode_prompt(tokenizer, &prompt.pieces, head)
     }
 
     fn output_parser<'a>(

@@ -53,7 +53,7 @@ impl DialectOutputParser for OutputParser<'_> {
             deltas.extend(self.stream.push(event));
             return Ok(deltas);
         }
-        let text = self.decoder.push(token).map_err(|error| eyre!(error))?;
+        let text = self.decoder.push(token)?;
         Ok(self.stream.push(Event::Text(&text)))
     }
 
@@ -90,10 +90,10 @@ impl OutputStream {
         let mut deltas = Vec::new();
         match event {
             Event::Text(text) => self.text(text, &mut deltas),
-            Event::ThinkEnd if !self.answering => self.boundary(true),
+            Event::ThinkEnd if !self.answering => self.boundary(),
             Event::ThinkEnd => self.text("</think>", &mut deltas),
             Event::CallStart if self.current_call.is_none() => {
-                self.boundary(true);
+                self.boundary();
                 self.current_call = Some(String::new());
             }
             Event::CallStart => self.text("<tool_call>", &mut deltas),
@@ -110,7 +110,7 @@ impl OutputStream {
                         self.current_call = Some(call);
                     } else {
                         self.calls.push(parsed);
-                        self.boundary(true);
+                        self.boundary();
                     }
                 }
                 // A closing token inside an unfinished function belongs to its arguments.
@@ -137,9 +137,9 @@ impl OutputStream {
         self.text(&format!("<tool_call>{call}{closing}"), deltas);
     }
 
-    /// Start a new section, discarding the whitespace that separated it from the last one.
-    fn boundary(&mut self, answering: bool) {
-        self.answering = answering;
+    /// Start a new answer section, discarding the whitespace that separated it from the last one.
+    fn boundary(&mut self) {
+        self.answering = true;
         self.inner = false;
         self.held.clear();
     }

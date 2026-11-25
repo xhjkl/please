@@ -5,8 +5,8 @@
 //! Deliberate departures from the template: such literal markers are never promoted to
 //! control tokens; instructions that arrive mid-conversation become user messages instead of
 //! an error; and tool exchanges with no intervening assistant entry share one assistant step.
-use super::conversation::{ConversationMessage, Rendered, ToolCall, fit_command_results};
-use super::piece::{Piece, encode_pieces, encode_text, special};
+use super::conversation::{ConversationMessage, Rendered, ToolCall, split_preamble};
+use super::piece::{Piece, encode_pieces, special};
 use super::{Adapter as DialectAdapter, OutputParser as DialectOutputParser};
 use crate::protocol::Effort;
 use eyre::{Result, eyre};
@@ -36,7 +36,7 @@ fn effort_instructions(effort: Effort) -> Option<&'static str> {
 
 /// Serialize like the template's `tojson` filter, which is Python's `json.dumps` with its
 /// default `", "` and `": "` separators; keys keep their insertion order.
-fn template_json(value: &Value) -> Result<String> {
+fn template_json(value: &Value) -> String {
     struct Spaced;
     impl serde_json::ser::Formatter for Spaced {
         fn begin_array_value<W: ?Sized + std::io::Write>(
@@ -70,8 +70,8 @@ fn template_json(value: &Value) -> Result<String> {
     }
     let mut bytes = Vec::new();
     let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, Spaced);
-    serde::Serialize::serialize(value, &mut serializer)?;
-    Ok(String::from_utf8(bytes)?)
+    serde::Serialize::serialize(value, &mut serializer).expect("a JSON value serializes to memory");
+    String::from_utf8(bytes).expect("serde_json writes UTF-8")
 }
 
 /// Rendered prompt whose adjacent text merges into one run, because the reference
@@ -80,7 +80,7 @@ fn template_json(value: &Value) -> Result<String> {
 struct Prompt {
     pieces: Vec<Piece>,
     /// End of the invocation-independent head: whole pieces, then bytes of the next text.
-    preamble: Option<(usize, usize)>,
+    preamble: (usize, usize),
 }
 
 impl Prompt {
@@ -112,23 +112,18 @@ impl Prompt {
 
     /// Mark the end of the static head; the next text starts the per-invocation facts.
     fn boundary(&mut self) {
-        self.preamble = Some(match self.pieces.last() {
+        self.preamble = match self.pieces.last() {
             Some(Piece::Text(text)) => (self.pieces.len() - 1, text.len()),
             _ => (self.pieces.len(), 0),
-        });
+        };
     }
 
     fn encode(&self, tokenizer: &Tokenizer) -> Result<Rendered> {
         let tokens = encode_pieces(tokenizer, &self.pieces)?;
-        let Some((whole, bytes)) = self.preamble else {
-            return Ok(Rendered {
-                tokens,
-                preamble: 0,
-            });
-        };
+        let (whole, bytes) = self.preamble;
         let mut head = encode_pieces(tokenizer, &self.pieces[..whole])?;
         if let Some(Piece::Text(text)) = self.pieces.get(whole) {
-            head.extend(encode_text(tokenizer, &text[..bytes])?);
+            head.extend(tokenizer.encode(&text[..bytes])?);
         }
         // A BPE merge across the boundary would make the head a different prefix; cache nothing then.
         let preamble = if tokens.starts_with(&head) {
@@ -150,7 +145,7 @@ impl Prompt {
 
     /// Lead with tools, then the merged leading system and developer messages, as the template does.
     /// Static instructions precede per-invocation facts, so everything before the facts is cacheable.
-    fn system(&mut self, effort: Option<Effort>, instructions: &str, facts: &str) -> Result<()> {
+    fn system(&mut self, effort: Option<Effort>, instructions: &str, facts: &str) {
         self.marker("<|im_start|>");
         self.text("system\n");
         if let Some(instructions) = effort.and_then(effort_instructions) {
@@ -160,7 +155,7 @@ impl Prompt {
         self.text("# Tools\n\nYou have access to the following functions:\n\n<tools>");
         for schema in super::conversation::tool_schemas() {
             self.text("\n");
-            self.text(&template_json(&schema)?);
+            self.text(&template_json(&schema));
         }
         self.text("\n</tools>");
         self.markup(CALL_INSTRUCTIONS);
@@ -175,7 +170,6 @@ impl Prompt {
         self.text(facts);
         self.marker("<|im_end|>");
         self.text("\n");
-        Ok(())
     }
 
     /// Render one step; earlier reasoning stays, as the template preserves thinking by default.
@@ -204,7 +198,7 @@ impl Prompt {
             for (name, value) in arguments {
                 let value = match value {
                     Value::String(value) => value.clone(),
-                    value => template_json(value)?,
+                    value => template_json(value),
                 };
                 self.text(&format!("<parameter={name}>\n{value}\n</parameter>\n"));
             }
@@ -237,15 +231,12 @@ impl Prompt {
 fn render(messages: &[ConversationMessage]) -> Result<Prompt> {
     use ConversationMessage::*;
     let mut prompt = Prompt::default();
-    let preamble = messages
-        .iter()
-        .take_while(|message| message.is_preamble())
-        .count();
+    let (preamble, mut rest) = split_preamble(messages);
     if !messages.is_empty() {
         let mut effort = None;
         let mut instructions = Vec::new();
         let mut facts = Vec::new();
-        for message in &messages[..preamble] {
+        for message in preamble {
             match message {
                 Effort(level) => effort = Some(*level),
                 Instructions(text) if !text.trim().is_empty() => instructions.push(text.trim()),
@@ -253,9 +244,8 @@ fn render(messages: &[ConversationMessage]) -> Result<Prompt> {
                 _ => {}
             }
         }
-        prompt.system(effort, &instructions.join("\n"), &facts.join("\n"))?;
+        prompt.system(effort, &instructions.join("\n"), &facts.join("\n"));
     }
-    let mut rest = &messages[preamble..];
     while let Some(first) = rest.first() {
         match first {
             Effort(_) => rest = &rest[1..],
@@ -326,16 +316,8 @@ fn results(messages: &[ConversationMessage]) -> Vec<&str> {
 pub struct Adapter;
 
 impl DialectAdapter for Adapter {
-    fn encode(
-        &self,
-        tokenizer: &Tokenizer,
-        mut messages: Vec<ConversationMessage>,
-        tail_budget: usize,
-    ) -> Result<Rendered> {
-        fit_command_results(&mut messages, tail_budget, |text| {
-            Ok(encode_text(tokenizer, text)?.len())
-        })?;
-        render(&messages)?.encode(tokenizer)
+    fn encode(&self, tokenizer: &Tokenizer, messages: &[ConversationMessage]) -> Result<Rendered> {
+        render(messages)?.encode(tokenizer)
     }
 
     fn output_parser<'a>(

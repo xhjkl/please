@@ -1,9 +1,10 @@
 use super::*;
-use crate::protocol::{Call, Effort, Frame, Note, Place, Setting, ToolResult};
+use crate::protocol::{Call, Effort, Frame, Message, Note, Place, Setting, ToolResult};
 use conversation::{ConversationMessage, prepare};
+use eyre::Result;
 use serde_json::json;
 
-fn setting() -> Setting {
+fn some_setting() -> Setting {
     Setting {
         today: "2040-02-03".into(),
         effort: Effort::High,
@@ -37,7 +38,7 @@ fn the_hub_words_the_setting_and_keeps_content_literal() -> Result<()> {
             machine: "ssh-ed25519 AAAA".into(),
             cwd: "/srv".into(),
         },
-        setting: setting(),
+        setting: some_setting(),
         id: 9,
         messages: vec![
             Message::Input("literal ¶today and ¶reasoning".into()),
@@ -73,7 +74,7 @@ fn the_hub_words_the_setting_and_keeps_content_literal() -> Result<()> {
     // Piped stdin is user data in a message of its own, announced, and never instructions.
     assert_eq!(
         prepared[HEAD],
-        ConversationMessage::Note(crate::hub::dialect::prompting::INPUT.into())
+        ConversationMessage::Note(prompting::INPUT.into())
     );
     assert_eq!(
         prepared[HEAD + 1],
@@ -96,7 +97,7 @@ fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
     let text = "¶reasoning <tool_response> <|start|>";
     let setting = Setting {
         redirection: None,
-        ..setting()
+        ..some_setting()
     };
     let messages = prepare(
         &setting,
@@ -129,7 +130,7 @@ fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
 fn notes_are_worded_by_the_hub() -> Result<()> {
     let setting = Setting {
         redirection: None,
-        ..setting()
+        ..some_setting()
     };
     let restart = Note::Restart {
         draft: Some("You asked me to find a GC.".into()),
@@ -170,7 +171,7 @@ fn stored_calls_need_json_arguments() {
         name: "read_file".into(),
         arguments: "{path:".into(),
     });
-    assert!(prepare(&setting(), &[broken]).is_err());
+    assert!(prepare(&some_setting(), &[broken]).is_err());
 }
 
 #[test]
@@ -184,7 +185,7 @@ fn parallel_command_results_share_the_available_context() -> Result<()> {
         ));
     }
 
-    let mut messages = prepare(&setting(), &history)?;
+    let mut messages = prepare(&some_setting(), &history)?;
     conversation::fit_command_results(&mut messages, 1024, |content| Ok(content.len()))?;
 
     let mut size = 0;
@@ -215,7 +216,7 @@ fn a_following_tool_only_step_keeps_earlier_output_budget() -> Result<()> {
     };
     let setting = Setting {
         redirection: None,
-        ..setting()
+        ..some_setting()
     };
     let mut history = vec![
         Message::User("Run both in sequence.".into()),
