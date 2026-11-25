@@ -16,8 +16,7 @@ const KEPT: usize = 4;
 
 /// Where cached heads live, beside `~/.please/weights`.
 fn directory() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-    PathBuf::from(home).join(".please/caches")
+    super::directory().join("caches")
 }
 
 /// Whether `name` could be a head this module wrote; anything else in the directory, such as

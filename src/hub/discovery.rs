@@ -15,8 +15,7 @@ pub struct Model {
 
 /// Locate where `please load` stores checkpoints and discovery looks for them.
 pub fn weights_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-    PathBuf::from(home).join(".please/weights")
+    super::directory().join("weights")
 }
 
 /// Reserve working-set headroom for context, scratch storage, and the rest of the system.

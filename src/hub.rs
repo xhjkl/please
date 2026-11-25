@@ -11,10 +11,15 @@ pub const UNSUPPORTED: &str =
 #[error("no supported local weights found; run `please load`")]
 pub struct NoWeights;
 
+/// Locate please's own directory, `~/.please`, home to the socket, weights, caches, and chats.
+pub fn directory() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
+    std::path::PathBuf::from(home).join(".please")
+}
+
 /// Locate the hub's Unix socket at `~/.please/socket`.
 pub fn socket_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
-    std::path::Path::new(&home).join(".please").join("socket")
+    directory().join("socket")
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

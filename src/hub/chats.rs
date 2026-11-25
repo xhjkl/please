@@ -51,8 +51,7 @@ impl Chat {
     pub fn open(place: &Place) -> Result<Self> {
         let Place { machine, cwd } = place;
         let key = format!("please chat\0{machine}\0{cwd}");
-        let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-        let dir = PathBuf::from(home).join(".please/chats");
+        let dir = super::directory().join("chats");
         let chat = Self::at(dir.join(super::digest::name_of(key.as_bytes())))?;
         if !chat.dir.join(WHERE).exists() {
             write(&chat.dir, WHERE, format!("{cwd}\n{machine}\n").as_bytes())?;
