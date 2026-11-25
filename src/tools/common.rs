@@ -76,24 +76,57 @@ fn relative_within(root: &Path, path: &Path, outside: &'static str) -> io::Resul
     Ok(rel.to_path_buf())
 }
 
-/// Canonicalize the deepest existing ancestor of `path`, then append the missing tail.
-/// This follows symlinks in the existing prefix but does not require the leaf to exist.
+/// Resolve `path` as the file system would, following symlinks wherever its components exist.
+/// Past one that does not, nothing can be a symlink, so the rest resolves lexically; a `..`
+/// there steps back into what exists, where resolution follows symlinks again.
 fn soft_canonicalize(path: &Path) -> io::Result<PathBuf> {
-    let mut probe = path;
-    let mut tail = Vec::new();
-    loop {
-        let found = fs::symlink_metadata(probe);
-        if found.is_ok() {
-            let mut real = probe.canonicalize()?;
-            real.extend(tail.iter().rev());
-            return Ok(real);
+    let mut real = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => {
+                let next = real.join(name);
+                let found = fs::symlink_metadata(&next);
+                real = match found {
+                    Err(_) => next,
+                    Ok(_) => next.canonicalize()?,
+                };
+            }
+            Component::ParentDir => {
+                real.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => real.push(component),
+            Component::CurDir => {}
         }
-        let Some(parent) = probe.parent() else {
-            return Ok(tail.iter().rev().collect());
-        };
-        if let Some(name) = probe.file_name() {
-            tail.push(name);
-        }
-        probe = parent;
+    }
+    Ok(real)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn a_parent_past_a_missing_directory_steps_back_for_real() -> io::Result<()> {
+        let (workspace, elsewhere) = (TempDir::new()?, TempDir::new()?);
+        let root = workspace.0.canonicalize()?;
+        let outside = elsewhere.0.canonicalize()?;
+        fs::create_dir(root.join("a"))?;
+        std::os::unix::fs::symlink(&outside, root.join("out"))?;
+
+        let resolved = soft_canonicalize(&root.join("a/new/leaf"))?;
+        assert_eq!(resolved, root.join("a/new/leaf"));
+        let resolved = soft_canonicalize(&root.join("missing/../a/new.txt"))?;
+        assert_eq!(resolved, root.join("a/new.txt"));
+        // Stepping back into what exists follows its symlinks again.
+        let resolved = soft_canonicalize(&root.join("missing/../out/file"))?;
+        assert_eq!(resolved, outside.join("file"));
+
+        let climbing = root.join("missing/../../etc/passwd");
+        let escaped = relative_within(&root, &climbing, "outside").unwrap_err();
+        assert_eq!(escaped.kind(), io::ErrorKind::PermissionDenied);
+        let linked = relative_within(&root, &root.join("missing/../out/file"), "outside");
+        assert_eq!(linked.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        Ok(())
     }
 }
