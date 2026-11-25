@@ -122,14 +122,14 @@ fn tool_result(id: u64, observation: Observation) -> Value {
         result["exit_signal"] = json!(signal);
     }
     let (signal, escalated) = match exit.cause {
-        ExitCause::Interrupted => ("SIGINT", false),
-        ExitCause::Escalated => ("SIGINT", true),
-        ExitCause::Forced => ("SIGKILL", false),
         ExitCause::Natural => {
             result["status"] = json!("finished");
             result["ok"] = json!(exit.status.success());
             return result;
         }
+        ExitCause::Interrupted => ("SIGINT", false),
+        ExitCause::Escalated => ("SIGINT", true),
+        ExitCause::Forced => ("SIGKILL", false),
     };
     result["status"] = json!("killed");
     result["ok"] = json!(false);

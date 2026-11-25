@@ -10,7 +10,6 @@ use super::common::{Param, ParamType};
 use serde::Deserialize;
 use serde_json::json;
 
-pub use parsing::parse_patch_ops;
 pub use preview::summarize_patch_for_preview;
 
 pub const NAME: &str = "apply_patch";
@@ -18,34 +17,28 @@ pub const NAME: &str = "apply_patch";
 #[derive(Deserialize)]
 pub struct Args {
     /// Target path for overwrite mode (ignored in patch mode)
-    #[serde(default)]
     path: Option<String>,
     /// Raw content to overwrite with, or an OpenAI-style patch to apply
     patch: Option<String>,
 }
 
 pub async fn call(args: Args, _context: ToolContext<'_>) -> serde_json::Value {
-    let content = match args.patch {
-        Some(s) => s,
-        None => return json!({ "error": "apply_patch requires parameter `patch`" }),
+    let Some(patch) = args.patch else {
+        return json!({ "error": "apply_patch requires parameter `patch`" });
     };
-
-    if !parsing::contains_patch_syntax(&content) {
-        // Overwrite mode: write verbatim to `path`
+    if !parsing::contains_patch_syntax(&patch) {
         let Some(path) = args.path.as_deref() else {
             return json!({ "error": "overwrite mode requires `path`" });
         };
-
-        return match filesystem::write_verbatim_within_cwd(path, &content) {
+        let written = filesystem::write_verbatim_within_cwd(path, &patch);
+        return match written {
+            Err(error) => json!({ "error": error.to_string() }),
             Ok(()) => json!({ "ok": true, "mode": "overwrite", "path": path }),
-            Err(e) => json!({ "error": e.to_string() }),
         };
     }
-
-    // Patch mode: parse -> execute; tolerate per-op errors, keep going.
-    match parse_patch_ops(&content) {
+    match parsing::parse_patch_ops(&patch) {
+        Err(error) => json!({ "error": error }),
         Ok(ops) => filesystem::execute_patch_ops(ops),
-        Err(e) => json!({ "error": e }),
     }
 }
 

@@ -17,7 +17,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(1);
 pub const STOP_WAIT: Duration = INTERRUPT_GRACE
     .saturating_add(DRAIN_GRACE)
     .saturating_add(Duration::from_secs(1));
-const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+pub const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_LIVE_BYTES: usize = 1024 * 1024;
 
 /// The registry's handle for a process supervised independently of tool waits.
@@ -263,7 +263,8 @@ impl Live {
     }
 }
 
-// Holding a partial UTF-8 character until its next read or the end of the stream.
+/// Find where the whole characters in `bytes` end, holding a partial UTF-8 character until its
+/// next read or the end of the stream.
 fn text_boundary(bytes: &[u8]) -> usize {
     let tail_start = bytes.len().saturating_sub(3);
     let tail = &bytes[tail_start..];

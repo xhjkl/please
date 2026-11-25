@@ -1,3 +1,4 @@
+use super::job::MAX_CAPTURE_BYTES;
 use super::*;
 use crate::test_support::TempDir;
 use nix::sys::signal::kill;
@@ -5,7 +6,6 @@ use nix::unistd::Pid;
 use std::path::Path;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 
 async fn shell(
     context: ToolContext<'_>,

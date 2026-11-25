@@ -38,7 +38,7 @@ mod read_file;
 pub use apply_patch::summarize_patch_for_preview;
 pub use command::Commands;
 
-/// Exposed tools are represented as a map keyed by function name.
+/// The probe's tools, keyed by function name.
 pub type ExposedTools = HashMap<&'static str, Tool>;
 
 /// A tool borrows its turn's command registry and may receive a live output sink for this call.
@@ -73,28 +73,25 @@ impl ToolKind {
         matches!(self, Self::RunCommand | Self::ControlCommand)
     }
 
-    pub fn starts_command(self, args: &serde_json::Value) -> bool {
+    pub fn starts_command(self, args: &Value) -> bool {
         matches!(self, Self::RunCommand)
             && args
                 .get("argv")
-                .and_then(|value| value.as_array())
+                .and_then(Value::as_array)
                 .is_some_and(|argv| !argv.is_empty())
     }
 }
 
 pub fn kind_of(name: &str) -> ToolKind {
-    if name == command::RUN_NAME {
-        return ToolKind::RunCommand;
+    match name {
+        command::RUN_NAME => ToolKind::RunCommand,
+        command::CONTROL_NAME => ToolKind::ControlCommand,
+        apply_patch::NAME => ToolKind::ApplyPatch,
+        _ => ToolKind::Other,
     }
-    if name == command::CONTROL_NAME {
-        return ToolKind::ControlCommand;
-    }
-    if name == apply_patch::NAME {
-        return ToolKind::ApplyPatch;
-    }
-    ToolKind::Other
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const CONTROL_COMMAND_NAME: &str = command::CONTROL_NAME;
 
 pub fn all_tools() -> ExposedTools {
@@ -131,8 +128,8 @@ pub async fn invoke(
     tools: &ExposedTools,
     context: ToolContext<'_>,
     name: &str,
-    args: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+    args: Value,
+) -> Result<Value, String> {
     let Some((_, work, _)) = tools.get(name) else {
         return Err("No such function".to_string());
     };

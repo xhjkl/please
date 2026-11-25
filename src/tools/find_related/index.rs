@@ -74,11 +74,14 @@ pub fn search(scope: &Path, query: &str) -> io::Result<String> {
         let modified = metadata.modified()?;
         let file = match cached.remove(path) {
             Some(file) if file.size == metadata.len() && file.modified == modified => file,
-            _ => File {
-                size: metadata.len(),
-                modified,
-                chunks: read(&full).map_or_else(Vec::new, |text| chunks(path, &text)),
-            },
+            _ => {
+                let text = read(&full);
+                File {
+                    size: metadata.len(),
+                    modified,
+                    chunks: text.map_or_else(Vec::new, |text| chunks(path, &text)),
+                }
+            }
         };
         files.insert(path.clone(), file);
     }

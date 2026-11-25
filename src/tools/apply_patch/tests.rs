@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -43,11 +41,11 @@ fn execute_patch_ops_in_memory(
                     }
                     Err(errs) => {
                         results.push(json!({
-                          "path": path,
-                          "op": "update",
-                          "ok": false,
-                          "errors": errs.iter().map(|(i, e)| json!({ "hunk": i, "error": e })).collect::<Vec<_>>()
-                      }));
+                            "path": path,
+                            "op": "update",
+                            "ok": false,
+                            "errors": errs.iter().map(|(i, e)| json!({ "hunk": i, "error": e })).collect::<Vec<_>>()
+                        }));
                     }
                 }
             }

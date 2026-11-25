@@ -10,29 +10,24 @@ pub fn set_trailing_newline(s: &str, want_newline: bool) -> String {
     t
 }
 
+/// Find the first run of `before` that matches `old` line by line, ignoring trailing whitespace.
 pub fn find_lines_window(before: &[&str], old: &[&str]) -> Option<(usize, usize)> {
-    if old.is_empty() || before.len() < old.len() {
+    if old.is_empty() {
         return None;
     }
-    'outer: for start in 0..=before.len() - old.len() {
-        for k in 0..old.len() {
-            if !eq_line_relaxed(before[start + k], old[k]) {
-                continue 'outer;
-            }
-        }
-        return Some((start, start + old.len()));
-    }
-    None
-}
-
-fn eq_line_relaxed(a: &str, b: &str) -> bool {
-    a.trim_end() == b.trim_end()
+    let start = before.windows(old.len()).position(|window| {
+        window
+            .iter()
+            .zip(old)
+            .all(|(line, wanted)| line.trim_end() == wanted.trim_end())
+    })?;
+    Some((start, start + old.len()))
 }
 
 pub fn preview(s: &str) -> String {
     let s = s.replace('\n', "\\n");
     if s.len() > 160 {
-        format!("{}…", &s[..160])
+        format!("{}…", &s[..s.floor_char_boundary(160)])
     } else {
         s
     }

@@ -20,3 +20,9 @@ pub struct Hunk {
     pub old_lines: Vec<String>,
     pub new_lines: Vec<String>,
 }
+
+impl Hunk {
+    pub fn is_empty(&self) -> bool {
+        self.old_lines.is_empty() && self.new_lines.is_empty()
+    }
+}

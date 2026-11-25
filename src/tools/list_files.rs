@@ -1,14 +1,15 @@
 use super::ToolContext;
 use super::common::{Param, ParamType, resolve_path_within_cwd};
 use serde::Deserialize;
-use std::fs;
+use serde_json::json;
 use std::path::Path;
+use std::{fs, io};
 
 #[derive(Deserialize)]
 pub struct Args {
     #[serde(default = "default_dot")]
     path: String,
-    #[serde(default = "default_depth")]
+    #[serde(default)]
     max_depth: usize,
 }
 
@@ -16,70 +17,57 @@ fn default_dot() -> String {
     ".".to_string()
 }
 
-fn default_depth() -> usize {
-    0
+pub async fn call(args: Args, _context: ToolContext<'_>) -> serde_json::Value {
+    let root = resolve_path_within_cwd(&args.path);
+    let root = match root {
+        Err(error) => return json!({ "error": error.to_string() }),
+        Ok(root) => root,
+    };
+    let exists = root.exists();
+    if !exists {
+        return json!({ "error": format!("path does not exist: {}", root.display()) });
+    }
+    let mut listed = Vec::new();
+    let walked = walk(&root, &root, 0, args.max_depth, &mut listed);
+    if let Err(error) = walked {
+        return json!({ "error": error.to_string() });
+    }
+    json!(listed)
 }
 
-pub async fn call(args: Args, _context: ToolContext<'_>) -> serde_json::Value {
-    let root = match resolve_path_within_cwd(&args.path) {
-        Ok(p) => p,
-        Err(e) => return serde_json::json!({ "error": e.to_string() }),
-    };
-    if !root.exists() {
-        return serde_json::json!({ "error": format!("path does not exist: {}", root.display()) });
+fn is_excluded_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "target" | "node_modules" | "dist" | "build" | "lib" | "out"
+    )
+}
+
+fn walk(
+    dir: &Path,
+    base: &Path,
+    depth: usize,
+    max_depth: usize,
+    listed: &mut Vec<String>,
+) -> io::Result<()> {
+    if depth > max_depth {
+        return Ok(());
     }
-
-    let mut out: Vec<String> = Vec::new();
-    let max_depth = args.max_depth;
-
-    fn is_excluded_dir(name: &str) -> bool {
-        matches!(
-            name,
-            "target" | "node_modules" | "dist" | "build" | "lib" | "out"
-        )
-    }
-
-    fn walk(
-        cur: &Path,
-        base: &Path,
-        depth: usize,
-        max_depth: usize,
-        out: &mut Vec<String>,
-    ) -> std::io::Result<()> {
-        if depth > max_depth {
-            return Ok(());
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        if is_dir && is_excluded_dir(&entry.file_name().to_string_lossy()) {
+            continue;
         }
-        for entry in fs::read_dir(cur)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if is_excluded_dir(&name) {
-                    continue;
-                }
-            }
-            let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
-            let mut s = rel.display().to_string();
-            if path.is_dir() && !s.ends_with('/') {
-                s.push('/');
-            }
-            out.push(s);
-            if path.is_dir() {
-                walk(&path, base, depth + 1, max_depth, out)?;
-            }
+        let shown = path.strip_prefix(base).unwrap_or(&path).display();
+        if is_dir {
+            listed.push(format!("{shown}/"));
+            walk(&path, base, depth + 1, max_depth, listed)?;
+        } else {
+            listed.push(shown.to_string());
         }
-        Ok(())
     }
-    let base = if root.is_dir() {
-        root.clone()
-    } else {
-        root.parent().unwrap_or(Path::new(".")).to_path_buf()
-    };
-    if let Err(e) = walk(&root, &base, 0, max_depth, &mut out) {
-        return serde_json::json!({ "error": e.to_string() });
-    }
-    serde_json::json!(out)
+    Ok(())
 }
 
 pub const SPEC: (&str, &str, &[Param]) = (

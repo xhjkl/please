@@ -1,7 +1,9 @@
 use super::ToolContext;
 use super::common::{Param, ParamType, resolve_path_within_cwd};
 use serde::Deserialize;
-use std::io::Read;
+use serde_json::json;
+use std::fs::File;
+use std::io::{self, Read};
 
 #[derive(Deserialize)]
 pub struct Args {
@@ -15,19 +17,19 @@ fn default_max_bytes() -> usize {
 }
 
 pub async fn call(args: Args, _context: ToolContext<'_>) -> serde_json::Value {
-    let res = (|| -> Result<String, String> {
-        let rel = resolve_path_within_cwd(&args.path).map_err(|e| e.to_string())?;
-        let file = std::fs::File::open(rel).map_err(|e| e.to_string())?;
-        let mut buf: Vec<u8> = Vec::with_capacity(std::cmp::min(args.max_bytes, 1024 * 1024));
-        let mut limited = std::io::Read::take(file, args.max_bytes as u64);
-        limited.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-        Ok(String::from_utf8_lossy(&buf).to_string())
-    })();
-
-    match res {
-        Ok(s) => serde_json::json!(s),
-        Err(e) => serde_json::json!({ "error": e }),
+    let text = read(&args.path, args.max_bytes);
+    match text {
+        Err(error) => json!({ "error": error.to_string() }),
+        Ok(text) => json!(text),
     }
+}
+
+fn read(path: &str, max_bytes: usize) -> io::Result<String> {
+    let path = resolve_path_within_cwd(path)?;
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub const SPEC: (&str, &str, &[Param]) = (

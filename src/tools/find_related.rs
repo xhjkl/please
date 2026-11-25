@@ -11,23 +11,24 @@ mod tests;
 #[derive(Deserialize)]
 pub struct Args {
     query: String,
-    #[serde(default)]
     path: Option<String>,
 }
 
 pub async fn call(args: Args, _context: ToolContext<'_>) -> serde_json::Value {
-    let scope = match resolve_path_within_cwd(args.path.as_deref().unwrap_or(".")) {
-        Ok(scope) => scope,
+    let scope = resolve_path_within_cwd(args.path.as_deref().unwrap_or("."));
+    let scope = match scope {
         Err(error) => return json!({ "error": error.to_string() }),
+        Ok(scope) => scope,
     };
-    if !scope.is_dir() {
+    let is_dir = scope.is_dir();
+    if !is_dir {
         return json!({ "error": format!("not a directory: {}", scope.display()) });
     }
     let found = tokio::task::spawn_blocking(move || index::search(&scope, &args.query)).await;
     match found {
-        Ok(Ok(text)) => json!(text),
-        Ok(Err(error)) => json!({ "error": error.to_string() }),
         Err(error) => json!({ "error": error.to_string() }),
+        Ok(Err(error)) => json!({ "error": error.to_string() }),
+        Ok(Ok(text)) => json!(text),
     }
 }
 

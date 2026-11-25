@@ -1,71 +1,44 @@
-use super::model;
-use super::parse_patch_ops;
-use super::parsing;
+use super::model::PatchOp;
+use super::parsing::{contains_patch_syntax, parse_patch_ops};
 
-/// Produce a full diff-like preview for a proposed patch (no truncation).
-/// For overwrite mode, returns the full content. For patch mode, returns a
-/// unified diff-style representation across all ops.
+/// Render a proposed patch in full for approval: overwrite content as is, and a patch as a
+/// unified-diff-like listing of its operations.
 pub fn summarize_patch_for_preview(raw: &str) -> Option<String> {
-    if !parsing::contains_patch_syntax(raw) {
-        // Overwrite mode: show full content as-is
+    if !contains_patch_syntax(raw) {
         return Some(raw.to_string());
     }
-
     let ops = match parse_patch_ops(raw) {
-        Ok(ops) => ops,
         Err(error) => return Some(format!("Invalid patch: {error}\n\n{raw}")),
+        Ok(ops) => ops,
     };
-    // Build a full unified-diff-like preview for all ops
     let mut out = String::new();
-    for op in ops.iter() {
+    for op in ops {
         match op {
-            model::PatchOp::Add { path, content, .. } => {
-                out.push_str("--- /dev/null\n");
-                out.push_str(&format!("+++ {path}\n"));
-                out.push_str("@@\n");
-                for l in content.lines() {
-                    out.push('+');
-                    out.push_str(l);
-                    out.push('\n');
+            PatchOp::Add { path, content, .. } => {
+                out += &format!("--- /dev/null\n+++ {path}\n@@\n");
+                for line in content.lines() {
+                    out += &format!("+{line}\n");
                 }
                 out.push('\n');
             }
-            model::PatchOp::Delete { path } => {
-                out.push_str(&format!("--- {path}\n"));
-                out.push_str("+++ /dev/null\n");
-                out.push_str("@@\n\n");
-            }
-            model::PatchOp::Update { path, hunks, .. } => {
-                out.push_str(&format!("--- {path}\n"));
-                out.push_str(&format!("+++ {path}\n"));
-                for h in hunks.iter() {
-                    out.push_str("@@\n");
-                    let n = std::cmp::min(h.old_lines.len(), h.new_lines.len());
-                    for i in 0..n {
-                        let old = &h.old_lines[i];
-                        let newl = &h.new_lines[i];
-                        if old == newl {
-                            out.push(' ');
-                            out.push_str(old);
-                            out.push('\n');
+            PatchOp::Delete { path } => out += &format!("--- {path}\n+++ /dev/null\n@@\n\n"),
+            PatchOp::Update { path, hunks, .. } => {
+                out += &format!("--- {path}\n+++ {path}\n");
+                for hunk in hunks {
+                    out += "@@\n";
+                    let paired = hunk.old_lines.len().min(hunk.new_lines.len());
+                    for (old, new) in hunk.old_lines.iter().zip(&hunk.new_lines) {
+                        if old == new {
+                            out += &format!(" {old}\n");
                         } else {
-                            out.push('-');
-                            out.push_str(old);
-                            out.push('\n');
-                            out.push('+');
-                            out.push_str(newl);
-                            out.push('\n');
+                            out += &format!("-{old}\n+{new}\n");
                         }
                     }
-                    for line in &h.old_lines[n..] {
-                        out.push('-');
-                        out.push_str(line);
-                        out.push('\n');
+                    for old in &hunk.old_lines[paired..] {
+                        out += &format!("-{old}\n");
                     }
-                    for line in &h.new_lines[n..] {
-                        out.push('+');
-                        out.push_str(line);
-                        out.push('\n');
+                    for new in &hunk.new_lines[paired..] {
+                        out += &format!("+{new}\n");
                     }
                     out.push('\n');
                 }
