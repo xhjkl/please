@@ -93,11 +93,12 @@ fn index(entries: &[Entry]) -> String {
 /// chunks of about `budget` bytes, oldest first; no entry is shown longer than half a chunk.
 pub fn chunks(entries: &[Entry], budget: usize) -> Vec<String> {
     let longest = budget / 2;
-    let restarted = entries.iter().any(|entry| entry.backup);
     let mut chunks: Vec<String> = Vec::new();
     for (index, entry) in entries.iter().filter(|entry| !entry.backup).enumerate() {
         // A conversation that restarted before opens with the message it restarted from.
-        let previous = restarted && index == 0 && matches!(entry.message, Message::Answer(_));
+        // Numbering goes on across restarts, so its number tells even once `old` is erased.
+        let previous =
+            index == 0 && entry.number > 1 && matches!(entry.message, Message::Answer(_));
         let block = block(entry, longest);
         let block = match previous {
             true => block.replacen(
@@ -211,6 +212,22 @@ mod tests {
         // A small budget splits between entries, never inside one.
         let small = chunks(&chat.entries()?, 900);
         assert!(small.len() > 1 && small.iter().all(|chunk| chunk.starts_with('[')));
+        Ok(())
+    }
+
+    #[test]
+    fn the_message_restarted_from_is_named_even_once_old_is_erased() -> Result<(), eyre::Report> {
+        let dir = TempDir::new()?;
+        let chat = Chat::at(dir.0.join("chat"))?;
+        chat.append(&some_conversation())?;
+        chat.restart(&[Message::Answer("You asked me to find a GC.".into())])?;
+        chat.append(&[Message::User("look in ./gc".into())])?;
+        let restarted_from = "[6] the message the conversation last restarted from\n";
+        let kept = chunks(&chat.entries()?, 1 << 20);
+        assert!(kept[0].starts_with(restarted_from));
+        std::fs::remove_dir_all(chat.dir().join("old"))?;
+        let erased = chunks(&chat.entries()?, 1 << 20);
+        assert_eq!(erased, kept);
         Ok(())
     }
 
