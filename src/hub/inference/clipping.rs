@@ -7,7 +7,7 @@ use crate::protocol::Message;
 use eyre::Result;
 use std::ops::Range;
 
-/// The probe history without the dropped messages.
+/// Copy the probe history without the dropped messages.
 pub fn visible(history: &[Message], dropped: &[Range<usize>]) -> Vec<Message> {
     history
         .iter()
@@ -17,8 +17,8 @@ pub fn visible(history: &[Message], dropped: &[Range<usize>]) -> Vec<Message> {
         .collect()
 }
 
-/// Indices where a user turn or an assistant step begins; cutting elsewhere would separate a
-/// tool call from its reasoning or result, or piped input from the request it came with.
+/// List the indices where a user turn or an assistant step begins; cutting elsewhere would
+/// separate a tool call from its reasoning or result, or piped input from the request it came with.
 pub fn boundaries(history: &[Message]) -> Vec<usize> {
     let tool = |message: &Message| matches!(message, Message::Call(_) | Message::Result(_));
     (1..history.len())
@@ -30,7 +30,7 @@ pub fn boundaries(history: &[Message]) -> Vec<usize> {
         .collect()
 }
 
-/// Where the turn of the user message at `user` opens: at its piped input, if any.
+/// Find where the turn of the user message at `user` opens: at its piped input, if any.
 fn opening(history: &[Message], user: usize) -> usize {
     match user.checked_sub(1).map(|index| &history[index]) {
         Some(Message::Input(_)) => user - 1,
@@ -57,20 +57,18 @@ pub fn choose(
     let user = history
         .iter()
         .rposition(|message| matches!(message, Message::User(_)))
-        .or((!history.is_empty()).then_some(0));
-    let request = user.map(|user| opening(history, user));
+        .unwrap_or(0);
+    let request = opening(history, user);
     // Older turns go whole: only where they open are cut points.
     let older = cuts
         .iter()
         .filter(|&&cut| matches!(history[cut], Message::User(_) | Message::Input(_)))
-        .filter(|&&cut| request.is_none_or(|request| cut <= request))
+        .filter(|&&cut| cut <= request)
         .map(|&cut| std::iter::once(0..cut).collect::<Vec<_>>());
-    let steps = request.zip(user).into_iter().flat_map(|(request, user)| {
-        let last = cuts.last().copied().unwrap_or(user);
-        cuts.iter()
-            .filter(move |&&cut| cut > user + 1 && cut <= last)
-            .map(move |&cut| vec![0..request, user + 1..cut])
-    });
+    let steps = cuts
+        .iter()
+        .filter(|&&cut| cut > user + 1)
+        .map(|&cut| vec![0..request, user + 1..cut]);
     let mut fitting = None;
     for candidate in older.chain(steps) {
         let candidate: Vec<_> = dropped.iter().cloned().chain(candidate).collect();

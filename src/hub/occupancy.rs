@@ -36,11 +36,12 @@ impl Occupancy {
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
         let mut occupant = self.0.0.lock().unwrap();
-        if let Some(admitted) = occupant.as_mut() {
-            admitted.connections -= 1;
-            if admitted.connections == 0 {
-                *occupant = None;
-            }
+        let admitted = occupant
+            .as_mut()
+            .expect("an admission keeps its probe the occupant");
+        admitted.connections -= 1;
+        if admitted.connections == 0 {
+            *occupant = None;
         }
     }
 }

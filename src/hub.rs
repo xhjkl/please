@@ -11,7 +11,7 @@ pub const UNSUPPORTED: &str =
 #[error("no supported local weights found; run `please load`")]
 pub struct NoWeights;
 
-/// Default UNIX socket location under `~/.please/socket`.
+/// Locate the hub's Unix socket at `~/.please/socket`.
 pub fn socket_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
     std::path::Path::new(&home).join(".please").join("socket")

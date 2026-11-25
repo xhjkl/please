@@ -111,21 +111,16 @@ async fn exchange(
         )
         .await
     });
-    while let Some(event) = rx.recv().await {
-        match event {
-            inference::Generated::Stop => break,
-            inference::Generated::Token(token) => {
-                let elapsed = started.elapsed().as_secs_f64();
-                times.push(elapsed);
-                tokens.push(token);
-                let deltas = parser.push_token(token)?;
-                for delta in deltas {
-                    first_visible.get_or_insert(elapsed);
-                    match delta {
-                        Delta::Answer(text) => answer.push_str(&text),
-                        Delta::Thinking(text) => thinking.push_str(&text),
-                    }
-                }
+    while let Some(inference::Generated::Token(token)) = rx.recv().await {
+        let elapsed = started.elapsed().as_secs_f64();
+        times.push(elapsed);
+        tokens.push(token);
+        let deltas = parser.push_token(token)?;
+        for delta in deltas {
+            first_visible.get_or_insert(elapsed);
+            match delta {
+                Delta::Answer(text) => answer.push_str(&text),
+                Delta::Thinking(text) => thinking.push_str(&text),
             }
         }
     }
@@ -174,11 +169,9 @@ impl Exchange {
     }
 
     fn report(&self) -> Result<serde_json::Value> {
-        let first = *self
-            .times
-            .first()
-            .ok_or_else(|| eyre!("no tokens generated"))?;
-        let last = *self.times.last().unwrap_or(&first);
+        let (Some(&first), Some(&last)) = (self.times.first(), self.times.last()) else {
+            return Err(eyre!("no tokens generated"));
+        };
         let (tool_calls, parse_error) = match &self.calls {
             Err(error) => (vec![], Some(error.to_string())),
             Ok(calls) => (

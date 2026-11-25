@@ -60,7 +60,7 @@ struct Download<'a> {
     offset: u64,
     head: ResponseHead,
     file: Option<File>,
-    // The write callback returns a byte count to libcurl. Keep the underlying error for Rust.
+    /// Why the body could not be written; the write callback only reports a byte count to libcurl.
     error: Option<eyre::Report>,
 }
 

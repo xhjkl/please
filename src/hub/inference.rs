@@ -9,7 +9,7 @@ use super::dialect::{Adapter, Dialect, OutputParser, Rendered};
 use super::occupancy::Occupancy;
 use super::preamble;
 use crate::protocol::{Message, Setting};
-use eyre::{Result, ensure, eyre};
+use eyre::{Result, bail, ensure, eyre};
 use std::ops::Range;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
@@ -117,7 +117,7 @@ impl Engine {
         Ok(tokens as f64 / self.capacity as f64)
     }
 
-    /// A conversation key shared with no other, for prompts that extend nothing kept.
+    /// Issue a conversation key shared with no other, for prompts that extend nothing kept.
     pub fn connect(&self) -> u64 {
         self.connections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -128,8 +128,7 @@ impl Engine {
         let capacity = self.capacity;
         let weights = self.weights.clone();
         if head.is_empty() {
-            let session = blocking(move || weights.new_session(capacity)).await?;
-            let session = session.map_err(|error| eyre!(error))?;
+            let session = blocking(move || weights.new_session(capacity)).await??;
             return Ok((session, Start::Fresh));
         }
         let path = self.origin.path(head);
@@ -141,23 +140,21 @@ impl Engine {
             .inspect_err(|error| tracing::debug!("hub: no cached head: {error:#}"))
             .ok();
         if let Some(session) = reuse::adopt_head(opened, head) {
-            if let Err(error) = preamble::touch(&path) {
+            let touched = preamble::touch(&path);
+            if let Err(error) = touched {
                 tracing::debug!("hub: cannot mark the head as used: {error:#}");
             }
             return Ok((session, Start::Opened));
         }
-        let session = blocking(move || weights.new_session(capacity)).await?;
-        let mut session = session.map_err(|error| eyre!(error))?;
-        let mut inference = session.infer(head).map_err(|error| eyre!(error))?;
-        inference.next().await.map_err(|error| eyre!(error))?;
+        let mut session = blocking(move || weights.new_session(capacity)).await??;
+        let mut inference = session.infer(head)?;
+        inference.next().await?;
         drop(inference);
         // The head stays a checkpoint, so rewinds into the conversation never replay it.
-        session.checkpoint().map_err(|error| eyre!(error))?;
+        session.checkpoint()?;
         let (session, saved) = blocking(move || {
             // A failed save costs the next invocation a prefill, never this request.
-            let saved = preamble::save(&path, |path| {
-                session.save(path).map_err(|error| eyre!(error))
-            });
+            let saved = preamble::save(&path, |path| Ok(session.save(path)?));
             (session, saved.map(|()| path))
         })
         .await?;
@@ -178,13 +175,13 @@ pub async fn load_model(model_path: &std::path::Path, dialect: Dialect) -> Resul
     let started = Instant::now();
     let path = std::fs::canonicalize(model_path)?;
     let load_path = path.clone();
-    let weights = blocking(move || oco::load(load_path)).await?;
-    let weights = weights.map_err(|error| eyre!(error))?;
+    let weights = blocking(move || oco::load(load_path)).await??;
     let capacity = weights.capacity_within(GPU_SHARE);
     // `PLEASE_CONTEXT` caps the context, to try long-conversation behavior on short ones.
-    let capacity = match std::env::var("PLEASE_CONTEXT").ok().map(|cap| cap.parse()) {
+    let cap = std::env::var("PLEASE_CONTEXT").ok();
+    let capacity = match cap.map(|cap| cap.parse()) {
+        Some(Err(_)) => bail!("PLEASE_CONTEXT must be a number of tokens"),
         Some(Ok(cap)) => capacity.min(cap),
-        Some(Err(_)) => eyre::bail!("PLEASE_CONTEXT must be a number of tokens"),
         None => capacity,
     };
     ensure!(
@@ -226,7 +223,7 @@ pub async fn generate(
     let capacity = engine.capacity;
     let base = engine.render(setting, &[], capacity)?.tokens.len();
     if base >= capacity / 2 {
-        eyre::bail!(
+        bail!(
             "system instructions and stdin exceed half the {capacity}-token context; shorten the input"
         );
     }
@@ -255,15 +252,20 @@ pub async fn generate(
         kept.owner = conversation;
         kept.dropped.clear();
     }
-    let size = |visible: &[Message]| Ok(engine.render(setting, visible, tail_budget)?.tokens.len());
-    let limit = capacity - REPLY_ROOM;
-    kept.dropped = clipping::choose(history, &kept.dropped, limit, capacity / 2, size)?;
-    let visible = clipping::visible(history, &kept.dropped);
-    let mut tokens = engine.render(setting, &visible, tail_budget)?.tokens;
-    let limit = max_tokens.unwrap_or(MAX_GENERATED_TOKENS);
+    let output_limit = max_tokens.unwrap_or(MAX_GENERATED_TOKENS);
     let mut reply = Vec::new();
     let mut turn = None;
-    let outcome = loop {
+    let ended = loop {
+        // Coming around again means the context filled mid-reply: more history goes so the
+        // reply can continue.
+        let size = |visible: &[Message]| {
+            Ok(engine.render(setting, visible, tail_budget)?.tokens.len() + reply.len())
+        };
+        let limit = capacity - REPLY_ROOM;
+        kept.dropped = clipping::choose(history, &kept.dropped, limit, capacity / 2, size)?;
+        let visible = clipping::visible(history, &kept.dropped);
+        let mut tokens = engine.render(setting, &visible, tail_budget)?.tokens;
+        tokens.extend(&reply);
         let reused = reuse::rewind_point(kept.session.history(), &tokens);
         tracing::debug!(
             prompt = tokens.len(),
@@ -271,10 +273,7 @@ pub async fn generate(
             fed = tokens.len() - reused,
             "hub: feeding prompt"
         );
-        let first = match feed(&mut kept.session, &tokens, reused).await {
-            Ok(first) => first,
-            Err(error) => break Err(error),
-        };
+        let first = feed(&mut kept.session, &tokens, reused).await?;
         turn.get_or_insert_with(|| {
             let turn = Turn {
                 start,
@@ -287,68 +286,39 @@ pub async fn generate(
             tracing::debug!(?turn, seconds, "hub: first token");
             turn
         });
-        let decoded = decode(
+        let ended = decode(
             engine,
             &mut kept.session,
             first,
             &generated,
             &mut reply,
-            limit,
+            output_limit,
         )
-        .await;
-        match decoded {
-            Ok(Some(ended)) => break Ok(ended),
-            Ok(None) => {}
-            Err(error) => break Err(error),
+        .await?;
+        if let Some(ended) = ended {
+            break ended;
         }
-        // The context filled mid-reply: drop more history so the reply can continue.
-        let size = |visible: &[Message]| {
-            Ok(engine.render(setting, visible, tail_budget)?.tokens.len() + reply.len())
-        };
-        kept.dropped = match clipping::choose(
-            history,
-            &kept.dropped,
-            capacity - REPLY_ROOM,
-            capacity / 2,
-            size,
-        ) {
-            Ok(dropped) => dropped,
-            Err(error) => break Err(error),
-        };
-        let visible = clipping::visible(history, &kept.dropped);
-        tokens = match engine.render(setting, &visible, tail_budget) {
-            Ok(rendered) => rendered.tokens,
-            Err(error) => break Err(error),
-        };
-        tokens.extend(&reply);
     };
     // An error may leave GPU work in flight, so only a session that finished cleanly is kept.
-    match outcome {
-        Ok(ended) => {
-            *held = Some(kept);
-            if ended == Ended::Limit && max_tokens.is_none() {
-                eyre::bail!("model exceeded the {limit}-token output limit");
-            }
-            Ok(turn.map(|turn| Turn {
-                complete: ended == Ended::Finished,
-                ..turn
-            }))
-        }
-        Err(error) => Err(error),
+    *held = Some(kept);
+    if ended == Ended::Limit && max_tokens.is_none() {
+        bail!("model exceeded the {output_limit}-token output limit");
     }
+    Ok(turn.map(|turn| Turn {
+        complete: ended == Ended::Finished,
+        ..turn
+    }))
 }
 
 /// Feed the prompt past its reused prefix and return the first prediction, checkpointing the
 /// consumed prompt so a later rewind replays at most one reply.
 async fn feed(session: &mut oco::Session, tokens: &[u32], reused: usize) -> Result<u32> {
-    session.rewind(reused).map_err(|error| eyre!(error))?;
-    let mut inference = session
-        .infer(&tokens[reused..])
-        .map_err(|error| eyre!(error))?;
-    let first = inference.next().await.map_err(|error| eyre!(error))?;
+    session.rewind(reused)?;
+    let mut inference = session.infer(&tokens[reused..])?;
+    let first = inference.next().await?;
     drop(inference);
     let first = first.ok_or_else(|| eyre!("context capacity exhausted by the prompt"))?;
-    session.checkpoint().map_err(|error| eyre!(error))?;
+    session.checkpoint()?;
     Ok(first)
 }
 
@@ -370,7 +340,7 @@ async fn decode(
     reply: &mut Vec<u32>,
     limit: usize,
 ) -> Result<Option<Ended>> {
-    let mut inference = session.infer(vec![first]).map_err(|error| eyre!(error))?;
+    let mut inference = session.infer(vec![first])?;
     let mut token = Some(first);
     while let Some(next) = token {
         if generated.is_closed() {
@@ -391,7 +361,7 @@ async fn decode(
             return Ok(Some(Ended::Finished));
         }
         reply.push(next);
-        token = inference.next().await.map_err(|error| eyre!(error))?;
+        token = inference.next().await?;
     }
     Ok(None)
 }

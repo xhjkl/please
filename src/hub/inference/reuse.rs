@@ -19,8 +19,8 @@ pub fn common_prefix(left: &[u32], right: &[u32]) -> usize {
     left.iter().zip(right).take_while(|(a, b)| a == b).count()
 }
 
-/// Rewind target for a prompt: everything shared, except that at least one token is fed,
-/// because only a prefill yields the next prediction.
+/// Find where to rewind for a prompt: past everything shared, except that at least one token
+/// is fed, because only a prefill yields the next prediction.
 pub fn rewind_point(history: &[u32], prompt: &[u32]) -> usize {
     common_prefix(history, prompt).min(prompt.len().saturating_sub(1))
 }
