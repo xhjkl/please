@@ -71,7 +71,7 @@ pub fn choose(
         .map(|&cut| vec![0..request, user + 1..cut]);
     let mut fitting = None;
     for candidate in older.chain(steps) {
-        let candidate: Vec<_> = dropped.iter().cloned().chain(candidate).collect();
+        let candidate = merged(dropped.iter().cloned().chain(candidate));
         let tokens = size(&visible(history, &candidate))?;
         if tokens <= target {
             return Ok(candidate);
@@ -81,6 +81,21 @@ pub fn choose(
         }
     }
     fitting.ok_or_else(|| eyre::eyre!("the latest request and its newest step exceed the context"))
+}
+
+/// Merge ranges that overlap or touch; each new cut tends to cover the last, so the list would
+/// otherwise grow with every clip of a long conversation.
+fn merged(ranges: impl Iterator<Item = Range<usize>>) -> Vec<Range<usize>> {
+    let mut ranges: Vec<_> = ranges.filter(|range| !range.is_empty()).collect();
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -109,6 +124,12 @@ mod tests {
                 content: format!("{request} {step}"),
             }));
         }
+    }
+
+    #[test]
+    fn repeated_cuts_merge_into_one_range() {
+        let ranges = [0..4, 0..7, 9..12, 7..8, 3..5, 12..12, 20..22];
+        assert_eq!(merged(ranges.into_iter()), [0..8, 9..12, 20..22]);
     }
 
     #[test]
