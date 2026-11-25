@@ -9,19 +9,11 @@ pub enum Command {
     New,
 }
 
-/// The command a line spells, `None` for an ordinary request, or an error naming the commands.
-/// Only a lone word is a command, so requests about paths like `/etc/hosts` stay requests.
-/// A bare word must be a command's own name, since synonyms like `clear`, `reset`, or
-/// `summarize` are everyday requests too; with a slash, the synonyms work as well.
+/// The command a prompt line spells, `None` for an ordinary request, or an error naming the
+/// commands. Only a lone `/word` is a command, so requests about paths like `/etc/hosts` stay
+/// requests, and so does a bare `new` answering the model's question.
 pub fn parse(line: &str) -> Option<Result<Command, String>> {
-    let line = line.trim();
-    let Some(name) = line.strip_prefix('/') else {
-        return match line.to_lowercase().as_str() {
-            "compact" => Some(Ok(Command::Compact)),
-            "new" => Some(Ok(Command::New)),
-            _ => None,
-        };
-    };
+    let name = line.trim().strip_prefix('/')?;
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphabetic()) {
         return None;
     }
@@ -36,6 +28,17 @@ pub fn parse(line: &str) -> Option<Result<Command, String>> {
     })
 }
 
+/// The command a whole one-shot request spells, as `parse` reads it, except that a command's
+/// own bare name counts too: `please compact` can only mean the command. Synonyms still need
+/// the slash, since `please clear` or `please summarize` are everyday requests.
+pub fn parse_request(prompt: &str) -> Option<Result<Command, String>> {
+    match prompt.trim().to_lowercase().as_str() {
+        "compact" => Some(Ok(Command::Compact)),
+        "new" => Some(Ok(Command::New)),
+        _ => parse(prompt),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,10 +50,12 @@ mod tests {
         assert_eq!(parse("/squash"), Some(Ok(Command::Compact)));
         assert_eq!(parse("/clear"), Some(Ok(Command::New)));
         assert_eq!(parse("/new"), Some(Ok(Command::New)));
-        assert_eq!(parse("compact"), Some(Ok(Command::Compact)));
-        assert_eq!(parse(" New\n"), Some(Ok(Command::New)));
-        assert_eq!(parse("summarize"), None);
-        assert_eq!(parse("clear"), None);
+        assert_eq!(parse("new"), None);
+        assert_eq!(parse_request("compact"), Some(Ok(Command::Compact)));
+        assert_eq!(parse_request(" New\n"), Some(Ok(Command::New)));
+        assert_eq!(parse_request("/clear"), Some(Ok(Command::New)));
+        assert_eq!(parse_request("summarize"), None);
+        assert_eq!(parse_request("clear"), None);
         assert!(matches!(parse("/frobnicate"), Some(Err(_))));
         assert_eq!(parse("compact the logs"), None);
         assert_eq!(parse("summarize ./a/b"), None);

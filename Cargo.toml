@@ -9,7 +9,7 @@ rust-version = "1.99"
 crossterm = { version = "0.29", default-features = false }
 eyre = "0.6"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-nix = { version = "0.32", features = ["fs", "signal", "term"] }
+nix = { version = "0.32", features = ["fs", "poll", "signal", "term"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 rustyline = { version = "19", default-features = false }
 serde = { version = "1", features = ["derive"] }

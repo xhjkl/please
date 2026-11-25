@@ -2,6 +2,7 @@ use eyre::Result;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::cli::io;
@@ -18,48 +19,89 @@ use super::turn::{Scene, TurnCancelled, is_cancelled, restart, run_turn};
 const EX_TEMPFAIL: u8 = 75;
 /// The shell's status for a process ended by SIGINT.
 const INTERRUPTED: u8 = 130;
+/// How long a special waits for piped data that would make its name a request instead.
+const SPECIAL_PATIENCE: Duration = Duration::from_millis(100);
 
+/// What one run of `please` asks for.
+enum Invocation<'a> {
+    /// A command to `please` itself.
+    Special(Special<'a>),
+    Conversation(Conversation),
+}
+
+/// What the hub is asked for.
 enum Conversation {
     Interactive,
-    OneShot(String),
+    /// A command given as the whole one-shot request.
+    Command(Command),
+    /// A one-shot request, opening with any data piped along with it.
+    Request(Vec<Message>),
+}
+
+/// Read what the arguments, the special they spell, and piped data ask for; `terminal` says
+/// all three standard streams are one. Piped data makes the words a request about it, so then
+/// nothing is a special or a command.
+fn invocation<'a>(
+    args: &[String],
+    special: Option<Special<'a>>,
+    input: Option<String>,
+    terminal: bool,
+) -> Result<Invocation<'a>> {
+    let prompt = args.join(" ");
+    if let Some(input) = input {
+        let request = vec![Message::Input(input), Message::User(prompt)];
+        return Ok(Invocation::Conversation(Conversation::Request(request)));
+    }
+    if let Some(special) = special {
+        return Ok(Invocation::Special(special));
+    }
+    let conversation = if terminal && prompt.is_empty() {
+        Conversation::Interactive
+    } else {
+        match commands::parse_request(&prompt) {
+            Some(Err(error)) => eyre::bail!(error),
+            Some(Ok(command)) => Conversation::Command(command),
+            None => Conversation::Request(vec![Message::User(prompt)]),
+        }
+    };
+    Ok(Invocation::Conversation(conversation))
 }
 
 /// Run a special command, the REPL, or a one-shot request.
 pub async fn run() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let special = specials::parse(&args);
-    // All user-visible output, logs included, goes through the display.
-    let display = Arc::new(Display::new(special == Some(Special::Hub)));
-    crate::logging::setup_tracing_display_logger(display.clone());
-
-    if let Some(special) = special {
-        specials::run(special).await?;
-        return Ok(ExitCode::SUCCESS);
-    }
-
+    // Waiting only briefly before a special, so an idle pipe on stdin, as agents' and CI's
+    // shells may leave, cannot hang it.
+    let patience = special.as_ref().map(|_| SPECIAL_PATIENCE);
+    let input = io::read_whole_stdin(patience)?;
     let stdout_is_tty = std::io::stdout().is_terminal();
     let stderr_is_tty = std::io::stderr().is_terminal();
     let stdin_is_tty = std::io::stdin().is_terminal();
+    let terminal = stdout_is_tty && stderr_is_tty && stdin_is_tty;
+    let invocation = invocation(&args, special, input, terminal)?;
+    let hub_in_foreground = matches!(invocation, Invocation::Special(Special::Hub));
+    // All user-visible output, logs included, goes through the display.
+    let display = Arc::new(Display::new(hub_in_foreground));
+    crate::logging::setup_tracing_display_logger(display.clone());
+
+    let conversation = match invocation {
+        Invocation::Special(special) => {
+            specials::run(special).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Invocation::Conversation(conversation) => conversation,
+    };
     // Redirected stdout is worth telling the model about even when its path is unknown.
     let redirection = io::stdout_redirection_path();
     let redirection = (!stdout_is_tty).then(|| redirection.unwrap_or_default());
-    // Piped data opens the request it came with, as the person's material.
-    let input = io::read_whole_stdin()?;
-    let input = input.map(Message::Input);
     let setting = crate::setting::current(redirection);
     let place = crate::place::here()?;
-    let prompt = args.join(" ");
-
-    let conversation = if stdout_is_tty && stderr_is_tty && stdin_is_tty && prompt.is_empty() {
-        Conversation::Interactive
-    } else {
-        Conversation::OneShot(prompt)
-    };
     let scene = Scene {
         place: &place,
         setting: &setting,
     };
-    let conversed = converse(&display, scene, input, conversation).await;
+    let conversed = converse(&display, scene, conversation).await;
     match conversed {
         Err(error) if error.downcast_ref::<HubBusy>().is_some() => {
             eprintln!("please: {error}");
@@ -75,12 +117,7 @@ pub async fn run() -> Result<ExitCode> {
 }
 
 /// Connect to the hub, maybe starting a new hub process, and hold the conversation.
-async fn converse(
-    display: &Display,
-    scene: Scene<'_>,
-    input: Option<Message>,
-    conversation: Conversation,
-) -> Result<()> {
+async fn converse(display: &Display, scene: Scene<'_>, conversation: Conversation) -> Result<()> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let little_snake = display.start_spinning();
     let stream = tokio::select! {
@@ -103,17 +140,64 @@ async fn converse(
 
     match conversation {
         Conversation::Interactive => interact_forever(&mut stream, display, scene).await?,
-        Conversation::OneShot(prompt) => match commands::parse(&prompt) {
-            Some(Err(error)) => eyre::bail!(error),
-            Some(Ok(command)) => {
-                restart(&mut stream, display, scene, command == Command::Compact).await?
-            }
-            None => {
-                let request = input.into_iter().chain([Message::User(prompt)]).collect();
-                run_turn(&mut stream, display, scene, request).await?;
-            }
-        },
+        Conversation::Command(command) => {
+            restart(&mut stream, display, scene, command == Command::Compact).await?
+        }
+        Conversation::Request(request) => {
+            run_turn(&mut stream, display, scene, request).await?;
+        }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(String::from).collect()
+    }
+
+    fn read<'a>(args: &'a [String], input: Option<&str>, terminal: bool) -> Result<Invocation<'a>> {
+        invocation(
+            args,
+            specials::parse(args),
+            input.map(String::from),
+            terminal,
+        )
+    }
+
+    #[test]
+    fn piped_data_makes_any_invocation_a_request() -> Result<()> {
+        let (help, compact) = (words("help"), words("compact"));
+        let Invocation::Conversation(Conversation::Request(request)) =
+            read(&help, Some("data"), false)?
+        else {
+            panic!("piped data with a special's name is a request");
+        };
+        assert_eq!(
+            request,
+            [Message::Input("data".into()), Message::User("help".into())]
+        );
+        assert!(matches!(
+            read(&compact, Some("data"), false)?,
+            Invocation::Conversation(Conversation::Request(_))
+        ));
+
+        assert!(matches!(
+            read(&help, None, false)?,
+            Invocation::Special(Special::Help)
+        ));
+        assert!(matches!(
+            read(&compact, None, false)?,
+            Invocation::Conversation(Conversation::Command(Command::Compact))
+        ));
+        assert!(matches!(
+            read(&[], None, true)?,
+            Invocation::Conversation(Conversation::Interactive)
+        ));
+        assert!(read(&words("/frobnicate"), None, false).is_err());
+        Ok(())
+    }
 }

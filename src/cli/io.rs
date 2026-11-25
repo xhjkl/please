@@ -1,12 +1,23 @@
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::io::{IsTerminal, Read};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::time::Duration;
 
-/// Read piped stdin whole; `None` when stdin is a terminal or carries only whitespace.
-pub fn read_whole_stdin() -> std::io::Result<Option<String>> {
+/// Read piped stdin whole; `None` when stdin is a terminal or carries only whitespace, or when
+/// nothing, not even its end, arrives within `patience`.
+pub fn read_whole_stdin(patience: Option<Duration>) -> std::io::Result<Option<String>> {
     let mut stdin = std::io::stdin();
     if stdin.is_terminal() {
         return Ok(None);
+    }
+    if let Some(patience) = patience {
+        let mut watched = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+        let timeout = PollTimeout::try_from(patience).unwrap_or(PollTimeout::MAX);
+        let ready = poll(&mut watched, timeout)?;
+        if ready == 0 {
+            return Ok(None);
+        }
     }
     let mut buf = String::new();
     stdin.read_to_string(&mut buf)?;
