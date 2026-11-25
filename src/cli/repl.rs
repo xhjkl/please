@@ -6,7 +6,7 @@ use crate::display::{Display, read_terminal_line};
 use crate::protocol::{HubBusy, Message};
 
 use super::commands::{self, Command};
-use super::turn::{Scene, restart, run_turn};
+use super::turn::{Scene, is_cancelled, restart, run_turn};
 
 /// Read requests and commands until an empty line or end of input; the hub carries the
 /// conversation from one to the next.
@@ -22,10 +22,10 @@ pub async fn interact_forever(
 
     let term = std::env::var("TERM").unwrap_or_default();
     // Rustyline uses a blocking cooked read on these terminals.
-    let mut editor = if ["dumb", "cons25", "emacs"]
+    let cooked = ["dumb", "cons25", "emacs"]
         .iter()
-        .any(|name| term.eq_ignore_ascii_case(name))
-    {
+        .any(|name| term.eq_ignore_ascii_case(name));
+    let mut editor = if cooked {
         None
     } else {
         Some(rustyline::DefaultEditor::new()?)
@@ -34,10 +34,10 @@ pub async fn interact_forever(
         let line = if let Some(editor) = editor.as_mut() {
             let input = editor.readline(">> ");
             match input {
-                Ok(line) => line,
                 Err(Eof) => break,
                 Err(Interrupted | Signal(Interrupt)) => continue,
-                Err(e) => return Err(eyre!(e)),
+                Err(error) => return Err(eyre!(error)),
+                Ok(line) => line,
             }
         } else {
             let mut interrupt = signal(SignalKind::interrupt())?;
@@ -60,27 +60,20 @@ pub async fn interact_forever(
         }
 
         let outcome = match commands::parse(line) {
-            Some(Ok(command)) => restart(stream, display, scene, command == Command::Compact).await,
             Some(Err(error)) => Err(eyre!(error)),
+            Some(Ok(command)) => restart(stream, display, scene, command == Command::Compact).await,
             None => {
                 let request = vec![Message::User(line.to_string())];
                 run_turn(stream, display, scene, request).await.map(drop)
             }
         };
         match outcome {
-            Ok(()) => {}
             // Another probe took the hub while this one reconnected; the caller steps aside.
             Err(error) if error.downcast_ref::<HubBusy>().is_some() => return Err(error),
             // A cancelled or failed turn ends here, and the conversation goes on.
-            Err(error) => {
-                if super::turn::is_cancelled(&error) {
-                    eprintln!("\nplease: turn cancelled");
-                } else {
-                    eprintln!("please: {error:#}");
-                }
-                eprintln!();
-                continue;
-            }
+            Err(error) if is_cancelled(&error) => eprintln!("\nplease: turn cancelled"),
+            Err(error) => eprintln!("please: {error:#}"),
+            Ok(()) => {}
         }
         eprintln!();
     }

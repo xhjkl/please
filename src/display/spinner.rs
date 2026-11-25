@@ -3,15 +3,13 @@
 use crossterm::cursor;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType};
+use std::time::Duration;
 
-async fn display_spinner() {
-    use std::time::Duration;
-    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let mut index: usize = 0;
+const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+async fn spin() {
     let _ = crossterm::execute!(std::io::stderr(), cursor::Hide);
-    loop {
-        let frame = frames[index];
+    for frame in FRAMES.iter().cycle() {
         let _ = crossterm::execute!(
             std::io::stderr(),
             Print("\r"),
@@ -19,45 +17,37 @@ async fn display_spinner() {
             Print(frame),
             ResetColor
         );
-        index += 1;
-        index %= frames.len();
-
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
 }
 
-/// Guard that must be stopped once the pending operation finishes.
-#[must_use = "spinner keeps drawing until stop() is called"]
+/// A spinner drawing on stderr until stopped or dropped. Only `stop` waits for the last frame
+/// to be drawn, so stop it before writing anything else to stderr.
+#[must_use = "spinner keeps drawing until stopped"]
 pub struct Spinner {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Spinner {
-    /// For compatibility, make a spinner that does nothing.
+    /// Make a spinner that draws nothing, for output that is not a terminal.
     pub fn start_empty() -> Self {
         Spinner { task: None }
     }
 
-    /// Immediately start a task that will show a spinner until dropped.
     pub fn start() -> Self {
         Spinner {
-            task: Some(tokio::spawn(display_spinner())),
+            task: Some(tokio::spawn(spin())),
         }
     }
 
-    /// Stop the spinner before other stderr content is written.
+    /// Stop drawing and clear the spinner's line.
     pub async fn stop(mut self) {
-        let did_stop = if let Some(task) = self.task.as_mut() {
-            task.abort();
-            let _ = task.await;
-            true
-        } else {
-            false
+        let Some(task) = self.task.take() else {
+            return;
         };
-        if did_stop {
-            clear_spinner_line();
-            self.task = None;
-        }
+        task.abort();
+        let _ = task.await;
+        clear_spinner_line();
     }
 }
 

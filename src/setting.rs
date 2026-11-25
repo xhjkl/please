@@ -2,12 +2,13 @@
 use crate::protocol::{Effort, Setting};
 
 /// Capture the date, the requested effort, and where the answer goes.
-pub fn current(stdout_redirection: Option<String>) -> Setting {
+pub fn current(redirection: Option<String>) -> Setting {
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let requested = std::env::var("PLEASE_TRY").ok();
     Setting {
         today: now.date().to_string(),
-        effort: effort(std::env::var("PLEASE_TRY").ok().as_deref()),
-        redirection: stdout_redirection,
+        effort: effort(requested.as_deref()),
+        redirection,
     }
 }
 

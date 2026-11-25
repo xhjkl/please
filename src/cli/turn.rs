@@ -17,6 +17,7 @@ use crate::tools::{
 
 use super::connect::obtain_control_stream;
 
+/// A turn the user cancelled with Ctrl-C.
 #[derive(Debug, thiserror::Error)]
 #[error("turn cancelled")]
 pub struct TurnCancelled;
@@ -25,6 +26,7 @@ pub fn is_cancelled(error: &eyre::Report) -> bool {
     error.downcast_ref::<TurnCancelled>().is_some()
 }
 
+/// A call the model made, with its arguments parsed into an object.
 struct PendingToolCall {
     id: u64,
     name: String,
@@ -46,6 +48,7 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// Carry `messages` under a fresh ID.
     pub fn new(messages: Vec<Message>) -> Self {
         use std::hash::BuildHasher;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -78,7 +81,7 @@ async fn attempt_turn_on_stream(
         if !command_ids.is_empty() && !set_aside {
             messages.push(Message::Note(Note::Pending(command_ids.clone())));
         }
-        let mut spinner = Some(display.start_spinning().await);
+        let mut spinner = Some(display.start_spinning());
         let req = Frame::Request {
             place: scene.place.clone(),
             setting: scene.setting.clone(),
@@ -102,7 +105,7 @@ async fn attempt_turn_on_stream(
                 spinner.stop().await;
             }
             match frame {
-                Frame::Log(line) => display.show_log(&line).await,
+                Frame::Log(line) => display.show_log(&line),
                 // Shown apart from the answer, which may be going to a file.
                 Frame::Restarted(summary) => {
                     thinking = None;
@@ -153,15 +156,17 @@ async fn attempt_turn_on_stream(
             display.end_answer();
         }
 
-        let refused = malformed.into_iter().map(|(id, name)| {
-            let content = json!({ "error": "tool call arguments must be a JSON object" });
-            ToolResult {
-                id,
-                name,
-                content: content.to_string(),
-            }
-        });
-        let refused: Vec<_> = refused.collect();
+        let refused: Vec<_> = malformed
+            .into_iter()
+            .map(|(id, name)| {
+                let content = json!({ "error": "tool call arguments must be a JSON object" });
+                ToolResult {
+                    id,
+                    name,
+                    content: content.to_string(),
+                }
+            })
+            .collect();
         if calls.is_empty() && refused.is_empty() && !command_ids.is_empty() {
             *pending = Pending::new(vec![Message::Note(Note::AnswerSetAside(command_ids))]);
             continue;
@@ -196,7 +201,7 @@ async fn execute_calls(
     }) {
         let mut approvals = Vec::with_capacity(batch.len());
         for call in batch {
-            display.show_tool_call(&call.name, &call.arguments).await;
+            display.show_tool_call(&call.name, &call.arguments);
             let approval = approve_call(display, call).await;
             approvals.push(approval);
         }
@@ -222,9 +227,7 @@ async fn execute_calls(
                         let id = result.get("command_id").and_then(Value::as_u64);
                         let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
                         let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
-                        display
-                            .show_tool_output(&call.name, id, stdout, stderr)
-                            .await;
+                        display.show_tool_output(&call.name, id, stdout, stderr);
                     }
                 }
                 results
@@ -320,13 +323,14 @@ pub async fn run_turn(
     };
     if result.is_err() {
         // Closing the socket stops the hub's request and leaves the REPL free to reconnect.
-        let connection = stream.take();
-        drop(connection);
+        *stream = None;
     }
     commands.shutdown().await;
     result
 }
 
+/// Retry the turn on a new connection after a dropped one, waiting longer each time, up to six
+/// times in a row.
 async fn run_with_reconnect(
     stream: &mut Option<UnixStream>,
     display: &Display,
@@ -336,10 +340,7 @@ async fn run_with_reconnect(
 ) -> Result<String> {
     let mut reconnect_attempts = 0;
     loop {
-        let connection = match stream {
-            Some(connection) => connection,
-            None => stream.insert(obtain_control_stream().await?),
-        };
+        let connection = connection(stream).await?;
         let result = attempt_turn_on_stream(
             scene,
             pending,
@@ -354,8 +355,7 @@ async fn run_with_reconnect(
             return Err(error);
         }
 
-        let connection = stream.take();
-        drop(connection);
+        *stream = None;
         tokio::time::sleep(Duration::from_millis(1u64 << reconnect_attempts)).await;
         reconnect_attempts += 1;
     }
@@ -371,22 +371,20 @@ pub async fn restart(
 ) -> Result<()> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let restarted = async {
-        let connection = match stream {
-            Some(connection) => connection,
-            None => stream.insert(obtain_control_stream().await?),
-        };
+        let connection = connection(stream).await?;
         let request = Frame::Restart {
             place: scene.place.clone(),
             setting: scene.setting.clone(),
             summarize,
         };
         write_frame_to_stream(connection, &request).await?;
-        let spinner = display.start_spinning().await;
+        let spinner = display.start_spinning();
         let mut store = Vec::new();
         let mut answered = false;
         loop {
-            match read_frame_from_stream(connection, &mut store, None, None).await? {
-                Frame::Log(line) => display.show_log(&line).await,
+            let frame = read_frame_from_stream(connection, &mut store, None, None).await?;
+            match frame {
+                Frame::Log(line) => display.show_log(&line),
                 // Asked for, the summary is the answer.
                 Frame::Restarted(text) => {
                     answered = true;
@@ -409,9 +407,20 @@ pub async fn restart(
         result = restarted => result,
     };
     if result.is_err() {
-        drop(stream.take());
+        *stream = None;
     }
     result
+}
+
+/// Reuse the open connection to the hub, or open one.
+async fn connection(stream: &mut Option<UnixStream>) -> Result<&mut UnixStream> {
+    match stream {
+        Some(connection) => Ok(connection),
+        None => {
+            let connection = obtain_control_stream().await?;
+            Ok(stream.insert(connection))
+        }
+    }
 }
 
 fn is_disconnect(error: &eyre::Report) -> bool {

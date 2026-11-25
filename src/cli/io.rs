@@ -1,98 +1,43 @@
-use eyre::eyre;
 use std::io::{IsTerminal, Read};
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 
-#[cfg(unix)]
-use std::os::fd::AsFd;
-#[cfg(unix)]
-use std::path::Path;
-
-#[cfg(target_os = "macos")]
-use std::os::fd::BorrowedFd;
-
-#[cfg(target_os = "macos")]
-use nix::fcntl::{FcntlArg, fcntl};
-
-/// If stdin is not a TTY, read it fully as a single UTF-8 string.
-/// Returns `None` when stdin is a TTY or when the input is empty/whitespace.
-pub fn read_whole_stdin() -> eyre::Result<Option<String>> {
+/// Read piped stdin whole; `None` when stdin is a terminal or carries only whitespace.
+pub fn read_whole_stdin() -> std::io::Result<Option<String>> {
     let mut stdin = std::io::stdin();
     if stdin.is_terminal() {
         return Ok(None);
     }
     let mut buf = String::new();
-    stdin.read_to_string(&mut buf).map_err(|e| eyre!(e))?;
-    if buf.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(buf))
-    }
+    stdin.read_to_string(&mut buf)?;
+    Ok((!buf.trim().is_empty()).then_some(buf))
 }
 
-/// Best-effort detection of the file path stdout is redirected to.
-/// Returns Some(path) when stdout is a regular file, otherwise None (TTY, pipe, socket, etc.).
-#[cfg(unix)]
+/// Find the path of the regular file stdout is redirected to, if it can be found.
 pub fn stdout_redirection_path() -> Option<String> {
-    const FD: i32 = 1; // STDOUT
-
-    // A terminal, a pipe, or a device has no path worth naming.
     let stdout = std::io::stdout();
-    let file = stdout.as_fd().try_clone_to_owned().map(std::fs::File::from);
-    if stdout.is_terminal()
-        || !file
-            .and_then(|file| file.metadata())
-            .is_ok_and(|m| m.is_file())
-    {
+    let file = stdout.as_fd().try_clone_to_owned().ok()?;
+    let metadata = std::fs::File::from(file).metadata().ok()?;
+    // A terminal, a pipe, or a device has no path worth naming.
+    if !metadata.is_file() {
         return None;
     }
-
-    // Resolve common fd symlink locations across Unix variants; fall back to F_GETPATH on macOS.
-    let path = match try_readlink_fd(FD) {
-        Some(p) => p,
-        None => {
-            #[cfg(target_os = "macos")]
-            {
-                try_fcntl_getpath(FD)?
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                return None;
-            }
-        }
-    };
-
-    Some(path.to_string_lossy().to_string())
-}
-
-#[cfg(unix)]
-fn try_readlink_fd(fd: i32) -> Option<PathBuf> {
-    let candidates = [
-        format!("/proc/self/fd/{fd}"),    // Linux
-        format!("/proc/curproc/fd/{fd}"), // *BSD variants
-        format!("/dev/fd/{fd}"),          // macOS/*BSD
-    ];
-    for candidate in candidates {
-        if let Ok(target) = std::fs::read_link(Path::new(&candidate)) {
-            let s = target.to_string_lossy();
-            let cleaned = s.strip_suffix(" (deleted)").unwrap_or(&s);
-            let pb = PathBuf::from(cleaned);
-            if pb.is_absolute() {
-                return Some(pb);
-            }
-        }
-    }
-    None
+    let path = stdout_path()?;
+    Some(path.to_string_lossy().into_owned())
 }
 
 #[cfg(target_os = "macos")]
-fn try_fcntl_getpath(fd: i32) -> Option<PathBuf> {
-    let fd_ref = unsafe { BorrowedFd::borrow_raw(fd) };
-    let mut pb = PathBuf::new();
-    let _ = fcntl(fd_ref, FcntlArg::F_GETPATH(&mut pb)).ok()?;
-    if pb.is_absolute() { Some(pb) } else { None }
+fn stdout_path() -> Option<PathBuf> {
+    use nix::fcntl::{FcntlArg, fcntl};
+    let mut path = PathBuf::new();
+    fcntl(std::io::stdout(), FcntlArg::F_GETPATH(&mut path)).ok()?;
+    path.is_absolute().then_some(path)
 }
 
-#[cfg(not(unix))]
-pub fn stdout_redirection_path() -> Option<String> {
-    None
+#[cfg(not(target_os = "macos"))]
+fn stdout_path() -> Option<PathBuf> {
+    let path = std::fs::read_link("/proc/self/fd/1").ok()?;
+    let path = path.to_string_lossy();
+    let path = PathBuf::from(path.strip_suffix(" (deleted)").unwrap_or(&path));
+    path.is_absolute().then_some(path)
 }

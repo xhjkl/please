@@ -2,14 +2,14 @@ use super::*;
 use crate::protocol::{Effort, ProtocolError, write_frame_to_stream};
 use std::time::Duration;
 
-fn place() -> Place {
+fn some_place() -> Place {
     Place {
         machine: "ssh-ed25519 AAAA".into(),
         cwd: "/".into(),
     }
 }
 
-fn setting() -> Setting {
+fn some_setting() -> Setting {
     Setting {
         today: "2040-02-03".into(),
         effort: Effort::Medium,
@@ -36,7 +36,7 @@ fn result_of(messages: &[Message], tool: &str) -> Option<Value> {
 
 #[tokio::test]
 async fn completed_subturn_resets_budget_before_later_disconnect() {
-    let display = crate::display::make_display();
+    let display = Display::new(false);
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let hub = tokio::spawn(async move {
         let mut store = Vec::new();
@@ -61,7 +61,7 @@ async fn completed_subturn_resets_budget_before_later_disconnect() {
         assert_eq!(messages.len(), 1);
         assert!(result_of(&messages, "list_files").unwrap().is_array());
     });
-    let (place, setting) = (place(), setting());
+    let (place, setting) = (some_place(), some_setting());
     let scene = Scene {
         place: &place,
         setting: &setting,
@@ -93,7 +93,7 @@ async fn completed_subturn_resets_budget_before_later_disconnect() {
 
 #[tokio::test]
 async fn results_answer_their_calls_by_id_in_call_order() {
-    let display = crate::display::make_display();
+    let display = Display::new(false);
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let hub = tokio::spawn(async move {
         let mut store = Vec::new();
@@ -124,7 +124,7 @@ async fn results_answer_their_calls_by_id_in_call_order() {
         assert_eq!(answered, [(5, "list_files"), (6, "read_file")]);
         assert!(result_of(&messages, "read_file").unwrap()["error"].is_string());
     });
-    let (place, setting) = (place(), setting());
+    let (place, setting) = (some_place(), some_setting());
     let scene = Scene {
         place: &place,
         setting: &setting,
@@ -147,7 +147,7 @@ async fn results_answer_their_calls_by_id_in_call_order() {
 
 #[tokio::test]
 async fn incomplete_subturn_preserves_reconnect_budget_and_request() {
-    let display = crate::display::make_display();
+    let display = Display::new(false);
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let hub = tokio::spawn(async move {
         let mut store = Vec::new();
@@ -156,7 +156,7 @@ async fn incomplete_subturn_preserves_reconnect_budget_and_request() {
             .await
             .unwrap();
     });
-    let (place, setting) = (place(), setting());
+    let (place, setting) = (some_place(), some_setting());
     let scene = Scene {
         place: &place,
         setting: &setting,
@@ -260,14 +260,14 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
         write_frame_to_stream(&mut server, &Frame::Stop).await
     });
 
-    let (place, setting) = (place(), setting());
+    let (place, setting) = (some_place(), some_setting());
     let scene = Scene {
         place: &place,
         setting: &setting,
     };
     let mut pending = Pending::new(vec![Message::User("start a command".into())]);
     let mut reconnect_attempts = 0;
-    let display = crate::display::make_display();
+    let display = Display::new(false);
     let attempt = attempt_turn_on_stream(
         scene,
         &mut pending,

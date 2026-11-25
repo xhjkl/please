@@ -1,6 +1,6 @@
-//! Slash commands, typed at the prompt or given as the whole one-shot request.
+//! Commands on the conversation, typed at the prompt or given as the whole one-shot request.
 
-/// What a slash command asks for.
+/// What a command asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     /// Restart the conversation from a message summing it up.
@@ -10,9 +10,18 @@ pub enum Command {
 }
 
 /// The command a line spells, `None` for an ordinary request, or an error naming the commands.
-/// Only a lone `/word` is a command, so requests about paths like `/etc/hosts` stay requests.
+/// Only a lone word is a command, so requests about paths like `/etc/hosts` stay requests.
+/// A bare word must be a command's own name, since synonyms like `clear`, `reset`, or
+/// `summarize` are everyday requests too; with a slash, the synonyms work as well.
 pub fn parse(line: &str) -> Option<Result<Command, String>> {
-    let name = line.trim().strip_prefix('/')?;
+    let line = line.trim();
+    let Some(name) = line.strip_prefix('/') else {
+        return match line.to_lowercase().as_str() {
+            "compact" => Some(Ok(Command::Compact)),
+            "new" => Some(Ok(Command::New)),
+            _ => None,
+        };
+    };
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphabetic()) {
         return None;
     }
@@ -38,6 +47,10 @@ mod tests {
         assert_eq!(parse("/squash"), Some(Ok(Command::Compact)));
         assert_eq!(parse("/clear"), Some(Ok(Command::New)));
         assert_eq!(parse("/new"), Some(Ok(Command::New)));
+        assert_eq!(parse("compact"), Some(Ok(Command::Compact)));
+        assert_eq!(parse(" New\n"), Some(Ok(Command::New)));
+        assert_eq!(parse("summarize"), None);
+        assert_eq!(parse("clear"), None);
         assert!(matches!(parse("/frobnicate"), Some(Err(_))));
         assert_eq!(parse("compact the logs"), None);
         assert_eq!(parse("summarize ./a/b"), None);

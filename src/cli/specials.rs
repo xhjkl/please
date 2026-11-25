@@ -1,91 +1,86 @@
 use eyre::Result;
 use std::path::{Path, PathBuf};
 
-/// Handle special one-shot CLI commands like `--help`, `--version`, or `load`.
-/// Returns true if a special action was handled and the program should exit.
-pub async fn handle_specials_if_needed() -> Result<bool> {
-    let mut args = std::env::args();
-    let _ = args.next(); // binary name
+use super::connect::try_connect_to_hub;
+use crate::protocol::{Frame, read_frame_from_stream, write_frame_to_stream};
 
-    let arg = args.next().unwrap_or_default();
+const HELP: &str = "\
+please: a polite LLM for CLI
 
-    if matches!(arg.as_str(), "help" | "--help" | "-H" | "-h" | "-?") {
-        println!(
-            "{}",
-            concat!(
-                "please: a polite LLM for CLI\n\n",
-                "  $ git diff --cached | please summarize to a concise commit message\n",
-                "  $ please fix all clippy diagnostics\n"
-            )
-        );
-        println!(
-            "  $ please load       Download and verify Inkling 2 Mini\n  $ please version    Show the version and available models\n"
-        );
-        return Ok(true);
-    }
+  $ git diff --cached | please summarize to a concise commit message
+  $ please fix all clippy diagnostics
 
-    if matches!(arg.as_str(), "version" | "--version" | "-V" | "-v") {
-        println!("{}", env!("CARGO_PKG_VERSION"));
-        print_models().await?;
-        return Ok(true);
-    }
+  $ please load       Download and verify Inkling 2 Mini
+  $ please version    Show the version and available models
+";
 
-    if matches!(arg.as_str(), "bench") {
-        let (Some(model), Some(cases), None) = (args.next(), args.next(), args.next()) else {
-            eyre::bail!("usage: please bench MODEL.gguf CASES.json");
-        };
-        crate::hub::benchmark(&model, &cases).await?;
-        return Ok(true);
-    }
-
-    if matches!(arg.as_str(), "docker") {
-        // Wrap docker to bind-mount the host socket into the container at /root/.please/socket
-        let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
-        let host_socket = std::path::Path::new(&home).join(".please").join("socket");
-        let _ = std::fs::create_dir_all(std::path::Path::new(&home).join(".please"));
-        let volume = format!("{}:/root/.please/socket", host_socket.display());
-
-        let mut docker_args: Vec<String> = Vec::new();
-        docker_args.push("-v".to_string());
-        docker_args.push(volume);
-        docker_args.extend(args);
-
-        let status = std::process::Command::new("docker")
-            .args(&docker_args)
-            .status()
-            .map_err(|e| eyre::eyre!(e))?;
-        std::process::exit(status.code().unwrap_or(1));
-    }
-
-    if matches!(arg.as_str(), "run" | "start") {
-        // Launch the hub in the foreground and exit when it stops.
-        crate::hub::run().await?;
-        return Ok(true);
-    }
-
-    if matches!(arg.as_str(), "load" | "download") {
-        let extra = args.next();
-        if extra.is_some() {
-            eyre::bail!("usage: please load");
-        }
-        crate::hub::load_weights().await?;
-        return Ok(true);
-    }
-
-    // Otherwise, not a special
-    Ok(false)
+/// A command to `please` itself rather than a request to the model.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Special<'a> {
+    Help,
+    Version,
+    Load,
+    /// Serve as the hub in the foreground.
+    Hub,
+    Bench {
+        model: &'a str,
+        cases: &'a str,
+    },
+    /// Run docker with these arguments and the hub's socket mounted.
+    Docker(&'a [String]),
 }
 
-/// Query the checkpoint already in use by a local or forwarded hub.
+/// Find the special the arguments spell, if any. Most are a lone word, with or without a
+/// leading slash, so a sentence that merely starts with one stays a request; `docker` and
+/// `bench` take arguments.
+pub fn parse(args: &[String]) -> Option<Special<'_>> {
+    let (first, rest) = args.split_first()?;
+    let first = first.trim();
+    let name = first.strip_prefix('/').unwrap_or(first).to_lowercase();
+    match (name.as_str(), rest) {
+        ("docker", rest) => Some(Special::Docker(rest)),
+        ("bench", [model, cases]) => Some(Special::Bench { model, cases }),
+        ("help" | "--help" | "-h" | "-?", []) => Some(Special::Help),
+        ("version" | "--version" | "-v", []) => Some(Special::Version),
+        ("load" | "download", []) => Some(Special::Load),
+        ("run" | "start", []) => Some(Special::Hub),
+        _ => None,
+    }
+}
+
+/// Run a special; the program is done afterwards.
+pub async fn run(special: Special<'_>) -> Result<()> {
+    match special {
+        Special::Help => println!("{HELP}"),
+        Special::Version => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            print_models().await?;
+        }
+        Special::Load => crate::hub::load_weights().await?,
+        Special::Hub => crate::hub::run().await?,
+        Special::Bench { model, cases } => crate::hub::benchmark(model, cases).await?,
+        Special::Docker(args) => {
+            // Mounting the host socket where a container's root user looks for it.
+            let socket = crate::hub::socket_path();
+            if let Some(directory) = socket.parent() {
+                let _ = std::fs::create_dir_all(directory);
+            }
+            let volume = format!("{}:/root/.please/socket", socket.display());
+            let mut docker = std::process::Command::new("docker");
+            docker.arg("-v").arg(volume).args(args);
+            let status = docker.status()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+    Ok(())
+}
+
+/// Ask a running hub, local or forwarded, which checkpoint it has loaded.
 async fn running_model() -> Result<Option<PathBuf>> {
-    use crate::protocol::{Frame, read_frame_from_stream, write_frame_to_stream};
     let socket = crate::hub::socket_path();
-    let connected = super::connect::try_connect_to_hub(&socket).await;
+    let connected = try_connect_to_hub(&socket).await;
     let mut stream = match connected {
-        Err(
-            super::connect::ConnectError::Missing { .. }
-            | super::connect::ConnectError::NoListener { .. },
-        ) => return Ok(None),
+        Err(error) if error.is_absent() => return Ok(None),
         Err(error) => return Err(error.into()),
         Ok(stream) => stream,
     };
@@ -104,6 +99,7 @@ async fn running_model() -> Result<Option<PathBuf>> {
     Ok(Some(path.into()))
 }
 
+/// Print the available checkpoints under a heading for each folder, relative to `~` if inside.
 async fn print_models() -> Result<()> {
     let running = running_model().await?;
     let paths = crate::hub::model_paths(running)?;
@@ -131,4 +127,32 @@ async fn print_models() -> Result<()> {
         println!("  {}", name.to_string_lossy());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn a_special_is_a_lone_word_with_or_without_a_slash() {
+        assert_eq!(parse(&words("help")), Some(Special::Help));
+        assert_eq!(parse(&words("/load")), Some(Special::Load));
+        assert_eq!(parse(&words("-V")), Some(Special::Version));
+        assert_eq!(parse(&words("/Start")), Some(Special::Hub));
+        assert_eq!(parse(&words("help me rename these files")), None);
+        assert_eq!(parse(&words("run the tests")), None);
+        assert_eq!(parse(&words("load the csv into sqlite")), None);
+        assert_eq!(parse(&["version bump".into()]), None);
+        assert_eq!(parse(&words("/etc/hosts")), None);
+        assert_eq!(parse(&words("")), None);
+        let docker = words("docker run --rm bash");
+        assert_eq!(parse(&docker), Some(Special::Docker(&docker[1..])));
+        let bench = words("bench model.gguf cases.json");
+        let (model, cases) = ("model.gguf", "cases.json");
+        assert_eq!(parse(&bench), Some(Special::Bench { model, cases }));
+    }
 }

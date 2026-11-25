@@ -9,6 +9,8 @@ use super::Display;
 pub struct ExecutionPane(UnboundedReceiver<String>);
 
 impl ExecutionPane {
+    /// Run `invocation` while showing what it streams, and return its result once all of that
+    /// has been shown.
     pub async fn render<T>(mut self, invocation: impl Future<Output = T>) -> T {
         tokio::pin!(invocation);
         let result = tokio::select! {
@@ -39,6 +41,8 @@ impl Drop for ExecutionPane {
 }
 
 impl Display {
+    /// Open a pane for one command's live output, with the sender its output goes to; `None`
+    /// when stderr is not a terminal.
     pub fn execution_pane(&self) -> Option<(UnboundedSender<String>, ExecutionPane)> {
         if !self.stderr_is_tty {
             return None;

@@ -3,10 +3,13 @@ use std::io;
 
 use super::{Display, read_terminal_line};
 
+/// The user's answer to a call that needs approval.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Approval {
     Approved,
+    /// Declined, for the reason the user typed.
     Denied(String),
+    /// No answer could be asked for or read, for the reason given.
     Unavailable(String),
 }
 

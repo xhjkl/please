@@ -21,10 +21,15 @@ pub fn here() -> Result<Place> {
 /// The machine's SSH host key, the identity `known_hosts` pins: the same from any terminal
 /// or client, unchanged by a new hostname, new after a re-image. Empty without one.
 fn machine() -> String {
-    let read = HOST_KEYS.iter().map(std::fs::read_to_string);
-    read.filter_map(|text| key(&text.ok()?))
-        .next()
-        .unwrap_or_default()
+    for path in HOST_KEYS {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some(key) = key(&text) {
+            return key;
+        }
+    }
+    String::new()
 }
 
 /// A public key file's type and key; its comment, often `root@hostname`, is left out.

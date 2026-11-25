@@ -1,81 +1,70 @@
 use eyre::{Result, eyre};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::net::UnixStream;
 
+/// Why there is no hub to talk to at a socket path.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
-    #[error("missing socket: {}", path.display())]
-    Missing { path: PathBuf },
-    #[error("permission denied: {}", path.display())]
-    PermissionDenied { path: PathBuf },
-    #[error("not a socket: {}", path.display())]
-    NotSocket { path: PathBuf },
-    #[error("no listener at: {}", path.display())]
-    NoListener { path: PathBuf },
+    #[error("missing socket: {}", .0.display())]
+    Missing(PathBuf),
+    #[error("permission denied: {}", .0.display())]
+    PermissionDenied(PathBuf),
+    #[error("not a socket: {}", .0.display())]
+    NotSocket(PathBuf),
+    #[error("no listener at: {}", .0.display())]
+    NoListener(PathBuf),
 }
 
-/// Try to connect to an existing hub via Unix socket.
+impl ConnectError {
+    /// Whether no hub is there yet, as opposed to something in the way of one.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Missing(_) | Self::NoListener(_))
+    }
+}
+
+/// Connect to a hub already listening at `path`.
 pub async fn try_connect_to_hub(path: &Path) -> std::result::Result<UnixStream, ConnectError> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::FileTypeExt;
     let metadata = std::fs::metadata(path);
-    if let Ok(metadata) = metadata {
-        use std::os::unix::fs::FileTypeExt;
-        if !metadata.file_type().is_socket() {
-            return Err(ConnectError::NotSocket {
-                path: path.to_path_buf(),
-            });
-        }
+    if metadata.is_ok_and(|metadata| !metadata.file_type().is_socket()) {
+        return Err(ConnectError::NotSocket(path.to_path_buf()));
     }
     let connect = UnixStream::connect(path);
     let connected = tokio::time::timeout(Duration::from_millis(64), connect).await;
-    match connected {
-        Err(_elapsed) => Err(ConnectError::NoListener {
-            path: path.to_path_buf(),
-        }),
+    let error: fn(PathBuf) -> ConnectError = match connected {
+        Err(_elapsed) => ConnectError::NoListener,
         Ok(Err(error)) => match error.kind() {
-            std::io::ErrorKind::NotFound => Err(ConnectError::Missing {
-                path: path.to_path_buf(),
-            }),
-            std::io::ErrorKind::PermissionDenied => Err(ConnectError::PermissionDenied {
-                path: path.to_path_buf(),
-            }),
-            std::io::ErrorKind::ConnectionRefused => Err(ConnectError::NoListener {
-                path: path.to_path_buf(),
-            }),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-                Err(ConnectError::NoListener {
-                    path: path.to_path_buf(),
-                })
+            ErrorKind::NotFound => ConnectError::Missing,
+            ErrorKind::PermissionDenied => ConnectError::PermissionDenied,
+            ErrorKind::ConnectionRefused | ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+                ConnectError::NoListener
             }
-            _ => Err(ConnectError::NotSocket {
-                path: path.to_path_buf(),
-            }),
+            _ => ConnectError::NotSocket,
         },
-        Ok(Ok(stream)) => Ok(stream),
-    }
+        Ok(Ok(stream)) => return Ok(stream),
+    };
+    Err(error(path.to_path_buf()))
 }
 
 /// Start a detached hub and connect once it has bound its socket.
 async fn start_hub(path: &Path) -> Result<UnixStream> {
     let exe = std::env::current_exe()?;
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("run");
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    cmd.process_group(0);
-    let mut child = cmd.spawn()?;
+    let mut hub = tokio::process::Command::new(exe);
+    hub.arg("run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = hub.spawn()?;
     let connected = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let connected = try_connect_to_hub(path).await;
             match connected {
-                Err(
-                    error
-                    @ (ConnectError::NotSocket { .. } | ConnectError::PermissionDenied { .. }),
-                ) => {
-                    return Err(eyre!(error));
-                }
-                Err(ConnectError::NoListener { .. } | ConnectError::Missing { .. }) => {}
+                Err(error) if !error.is_absent() => return Err(eyre!(error)),
+                Err(_absent) => {}
                 Ok(stream) => return Ok(stream),
             }
             let status = child.try_wait()?;
@@ -114,14 +103,12 @@ pub async fn obtain_control_stream() -> Result<UnixStream> {
 async fn obtain_control_stream_at(path: &Path) -> Result<UnixStream> {
     let connected = try_connect_to_hub(path).await;
     match connected {
-        Err(error @ (ConnectError::NotSocket { .. } | ConnectError::PermissionDenied { .. })) => {
-            return Err(eyre!(error));
-        }
-        Err(ConnectError::NoListener { .. } | ConnectError::Missing { .. }) => {}
+        Err(error) if !error.is_absent() => return Err(eyre!(error)),
         Ok(stream) => {
             tracing::info!("probe: connected to existing hub at {}", path.display());
             return Ok(stream);
         }
+        Err(_absent) => {}
     }
 
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
