@@ -34,8 +34,9 @@ impl Origin {
     /// Identify the canonical checkpoint at `model` and the running build, each by path,
     /// length, and modification time, so replacing either names every head anew.
     pub fn new(model: &Path) -> Result<Self> {
+        let build = std::env::current_exe()?;
         let mut hash = Sha256::new();
-        for path in [model, &std::env::current_exe()?] {
+        for path in [model, &build] {
             let metadata = std::fs::metadata(path)?;
             let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
             hash.update(path.as_os_str().as_bytes());
@@ -83,12 +84,14 @@ fn prune(directory: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         if is_head(&entry.file_name().to_string_lossy()) {
-            heads.push((entry.metadata()?.modified()?, entry.path()));
+            let modified = entry.metadata()?.modified()?;
+            heads.push((modified, entry.path()));
         }
     }
     heads.sort();
     for (_, path) in heads.iter().rev().skip(KEPT) {
-        match std::fs::remove_file(path) {
+        let removed = std::fs::remove_file(path);
+        match removed {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
             _ => {}
         }

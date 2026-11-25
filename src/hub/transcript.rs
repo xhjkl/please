@@ -51,8 +51,8 @@ pub fn recall(chat: &Chat, arguments: &Value, page: usize) -> Value {
         Some(name) => chat.read(&name),
     };
     let text = match read {
-        Ok(text) => text,
         Err(error) => return json!({ "error": format!("{error:#}") }),
+        Ok(text) => text,
     };
     let length = text.chars().count();
     if offset == 0 && length <= page {
@@ -98,13 +98,14 @@ pub fn chunks(entries: &[Entry], budget: usize) -> Vec<String> {
     for (index, entry) in entries.iter().filter(|entry| !entry.backup).enumerate() {
         // A conversation that restarted before opens with the message it restarted from.
         let previous = restarted && index == 0 && matches!(entry.message, Message::Answer(_));
+        let block = block(entry, longest);
         let block = match previous {
-            true => block(entry, longest).replacen(
+            true => block.replacen(
                 "] answer",
                 "] the message the conversation last restarted from",
                 1,
             ),
-            false => block(entry, longest),
+            false => block,
         };
         match chunks.last_mut() {
             Some(chunk) if chunk.len() + block.len() <= budget => {
@@ -175,7 +176,7 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    fn conversation() -> Vec<Message> {
+    fn some_conversation() -> Vec<Message> {
         vec![
             Message::User("find me a gc implementation in this codebase".into()),
             Message::Thinking("x".repeat(2000)),
@@ -197,7 +198,7 @@ mod tests {
     fn chunks_abbreviate_bulk_and_keep_requests_whole() -> Result<(), eyre::Report> {
         let dir = TempDir::new()?;
         let chat = Chat::at(dir.0.join("chat"))?;
-        chat.append(&conversation())?;
+        chat.append(&some_conversation())?;
         let all = chunks(&chat.entries()?, 1 << 20);
         assert_eq!(all.len(), 1);
         let text = &all[0];
@@ -217,7 +218,7 @@ mod tests {
     fn recall_lists_entries_and_reads_them_across_restarts() -> Result<(), eyre::Report> {
         let dir = TempDir::new()?;
         let chat = Chat::at(dir.0.join("chat"))?;
-        chat.append(&conversation())?;
+        chat.append(&some_conversation())?;
         chat.restart(&[Message::Answer("You asked me to find a GC.".into())])?;
         let list = recall(&chat, &json!({}), RECALLED);
         let list = list.as_str().unwrap();

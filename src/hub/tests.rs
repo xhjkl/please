@@ -1,9 +1,8 @@
 use super::*;
 use crate::protocol::{Effort, Message, Place, Setting};
-use tokio::io::AsyncWriteExt;
 
 /// A request carrying `messages`, from nowhere in particular.
-fn request(messages: Vec<Message>) -> Frame {
+fn some_request(messages: Vec<Message>) -> Frame {
     Frame::Request {
         place: Place {
             machine: "ssh-ed25519 AAAA".into(),
@@ -83,7 +82,7 @@ async fn established_connection_survives_long_tool_waits() {
         }
     });
 
-    let request = request(vec![]);
+    let request = some_request(vec![]);
     let mut store = Vec::new();
     write_frame_to_stream(&mut client, &request).await.unwrap();
     let reply: Frame = read_frame_from_stream(&mut client, &mut store, None, None)
@@ -118,7 +117,7 @@ async fn idle_initial_connection_times_out() {
 #[tokio::test(start_paused = true)]
 async fn incomplete_request_on_established_connection_times_out() {
     let (mut client, mut server) = UnixStream::pair().unwrap();
-    let request = postcard::to_allocvec(&request(vec![])).unwrap();
+    let request = postcard::to_allocvec(&some_request(vec![])).unwrap();
     client.write_all(&request[..1]).await.unwrap();
 
     // Observing socket readiness before starting the virtual frame deadline.
@@ -137,8 +136,8 @@ async fn incomplete_request_on_established_connection_times_out() {
 #[tokio::test]
 async fn buffered_request_is_delivered_before_disconnect() {
     let (client, mut server) = UnixStream::pair().unwrap();
-    let mut store =
-        postcard::to_allocvec(&request(vec![Message::User("already received".into())])).unwrap();
+    let sent = some_request(vec![Message::User("already received".into())]);
+    let mut store = postcard::to_allocvec(&sent).unwrap();
     drop(client);
 
     let request = wait_for_request(&mut server, &mut store).await.unwrap();

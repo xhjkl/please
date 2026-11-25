@@ -170,7 +170,8 @@ impl Chat {
     fn names(&self) -> Result<Vec<(u64, bool)>> {
         let mut names = Vec::new();
         for (dir, backup) in [(self.dir.join(OLD), true), (self.dir.clone(), false)] {
-            let items = match std::fs::read_dir(&dir) {
+            let items = std::fs::read_dir(&dir);
+            let items = match items {
                 Err(error) if backup && error.kind() == std::io::ErrorKind::NotFound => continue,
                 items => items?,
             };
@@ -193,12 +194,12 @@ impl Chat {
             let path = self.path(number, backup);
             let read = std::fs::read_to_string(&path).map_err(eyre::Report::from);
             match read.and_then(|text| decode(&text)) {
+                Err(error) => tracing::warn!("chat: skipping {}: {error:#}", path.display()),
                 Ok(message) => entries.push(Entry {
                     number,
                     backup,
                     message,
                 }),
-                Err(error) => tracing::warn!("chat: skipping {}: {error:#}", path.display()),
             }
         }
         Ok(entries)
@@ -312,7 +313,7 @@ mod tests {
     use crate::protocol::Note;
     use crate::test_support::TempDir;
 
-    fn sample() -> Vec<Message> {
+    fn some_conversation() -> Vec<Message> {
         vec![
             Message::Input("diff --git a/x b/x".into()),
             Message::User("find me a gc implementation".into()),
@@ -336,8 +337,8 @@ mod tests {
     fn messages_round_trip_through_plain_files() -> Result<()> {
         let dir = TempDir::new()?;
         let chat = Chat::at(dir.0.join("chat"))?;
-        chat.append(&sample())?;
-        let kept: Vec<_> = sample()
+        chat.append(&some_conversation())?;
+        let kept: Vec<_> = some_conversation()
             .into_iter()
             .filter(|message| !matches!(message, Message::Note(_)))
             .collect();
@@ -373,7 +374,7 @@ mod tests {
     fn a_restart_sets_entries_aside_and_numbering_goes_on() -> Result<()> {
         let dir = TempDir::new()?;
         let chat = Chat::at(dir.0.join("chat"))?;
-        chat.append(&sample())?;
+        chat.append(&some_conversation())?;
         let summary = Message::Answer("You asked me to find a GC; next I'll read ./gc.".into());
         chat.restart(std::slice::from_ref(&summary))?;
         assert_eq!(chat.messages()?, std::slice::from_ref(&summary));

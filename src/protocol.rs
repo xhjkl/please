@@ -167,7 +167,8 @@ pub async fn greet(stream: &mut tokio::net::UnixStream) -> Result<()> {
     let hello = Frame::Hello { probe: probe_id() };
     write_frame_to_stream(stream, &hello).await?;
     let mut store = Vec::new();
-    match read_frame_from_stream(stream, &mut store, None, None).await? {
+    let greeting = read_frame_from_stream(stream, &mut store, None, None).await?;
+    match greeting {
         Frame::Welcome => Ok(()),
         Frame::Busy => Err(HubBusy.into()),
         frame => Err(eyre!("unexpected greeting from the hub: {frame:?}")),
@@ -179,7 +180,7 @@ pub async fn write_frame_to_stream<W: tokio::io::AsyncWriteExt + Unpin, T: serde
     sink: &mut W,
     frame: &T,
 ) -> Result<()> {
-    let bytes = postcard::to_allocvec(frame).map_err(|e| eyre!(e))?;
+    let bytes = postcard::to_allocvec(frame)?;
     sink.write_all(&bytes).await?;
     Ok(())
 }
@@ -202,17 +203,13 @@ pub async fn read_frame_from_stream<T: serde::de::DeserializeOwned>(
     loop {
         if !store.is_empty() {
             match postcard::take_from_bytes::<T>(&store[..]) {
-                Err(postcard::Error::DeserializeUnexpectedEnd) => {
-                    // Need more bytes; fall through to the read path below.
-                }
-                Err(e) => {
-                    // Broken transmission; abort
-                    return Err(ProtocolError::Decode(e));
-                }
+                // Reading on for the rest of a frame split across reads.
+                Err(postcard::Error::DeserializeUnexpectedEnd) => {}
+                Err(e) => return Err(ProtocolError::Decode(e)),
                 Ok((msg, rest)) => {
-                    // Chop off the consumed prefix, keep remainder for next call
+                    // Keeping the bytes past the frame for the next call.
                     let consumed = store.len() - rest.len();
-                    let _ = store.drain(0..consumed);
+                    store.drain(..consumed);
                     return Ok(msg);
                 }
             }
@@ -222,12 +219,12 @@ pub async fn read_frame_from_stream<T: serde::de::DeserializeOwned>(
             return Err(ProtocolError::Timeout);
         }
 
-        match tokio::time::timeout(per_read_timeout, AsyncReadExt::read(stream, &mut chunk)).await {
-            Err(_) => {
-                // per-read timeout, try again
-            }
+        let read = tokio::time::timeout(per_read_timeout, stream.read(&mut chunk)).await;
+        match read {
             Ok(Err(e)) => return Err(ProtocolError::Io(e)),
             Ok(Ok(0)) => return Err(ProtocolError::Disconnect),
+            // Rechecking the total deadline before reading on.
+            Err(_) => {}
             Ok(Ok(n)) => store.extend_from_slice(&chunk[..n]),
         }
     }

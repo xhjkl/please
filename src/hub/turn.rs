@@ -76,10 +76,17 @@ pub async fn serve(
             condensed = true;
             let base = engine.fill(setting, &[])?;
             let fits = |kept: &[Message]| Ok(engine.fill(setting, kept)? - base <= KEEP_SHARE);
-            let (folded, kept) = cutover(chat.entries()?, fits)?;
+            let entries = chat.entries()?;
+            let (folded, kept) = cutover(entries, fits)?;
             // Models tend to end their turn after a message of their own.
             let resume = kept.is_empty();
-            match condense(sink, engine, setting, &chat, folded, kept).await {
+            let restarted = condense(sink, engine, setting, &chat, folded, kept).await;
+            match restarted {
+                // Clipping old messages still lets the conversation go on.
+                Err(error) => {
+                    let line = format!("cannot condense the conversation: {error:#}");
+                    write_frame_to_stream(sink, &Frame::Log(line)).await?;
+                }
                 Ok(summary) => {
                     write_frame_to_stream(sink, &Frame::Restarted(summary)).await?;
                     if resume {
@@ -88,21 +95,16 @@ pub async fn serve(
                     history = chat.messages()?;
                     history.extend(notes.iter().cloned());
                 }
-                // Clipping old messages still lets the conversation go on.
-                Err(error) => {
-                    let line = format!("cannot condense the conversation: {error:#}");
-                    write_frame_to_stream(sink, &Frame::Log(line)).await?;
-                }
             }
         }
-        let key = conversation(place, chat.generation()?);
+        let generation = chat.generation()?;
+        let key = conversation(place, generation);
         let step = generate(Some(&mut *sink), engine, key, setting, &history, None).await?;
         let mut kept = opening(step.thinking, step.answer);
         // A call's ID is the number of the entry that first keeps it.
         let first = chat.next()?;
         let entry = |kept: &[Message]| first + kept.len() as u64;
         let calls = match step.calls {
-            Ok(calls) => calls,
             Err(error) => {
                 // No call is kept for what could not be parsed, so its result has its own ID.
                 let content = prompting::unparsed(&error);
@@ -110,6 +112,7 @@ pub async fn serve(
                 chat.append(&kept)?;
                 continue;
             }
+            Ok(calls) => calls,
         };
         if calls.is_empty() && pending {
             return write_frame_to_stream(sink, &Frame::Stop).await;
@@ -145,17 +148,12 @@ pub async fn serve(
         chat.append(&kept)?;
         if !sent.is_empty() || own.is_empty() {
             for (id, call) in sent {
-                let arguments_json = serde_json::to_string(&call.arguments)?;
-                let name = call.name;
-                write_frame_to_stream(
-                    sink,
-                    &Frame::ToolCall {
-                        id,
-                        name,
-                        arguments_json,
-                    },
-                )
-                .await?;
+                let frame = Frame::ToolCall {
+                    id,
+                    name: call.name,
+                    arguments_json: call.arguments.to_string(),
+                };
+                write_frame_to_stream(sink, &frame).await?;
             }
             return write_frame_to_stream(sink, &Frame::Stop).await;
         }
@@ -175,10 +173,12 @@ pub async fn restart(
 ) -> Result<()> {
     let chat = Chat::open(place)?;
     let _lock = lock(&chat).await?;
-    if chat.messages()?.is_empty() {
+    let messages = chat.messages()?;
+    if messages.is_empty() {
         write_frame_to_stream(sink, &Frame::Log("the conversation is empty".into())).await?;
     } else if summarize {
-        let summary = condense(sink, engine, setting, &chat, chat.entries()?, vec![]).await?;
+        let entries = chat.entries()?;
+        let summary = condense(sink, engine, setting, &chat, entries, vec![]).await?;
         write_frame_to_stream(sink, &Frame::Restarted(summary)).await?;
     } else {
         chat.restart(&[])?;
@@ -200,7 +200,10 @@ fn keep_arrivals(chat: &Chat, id: u64, incoming: Vec<Message>) -> Result<()> {
     let answers = !retried && matches!(incoming.first(), Some(Message::Result(_)));
     let mut arriving = match answers {
         true => vec![],
-        false => unanswered(&chat.messages()?),
+        false => {
+            let kept = chat.messages()?;
+            unanswered(&kept)
+        }
     };
     if !retried {
         arriving.extend(incoming);
@@ -356,14 +359,15 @@ async fn condense(
     if chunks.is_empty() {
         bail!("nothing to condense before the turn in progress");
     }
+    let parts = chunks.len();
     let mut draft: Option<String> = None;
-    for (index, chunk) in chunks.iter().enumerate() {
+    for (index, chunk) in chunks.into_iter().enumerate() {
         let part = index + 1;
-        let progress = format!("condensing the conversation ({part}/{})", chunks.len());
+        let progress = format!("condensing the conversation ({part}/{parts})");
         write_frame_to_stream(sink, &Frame::Log(progress)).await?;
         let note = Note::Restart {
             draft: draft.take(),
-            chunk: chunk.clone(),
+            chunk,
         };
         // A fresh key: condensing prompts share no clipping with any conversation.
         let key = engine.connect();
@@ -402,26 +406,20 @@ async fn generate(
 ) -> Result<Step> {
     let mut parser = engine.output_parser()?;
     let (sender, mut generated) = tokio::sync::mpsc::unbounded_channel();
-    let worker = engine.clone();
-    let (setting, history) = (setting.clone(), history.to_vec());
+    let (engine, setting, history) = (engine.clone(), setting.clone(), history.to_vec());
     let task = tokio::spawn(async move {
-        inference::generate(&worker, key, &setting, &history, sender, max_tokens).await
+        inference::generate(&engine, key, &setting, &history, sender, max_tokens).await
     });
-    let mut step = Step {
-        thinking: String::new(),
-        answer: String::new(),
-        calls: Ok(vec![]),
-        complete: false,
-    };
+    let (mut thinking, mut answer) = (String::new(), String::new());
     while let Some(inference::Generated::Token(token)) = generated.recv().await {
         for delta in parser.push_token(token)? {
             let frame = match delta {
                 Delta::Answer(text) => {
-                    step.answer.push_str(&text);
+                    answer.push_str(&text);
                     Frame::Answer(text)
                 }
                 Delta::Thinking(text) => {
-                    step.thinking.push_str(&text);
+                    thinking.push_str(&text);
                     Frame::Thinking(text)
                 }
             };
@@ -431,9 +429,14 @@ async fn generate(
         }
     }
     let turn = task.await??;
-    step.calls = parser.finish();
-    step.complete = turn.is_some_and(|turn| turn.complete);
-    Ok(step)
+    let calls = parser.finish();
+    let complete = turn.is_some_and(|turn| turn.complete);
+    Ok(Step {
+        thinking,
+        answer,
+        calls,
+        complete,
+    })
 }
 
 #[cfg(test)]
@@ -441,7 +444,7 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    fn call(id: u64, name: &str) -> Message {
+    fn some_call(id: u64, name: &str) -> Message {
         Message::Call(Call {
             id,
             name: name.into(),
@@ -454,8 +457,8 @@ mod tests {
         let kept = vec![
             Message::User("go".into()),
             Message::Thinking(String::new()),
-            call(3, "apply_patch"),
-            call(4, "run_command"),
+            some_call(3, "apply_patch"),
+            some_call(4, "run_command"),
         ];
         let answers = unanswered(&kept);
         let answered: Vec<_> = answers
@@ -480,7 +483,7 @@ mod tests {
         chat.append(&[
             Message::User("first".into()),
             Message::Thinking(String::new()),
-            call(3, "read_file"),
+            some_call(3, "read_file"),
         ])?;
         // Results answer the dangling call.
         let results = vec![result(3, "read_file", "x".into())];
@@ -488,7 +491,10 @@ mod tests {
         keep_arrivals(&chat, 7, results)?;
         assert_eq!(chat.messages()?.len(), 4);
         // A new request after a step whose calls never got results answers them first.
-        chat.append(&[Message::Thinking(String::new()), call(6, "run_command")])?;
+        chat.append(&[
+            Message::Thinking(String::new()),
+            some_call(6, "run_command"),
+        ])?;
         keep_arrivals(&chat, 8, vec![Message::User("next".into())])?;
         let messages = chat.messages()?;
         let answer = Message::Result(ToolResult {
@@ -511,7 +517,10 @@ mod tests {
         for step in 0..3 {
             let content = format!("step {step}");
             let id = chat.next()? + 1;
-            chat.append(&[Message::Thinking(content.clone()), call(id, "read_file")])?;
+            chat.append(&[
+                Message::Thinking(content.clone()),
+                some_call(id, "read_file"),
+            ])?;
             chat.append(&[result(id, "read_file", content)])?;
         }
         // Entries 1 and 2 are set aside, 3 is the restart message, and the turn is 4 to 14.

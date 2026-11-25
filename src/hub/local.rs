@@ -1,6 +1,6 @@
 //! Host Oco and serve streamed requests from local or forwarded clients.
 use super::socket_path;
-use eyre::{Result, eyre};
+use eyre::{Result, bail, eyre};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,7 +15,7 @@ async fn load(model_path: Option<&str>) -> Result<Arc<Engine>> {
         Some(path) => super::discovery::inspect(path.into())?,
         None => {
             let model = super::discovery::selected_model()?;
-            model.ok_or_else(|| eyre!(super::NoWeights))?
+            model.ok_or(super::NoWeights)?
         }
     };
     tracing::info!(model_path=%model.path.display(), dialect=?model.dialect, "hub: selected model");
@@ -62,16 +62,13 @@ async fn cleanup_stale_socket(path: &std::path::Path) -> Result<()> {
         Ok(metadata) => metadata,
     };
     if !metadata.file_type().is_socket() {
-        return Err(eyre!(
-            "hub: path exists but is not a socket: {}",
-            path.display()
-        ));
+        bail!("hub: path exists but is not a socket: {}", path.display());
     }
     let connected =
         tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(path)).await;
     match connected {
-        Err(_) => return Err(eyre!("hub: cannot verify that {} is stale", path.display())),
-        Ok(Ok(_stream)) => return Err(eyre!("hub already listening at {}", path.display())),
+        Err(_) => bail!("hub: cannot verify that {} is stale", path.display()),
+        Ok(Ok(_stream)) => bail!("hub already listening at {}", path.display()),
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
         Ok(Err(error)) => return Err(error.into()),
@@ -108,6 +105,28 @@ async fn wait_for_request(
     read_request(stream, store).await
 }
 
+/// Run `work` unless the probe hangs up first, which cancels it and gives `None`. A byte that
+/// arrives first opens the probe's next request, and `work` then runs to its end.
+async fn unless_hung_up(
+    reader: &mut tokio::net::unix::ReadHalf<'_>,
+    store: &mut Vec<u8>,
+    work: impl Future<Output = Result<()>>,
+) -> Result<Option<Result<()>>> {
+    tokio::pin!(work);
+    let mut byte = [0];
+    tokio::select! {
+        biased;
+        read = reader.read(&mut byte) => {
+            if read? == 0 {
+                return Ok(None);
+            }
+            store.extend_from_slice(&byte);
+            Ok(Some(work.await))
+        }
+        served = &mut work => Ok(Some(served)),
+    }
+}
+
 /// Serve a long-lived client connection, handling multiple turns per session.
 async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> Result<()> {
     tracing::info!("hub: connection accepted");
@@ -120,7 +139,7 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
     loop {
         let frame = match request {
             Err(ProtocolError::Disconnect) => return Ok(()),
-            Err(e) => return Err(eyre!(e)),
+            Err(error) => return Err(error.into()),
             Ok(frame) => frame,
         };
 
@@ -158,21 +177,11 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
                 tracing::info!("hub: received inference request");
                 let (mut reader, mut writer) = stream.split();
                 let turn = super::turn::serve(&mut writer, &hub, &place, &setting, id, messages);
-                tokio::pin!(turn);
-                let mut byte = [0];
-                tokio::select! {
-                    biased;
-                    read = reader.read(&mut byte) => {
-                        let read = read?;
-                        // Dropping the receiver stops generation even when there are no deltas.
-                        if read == 0 {
-                            return Ok(());
-                        }
-                        store.extend_from_slice(&byte[..read]);
-                        turn.await
-                    }
-                    result = &mut turn => result,
-                }
+                // Dropping the receiver stops generation even when there are no deltas.
+                let Some(served) = unless_hung_up(&mut reader, &mut store, turn).await? else {
+                    return Ok(());
+                };
+                served
             }
             Frame::Restart {
                 place,
@@ -182,20 +191,11 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
                 tracing::info!("hub: received restart request");
                 let (mut reader, mut writer) = stream.split();
                 let restart = super::turn::restart(&mut writer, &hub, &place, &setting, summarize);
-                tokio::pin!(restart);
-                let mut byte = [0];
                 // A probe that goes away cancels the restart before it is kept.
-                tokio::select! {
-                    biased;
-                    read = reader.read(&mut byte) => {
-                        if read? == 0 {
-                            return Ok(());
-                        }
-                        store.extend_from_slice(&byte[..1]);
-                        restart.await
-                    }
-                    result = &mut restart => result,
-                }
+                let Some(served) = unless_hung_up(&mut reader, &mut store, restart).await? else {
+                    return Ok(());
+                };
+                served
             }
             Frame::BenchmarkRequest {
                 setting,
@@ -212,7 +212,7 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
                     }
                 }
             }
-            _ => return Err(eyre!("bad request: {frame:?}")),
+            _ => bail!("bad request: {frame:?}"),
         };
 
         if let Err(error) = served {
