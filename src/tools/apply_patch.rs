@@ -10,7 +10,7 @@ use super::common::{Param, ParamKind, Spec};
 use serde::Deserialize;
 use serde_json::json;
 
-pub use preview::summarize_patch_for_preview;
+pub use preview::preview_patch;
 
 pub const NAME: &str = "apply_patch";
 

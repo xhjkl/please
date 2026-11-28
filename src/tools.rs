@@ -49,7 +49,7 @@ mod find_related;
 mod list_files;
 mod read_file;
 
-pub use apply_patch::summarize_patch_for_preview;
+pub use apply_patch::preview_patch;
 pub use command::Jobs;
 
 /// The probe's tools, keyed by name.

@@ -11,9 +11,7 @@ use crate::protocol::{
     Frame, Message, Note, Place, ProtocolError, Setting, ToolCall, ToolResult, read_frame,
     write_frame,
 };
-use crate::tools::{
-    Jobs, ToolContext, ToolKind, Tools, all_tools, kind_of, summarize_patch_for_preview,
-};
+use crate::tools::{Jobs, ToolContext, ToolKind, Tools, all_tools, kind_of, preview_patch};
 
 use super::commands::Command;
 use super::connect::connect_to_hub;
@@ -292,7 +290,7 @@ async fn approve_call(display: &Display, call: &ParsedCall) -> Approval {
         return Approval::Approved;
     }
     let patch = call.arguments.get("patch").and_then(Value::as_str);
-    let preview = patch.and_then(summarize_patch_for_preview);
+    let preview = patch.map(preview_patch);
     display
         .confirm(&call.name, &preview.unwrap_or_default())
         .await

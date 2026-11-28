@@ -3,12 +3,12 @@ use super::parsing::{contains_patch_syntax, parse_patch_ops};
 
 /// Render a proposed patch in full for approval: overwrite content as is, and a patch as a
 /// unified-diff-like listing of its operations.
-pub fn summarize_patch_for_preview(raw: &str) -> Option<String> {
+pub fn preview_patch(raw: &str) -> String {
     if !contains_patch_syntax(raw) {
-        return Some(raw.to_string());
+        return raw.to_string();
     }
     let ops = match parse_patch_ops(raw) {
-        Err(error) => return Some(format!("Invalid patch: {error}\n\n{raw}")),
+        Err(error) => return format!("Invalid patch: {error}\n\n{raw}"),
         Ok(ops) => ops,
     };
     let mut out = String::new();
@@ -45,5 +45,5 @@ pub fn summarize_patch_for_preview(raw: &str) -> Option<String> {
             }
         }
     }
-    Some(out)
+    out
 }
