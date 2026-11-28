@@ -156,10 +156,13 @@ impl Engine {
             let (weights, path) = (weights.clone(), path.clone());
             spawn_blocking(move || weights.open_session(path, capacity)).await?
         };
+        // The file name is a hash, and a collision or a stale file must cost a prefill, not a
+        // wrong prompt: a restored session is trusted only if it holds exactly this head.
         let opened = opened
             .inspect_err(|error| tracing::debug!("hub: no cached head: {error:#}"))
-            .ok();
-        if let Some(session) = reuse::adopt_head(opened, head) {
+            .ok()
+            .filter(|session| session.history() == head);
+        if let Some(session) = opened {
             let touched = heads::touch(&path);
             if let Err(error) = touched {
                 tracing::debug!("hub: cannot mark the head as used: {error:#}");
