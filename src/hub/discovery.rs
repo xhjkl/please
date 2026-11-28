@@ -18,10 +18,17 @@ pub fn weights_dir() -> PathBuf {
     super::directory().join("weights")
 }
 
-/// Reserve working-set headroom for context, scratch storage, and the rest of the system.
+/// Bytes a checkpoint's weights may take: four fifths of what Metal recommends as the working
+/// set and this process has not allocated yet. The rest is headroom for the context, scratch
+/// storage, and the rest of the system.
 pub fn memory_budget() -> Result<u64> {
-    let memory = super::intuition::available_memory_bytes()?;
-    Ok(memory.saturating_mul(4) / 5)
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+    let device = MTLCreateSystemDefaultDevice();
+    let device = device.ok_or_else(|| eyre::eyre!("no system Metal device found"))?;
+    let recommended = device.recommendedMaxWorkingSetSize();
+    let allocated = device.currentAllocatedSize();
+    let available = recommended.saturating_sub(allocated as u64);
+    Ok(available.saturating_mul(4) / 5)
 }
 
 /// Identify a checkpoint from its metadata without loading it onto Metal.
@@ -101,6 +108,7 @@ fn select_installed(directory: &Path, budget: u64) -> Result<Option<Checkpoint>>
     Ok(selection.map(|index| checkpoints.swap_remove(index)))
 }
 
+/// The checkpoint `PLEASE_MODEL` names, which overrides every choice among installed ones.
 fn explicit() -> Option<PathBuf> {
     let path = std::env::var_os("PLEASE_MODEL");
     path.map(PathBuf::from)
