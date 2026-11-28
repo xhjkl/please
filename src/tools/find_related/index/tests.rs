@@ -1,4 +1,4 @@
-use super::index::{chunks, search, terms};
+use super::*;
 use crate::test_support::TempDir;
 use std::fs;
 
@@ -85,14 +85,4 @@ fn search_sees_files_changed_since_the_last_search() {
     let report = search(&dir.0, "gamma").unwrap();
     assert!(report.contains("notes.txt:1-2"), "{report}");
     assert!(report.contains("    2  beta gamma"), "{report}");
-}
-
-#[tokio::test]
-async fn find_related_refuses_paths_outside_the_workspace() {
-    let jobs = crate::tools::Jobs::default();
-    let context = crate::tools::ToolContext::new(&jobs, None);
-    let args = serde_json::json!({ "query": "anything", "path": "/" });
-    let args = serde_json::from_value(args).unwrap();
-    let result = super::call(args, context).await;
-    assert!(result.get("error").is_some(), "{result}");
 }

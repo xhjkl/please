@@ -26,7 +26,7 @@ const SHOWN_LINES: usize = 6;
 const SHOWN_WIDTH: usize = 120;
 
 /// A run of whole lines with the terms in it and in its file's path.
-pub(super) struct Chunk {
+struct Chunk {
     /// One-based numbers of the first and last line.
     pub first: usize,
     pub last: usize,
@@ -171,7 +171,7 @@ fn read(path: &Path) -> Option<String> {
 }
 
 /// Cut a file into chunks of whole lines, skipping chunks with no visible text.
-pub(super) fn chunks(path: &str, text: &str) -> Vec<Chunk> {
+fn chunks(path: &str, text: &str) -> Vec<Chunk> {
     let lines: Vec<&str> = text.lines().collect();
     let path_terms = terms(path);
     let mut chunks = Vec::new();
@@ -213,7 +213,7 @@ pub(super) fn chunks(path: &str, text: &str) -> Vec<Chunk> {
 }
 
 /// Lowercased search terms: each identifier, plus its snake_case and camelCase parts.
-pub(super) fn terms(text: &str) -> Vec<String> {
+fn terms(text: &str) -> Vec<String> {
     let mut terms = Vec::new();
     for word in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
         let whole = word.trim_matches('_');
@@ -331,3 +331,6 @@ fn present(scope: &Path, hits: &[Hit], weights: &HashMap<String, f32>) -> String
     }
     report
 }
+
+#[cfg(test)]
+mod tests;
