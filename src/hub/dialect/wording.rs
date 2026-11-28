@@ -150,9 +150,8 @@ pub fn unparsed(error: &eyre::Report) -> String {
 fn pending(ids: &[u64]) -> String {
     let ids: Vec<_> = ids.iter().map(u64::to_string).collect();
     format!(
-        "Pending command_id values: {}. You can continue other work. Before answering, collect a final result for each with {} and action=\"wait\" or action=\"kill\".",
-        ids.join(", "),
-        crate::tools::CONTROL_COMMAND_NAME
+        "Pending command_id values: {}. You can continue other work. Before answering, collect a final result for each with control_command and action=\"wait\" or action=\"kill\".",
+        ids.join(", ")
     )
 }
 

@@ -104,9 +104,6 @@ pub fn kind_of(name: &str) -> ToolKind {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub const CONTROL_COMMAND_NAME: &str = command::CONTROL_NAME;
-
 /// Every tool the probe runs.
 pub fn all_tools() -> Tools {
     Tools::from([
