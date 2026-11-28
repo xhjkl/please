@@ -190,8 +190,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
         "run_command",
         json!({ "argv": ["sleep", "999"], "wait_seconds": 0 }),
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(start["status"], "running");
     let id = start["command_id"].as_u64().unwrap();
 

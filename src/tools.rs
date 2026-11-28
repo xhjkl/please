@@ -132,14 +132,9 @@ pub fn outcome(result: &str) -> Option<Value> {
 }
 
 /// Invoke a tool with services scoped to this tool call.
-pub async fn invoke(
-    tools: &Tools,
-    context: ToolContext<'_>,
-    name: &str,
-    args: Value,
-) -> Result<Value, String> {
+pub async fn invoke(tools: &Tools, context: ToolContext<'_>, name: &str, args: Value) -> Value {
     let Some(tool) = tools.get(name) else {
-        return Err("No such function".to_string());
+        return serde_json::json!({ "error": "No such function" });
     };
-    Ok((tool.handler)(args, context).await)
+    (tool.handler)(args, context).await
 }

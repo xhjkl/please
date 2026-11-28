@@ -270,14 +270,8 @@ async fn invoke_batch(
                         json!({ "error": "approval unavailable", "reason": reason })
                     }
                     Approval::Approved => {
-                        let result = crate::tools::invoke(
-                            tools,
-                            context,
-                            &call.name,
-                            call.arguments.clone(),
-                        )
-                        .await;
-                        result.unwrap_or_else(|error| json!({ "error": error }))
+                        let arguments = call.arguments.clone();
+                        crate::tools::invoke(tools, context, &call.name, arguments).await
                     }
                 }
             }),
