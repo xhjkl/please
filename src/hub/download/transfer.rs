@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 /// Resume a partial checkpoint and sync it only after the pinned size has been verified.
-pub fn fetch(url: &str, path: &Path, expected: u64) -> Result<()> {
+pub fn fetch_blocking(url: &str, path: &Path, expected: u64) -> Result<()> {
     let metadata = fs::metadata(path);
     let offset = match metadata {
         Err(error) if error.kind() == io::ErrorKind::NotFound => 0,

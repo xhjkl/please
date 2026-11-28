@@ -34,7 +34,7 @@ pub async fn run() -> Result<()> {
     let target = directory.join(FILENAME);
     let exists = target.try_exists()?;
     if exists {
-        verify_checkpoint(&target).await?;
+        verify(&target).await?;
         eprintln!("please load: using verified {}", target.display());
         return Ok(());
     }
@@ -46,21 +46,22 @@ pub async fn run() -> Result<()> {
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
     let partial = target.with_extension("gguf.part");
     eprintln!("please load: downloading {FILENAME} ({BYTES} bytes)");
-    download_one(URL, &partial, BYTES).await?;
-    verify_checkpoint(&partial).await?;
+    fetch(URL, &partial, BYTES).await?;
+    verify(&partial).await?;
     std::fs::rename(&partial, &target)?;
     eprintln!("please load: ready: {}", target.display());
     Ok(())
 }
 
-async fn verify_checkpoint(path: &Path) -> Result<()> {
+/// Check that the file at `path` is the pinned checkpoint whole.
+async fn verify(path: &Path) -> Result<()> {
     eprintln!("please load: verifying SHA-256 of {}", path.display());
     let path = path.to_owned();
-    tokio::task::spawn_blocking(move || verify(&path, BYTES, SHA256)).await?
+    tokio::task::spawn_blocking(move || verify_blocking(&path, BYTES, SHA256)).await?
 }
 
-/// Hash a completed file with bounded memory.
-fn verify(path: &Path, bytes: u64, expected: &str) -> Result<()> {
+/// Check a completed file's size and SHA-256, hashing it with bounded memory.
+fn verify_blocking(path: &Path, bytes: u64, expected: &str) -> Result<()> {
     let mut file = std::fs::File::open(path)
         .wrap_err_with(|| format!("cannot open checkpoint {}", path.display()))?;
     let metadata = file.metadata()?;
@@ -93,10 +94,11 @@ fn verify(path: &Path, bytes: u64, expected: &str) -> Result<()> {
     Ok(())
 }
 
-async fn download_one(url: &str, path: &Path, expected: u64) -> Result<()> {
+/// Download what `path` still lacks of the `expected` bytes at `url`.
+async fn fetch(url: &str, path: &Path, expected: u64) -> Result<()> {
     let url = url.to_owned();
     let path = path.to_owned();
-    tokio::task::spawn_blocking(move || transfer::fetch(&url, &path, expected)).await?
+    tokio::task::spawn_blocking(move || transfer::fetch_blocking(&url, &path, expected)).await?
 }
 
 #[cfg(test)]
@@ -109,9 +111,9 @@ mod tests {
         let path = directory.0.join("checkpoint.gguf.part");
         let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         std::fs::write(&path, b"abc")?;
-        verify(&path, 3, hash)?;
+        verify_blocking(&path, 3, hash)?;
         std::fs::write(&path, b"abb")?;
-        let result = verify(&path, 3, hash);
+        let result = verify_blocking(&path, 3, hash);
         assert!(result.unwrap_err().to_string().contains("has SHA-256"));
         Ok(())
     }
@@ -144,14 +146,14 @@ mod tests {
         ] {
             std::fs::write(&path, b"abc")?;
             let (url, task) = server(response.to_string()).await?;
-            download_one(&url, &path, 6).await?;
+            fetch(&url, &path, 6).await?;
             let request = task.await?;
             assert!(request.to_lowercase().contains("range: bytes=3-"));
             let bytes = std::fs::read(&path)?;
             assert_eq!(bytes, b"abcdef");
         }
         // A complete partial file needs no network request before structural validation.
-        download_one("http://127.0.0.1:1/unreachable", &path, 6).await?;
+        fetch("http://127.0.0.1:1/unreachable", &path, 6).await?;
         Ok(())
     }
 
@@ -174,7 +176,7 @@ mod tests {
             "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nskip",
         )).await?;
 
-        download_one(&url, &path, 6).await?;
+        fetch(&url, &path, 6).await?;
 
         for request in [redirect_request.await?, final_request.await?] {
             assert!(request.to_lowercase().contains("range: bytes=3-"));
@@ -195,7 +197,7 @@ mod tests {
         ] {
             std::fs::write(&path, b"abc")?;
             let (url, task) = server(response.to_string()).await?;
-            let result = download_one(&url, &path, 6).await;
+            let result = fetch(&url, &path, 6).await;
             assert!(result.is_err());
             task.await?;
             let bytes = std::fs::read(&path)?;
