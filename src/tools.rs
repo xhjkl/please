@@ -68,6 +68,7 @@ impl<'turn> ToolContext<'turn> {
     }
 }
 
+/// What the probe tells apart about a tool to approve its calls and show their output.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum ToolKind {
     RunCommand,
@@ -77,10 +78,13 @@ pub enum ToolKind {
 }
 
 impl ToolKind {
+    /// Whether the tool's result carries a command's output streams.
     pub fn has_command_output(self) -> bool {
         matches!(self, Self::RunCommand | Self::ControlCommand)
     }
 
+    /// Whether a call with `args` starts a command: one without an argv fails before anything
+    /// runs.
     pub fn starts_command(self, args: &Value) -> bool {
         matches!(self, Self::RunCommand)
             && args
@@ -90,6 +94,7 @@ impl ToolKind {
     }
 }
 
+/// Tell a tool's kind by its name; a tool that needs no handling of its own is `Other`.
 pub fn kind_of(name: &str) -> ToolKind {
     match name {
         command::RUN_NAME => ToolKind::RunCommand,

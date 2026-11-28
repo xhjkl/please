@@ -251,6 +251,8 @@ async fn execute_calls(
     answers
 }
 
+/// Invoke the batch's approved calls together; a call that was not approved is answered with
+/// why. Results come in the calls' order.
 async fn invoke_batch(
     calls: &[ParsedCall],
     approvals: Vec<Approval>,
@@ -279,23 +281,21 @@ async fn invoke_batch(
     .await
 }
 
+/// Ask the user before a call that changes their machine: a command to start, or a patch,
+/// previewed in full. Any other call is approved as it is.
 async fn approve_call(display: &Display, call: &ParsedCall) -> Approval {
     let kind = kind_of(&call.name);
-    match kind {
-        ToolKind::RunCommand if kind.starts_command(&call.arguments) => {
-            display.confirm(&call.name, "").await
-        }
-        ToolKind::ApplyPatch => {
-            let preview = call
-                .arguments
-                .get("patch")
-                .and_then(Value::as_str)
-                .and_then(summarize_patch_for_preview)
-                .unwrap_or_default();
-            display.confirm(&call.name, &preview).await
-        }
-        _ => Approval::Approved,
+    if kind.starts_command(&call.arguments) {
+        return display.confirm(&call.name, "").await;
     }
+    if kind != ToolKind::ApplyPatch {
+        return Approval::Approved;
+    }
+    let patch = call.arguments.get("patch").and_then(Value::as_str);
+    let preview = patch.and_then(summarize_patch_for_preview);
+    display
+        .confirm(&call.name, &preview.unwrap_or_default())
+        .await
 }
 
 /// Run one turn, from a request to its answer. SIGINT cancels all of it: approval, reconnects,
