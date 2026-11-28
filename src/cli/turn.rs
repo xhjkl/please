@@ -135,7 +135,7 @@ async fn attempt_turn(
                         _ => malformed.push((id, name)),
                     }
                 }
-                Frame::Stop => {
+                Frame::EndOfReply => {
                     *reconnect_attempts = 0;
                     break;
                 }
@@ -376,7 +376,7 @@ pub async fn restart(
                     continue;
                 }
                 Frame::Restarted(restarted) => restarted,
-                Frame::Stop => break,
+                Frame::EndOfReply => break,
                 Frame::Error(error) => return Err(eyre!(error)),
                 frame => return Err(eyre!("unexpected hub frame: {frame:?}")),
             };

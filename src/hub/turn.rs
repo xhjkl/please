@@ -120,7 +120,7 @@ pub async fn advance(
             Ok(calls) => calls,
         };
         if calls.is_empty() && pending {
-            return write_frame(sink, &Frame::Stop).await;
+            return write_frame(sink, &Frame::EndOfReply).await;
         }
         // The hub answers its own calls, and refuses one that would only feed a loop.
         let refused = |call: &FunctionCall| repeats(&history, call);
@@ -155,7 +155,7 @@ pub async fn advance(
             for call in sent {
                 write_frame(sink, &Frame::Call(call)).await?;
             }
-            return write_frame(sink, &Frame::Stop).await;
+            return write_frame(sink, &Frame::EndOfReply).await;
         }
     }
     Err(eyre!(
@@ -185,7 +185,7 @@ pub async fn restart(
         Restarted::Cleared
     };
     write_frame(sink, &Frame::Restarted(restarted)).await?;
-    write_frame(sink, &Frame::Stop).await
+    write_frame(sink, &Frame::EndOfReply).await
 }
 
 /// Hold the room for this hub, waiting for another hub to finish with it.

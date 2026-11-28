@@ -69,12 +69,12 @@ async fn established_connection_survives_long_tool_waits() {
         let mut store = Vec::new();
         let request = read_request(&mut server, &mut store).await.unwrap();
         assert!(matches!(request, Frame::Advance { .. }));
-        write_frame(&mut server, &Frame::Stop).await.unwrap();
+        write_frame(&mut server, &Frame::EndOfReply).await.unwrap();
 
         for _ in 0..8 {
             let request = wait_for_request(&mut server, &mut store).await.unwrap();
             assert!(matches!(request, Frame::Advance { .. }));
-            write_frame(&mut server, &Frame::Stop).await.unwrap();
+            write_frame(&mut server, &Frame::EndOfReply).await.unwrap();
         }
     });
 
@@ -82,12 +82,12 @@ async fn established_connection_survives_long_tool_waits() {
     let mut store = Vec::new();
     write_frame(&mut client, &request).await.unwrap();
     let reply = read_frame(&mut client, &mut store, None).await.unwrap();
-    assert!(matches!(reply, Frame::Stop));
+    assert!(matches!(reply, Frame::EndOfReply));
     for _ in 0..8 {
         tokio::time::sleep(Duration::from_secs(40)).await;
         write_frame(&mut client, &request).await.unwrap();
         let reply = read_frame(&mut client, &mut store, None).await.unwrap();
-        assert!(matches!(reply, Frame::Stop));
+        assert!(matches!(reply, Frame::EndOfReply));
     }
     reader.await.unwrap();
 }

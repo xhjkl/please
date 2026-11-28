@@ -149,7 +149,8 @@ pub enum Frame {
     Thinking(String),
     /// A call for the probe to answer with a result under the same ID.
     Call(ToolCall),
-    Stop,
+    /// The hub's reply to an advance or a restart is complete.
+    EndOfReply,
     CheckpointRequest,
     /// The checkpoint the hub has loaded.
     Checkpoint {

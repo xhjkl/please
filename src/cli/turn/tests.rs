@@ -52,7 +52,7 @@ async fn completed_step_resets_budget_before_later_disconnect() {
         )
         .await
         .unwrap();
-        write_frame(&mut server, &Frame::Stop).await.unwrap();
+        write_frame(&mut server, &Frame::EndOfReply).await.unwrap();
 
         // The hub keeps the conversation, so the probe sends only the new result.
         let messages = next_delivery(&mut server, &mut store).await.unwrap();
@@ -107,7 +107,7 @@ async fn results_answer_their_calls_by_id_in_call_order() {
             });
             write_frame(&mut server, &call).await.unwrap();
         }
-        write_frame(&mut server, &Frame::Stop).await.unwrap();
+        write_frame(&mut server, &Frame::EndOfReply).await.unwrap();
         // The refused call's result still follows the one before it.
         let messages = next_delivery(&mut server, &mut store).await.unwrap();
         let answered: Vec<_> = messages
@@ -218,7 +218,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
             }),
         )
         .await?;
-        write_frame(&mut server, &Frame::Stop).await?;
+        write_frame(&mut server, &Frame::EndOfReply).await?;
 
         let messages = next_delivery(&mut server, &mut store).await?;
         assert!(result_of(&messages, "list_files").unwrap().is_array());
@@ -227,7 +227,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
             Some(&Message::Note(Note::Pending(vec![id])))
         );
         write_frame(&mut server, &Frame::Answer("too early".into())).await?;
-        write_frame(&mut server, &Frame::Stop).await?;
+        write_frame(&mut server, &Frame::EndOfReply).await?;
 
         // An answer while the command runs is set aside, and the hub hears why.
         let messages = next_delivery(&mut server, &mut store).await?;
@@ -241,7 +241,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
             }),
         )
         .await?;
-        write_frame(&mut server, &Frame::Stop).await?;
+        write_frame(&mut server, &Frame::EndOfReply).await?;
 
         let messages = next_delivery(&mut server, &mut store).await?;
         let killed = result_of(&messages, "control_command").unwrap();
@@ -252,7 +252,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
                 .any(|message| matches!(message, Message::Note(_)))
         );
         write_frame(&mut server, &Frame::Answer("settled".into())).await?;
-        write_frame(&mut server, &Frame::Stop).await
+        write_frame(&mut server, &Frame::EndOfReply).await
     });
 
     let (place, setting) = (some_place(), some_setting());
