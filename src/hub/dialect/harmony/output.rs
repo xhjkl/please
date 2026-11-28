@@ -6,21 +6,21 @@
 //! Only invalid UTF-8 is treated differently, by the checkpoint's decoder: it is replaced in
 //! headers instead of failing them, bytes after a replacement show at once instead of one
 //! token later, and an unfinished character before a marker stays unshown in its message.
-use super::super::conversation::{Delta, FunctionCall};
 use super::super::piece::special;
+use super::super::prompt::{Delta, FunctionCall};
 use super::{CALL, CHANNEL, CONSTRAIN, END, MESSAGE, RETURN, START};
 use eyre::{Result, bail, eyre};
 use oco::Tokenizer;
 
 /// Token-level front end: recognises control tokens by ID and decodes the rest.
-pub struct OutputParser<'a> {
+pub struct Parser<'a> {
     tokenizer: &'a Tokenizer,
     decoder: oco::Decoder<'a>,
     markers: Vec<(u32, Marker)>,
-    stream: OutputStream,
+    stream: Stream,
 }
 
-impl<'a> OutputParser<'a> {
+impl<'a> Parser<'a> {
     /// Resolve every marker up front, so a checkpoint without one fails before generating
     /// rather than streaming its markers as text.
     pub fn new(tokenizer: &'a Tokenizer) -> Result<Self> {
@@ -33,7 +33,7 @@ impl<'a> OutputParser<'a> {
             tokenizer,
             decoder: tokenizer.decoder(),
             markers,
-            stream: OutputStream::new(start),
+            stream: Stream::new(start),
         })
     }
 
@@ -45,7 +45,7 @@ impl<'a> OutputParser<'a> {
     }
 }
 
-impl super::DialectOutputParser for OutputParser<'_> {
+impl super::OutputParser for Parser<'_> {
     fn push_token(&mut self, token: u32) -> Result<Vec<Delta>> {
         let marker = self.markers.iter().find(|(id, _)| *id == token);
         if let Some(&(_, marker)) = marker {
@@ -143,7 +143,7 @@ struct Header {
 
 /// Tokenizer-free Harmony message state machine.
 #[derive(Debug)]
-pub(super) struct OutputStream {
+pub(super) struct Stream {
     /// The `<|start|>` ID, named when anything else arrives between messages.
     start: u32,
     state: State,
@@ -155,7 +155,7 @@ pub(super) struct OutputStream {
     calls: Vec<(String, String)>,
 }
 
-impl OutputStream {
+impl Stream {
     /// Resume inside the assistant header that the prompt opened.
     pub(super) fn new(start: u32) -> Self {
         Self {

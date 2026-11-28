@@ -5,9 +5,9 @@
 //! Deliberate departures from the template: such literal markers are never promoted to
 //! control tokens; instructions that arrive mid-conversation become user messages instead of
 //! an error; and tool exchanges with no intervening assistant entry share one assistant step.
-use super::conversation::{ConversationMessage, FunctionCall, Rendered, split_preamble};
+use super::OutputParser;
 use super::piece::{Piece, encode_pieces, special};
-use super::{Adapter as DialectAdapter, OutputParser as DialectOutputParser};
+use super::prompt::{FunctionCall, PromptMessage, Rendered, split_preamble};
 use crate::protocol::Effort;
 use eyre::{Result, eyre};
 use oco::Tokenizer;
@@ -80,7 +80,7 @@ fn template_json(value: &Value) -> String {
 struct Prompt {
     pieces: Vec<Piece>,
     /// End of the invocation-independent head: whole pieces, then bytes of the next text.
-    preamble: (usize, usize),
+    head: (usize, usize),
 }
 
 impl Prompt {
@@ -112,7 +112,7 @@ impl Prompt {
 
     /// Mark the end of the static head; the next text starts the per-invocation facts.
     fn boundary(&mut self) {
-        self.preamble = match self.pieces.last() {
+        self.head = match self.pieces.last() {
             Some(Piece::Text(text)) => (self.pieces.len() - 1, text.len()),
             _ => (self.pieces.len(), 0),
         };
@@ -120,18 +120,18 @@ impl Prompt {
 
     fn encode(&self, tokenizer: &Tokenizer) -> Result<Rendered> {
         let tokens = encode_pieces(tokenizer, &self.pieces)?;
-        let (whole, bytes) = self.preamble;
+        let (whole, bytes) = self.head;
         let mut head = encode_pieces(tokenizer, &self.pieces[..whole])?;
         if let Some(Piece::Text(text)) = self.pieces.get(whole) {
             head.extend(tokenizer.encode(&text[..bytes])?);
         }
         // A BPE merge across the boundary would make the head a different prefix; cache nothing then.
-        let preamble = if tokens.starts_with(&head) {
+        let head = if tokens.starts_with(&head) {
             head.len()
         } else {
             0
         };
-        Ok(Rendered { tokens, preamble })
+        Ok(Rendered { tokens, head })
     }
 
     fn message(&mut self, role: &str, content: &str) {
@@ -153,7 +153,7 @@ impl Prompt {
             self.text("\n\n");
         }
         self.text("# Tools\n\nYou have access to the following functions:\n\n<tools>");
-        for schema in super::conversation::tool_schemas() {
+        for schema in super::prompt::tool_schemas() {
             self.text("\n");
             self.text(&template_json(&schema));
         }
@@ -228,8 +228,8 @@ impl Prompt {
 }
 
 /// Render neutral history into template pieces, ending with an open assistant turn in thinking.
-fn render(messages: &[ConversationMessage]) -> Result<Prompt> {
-    use ConversationMessage::*;
+fn render(messages: &[PromptMessage]) -> Result<Prompt> {
+    use PromptMessage::*;
     let mut prompt = Prompt::default();
     let (preamble, mut rest) = split_preamble(messages);
     if !messages.is_empty() {
@@ -302,39 +302,33 @@ fn render(messages: &[ConversationMessage]) -> Result<Prompt> {
 }
 
 /// Collect the tool results of one exchange in order.
-fn results(messages: &[ConversationMessage]) -> Vec<&str> {
+fn results(messages: &[PromptMessage]) -> Vec<&str> {
     messages
         .iter()
         .filter_map(|message| match message {
-            ConversationMessage::ToolResult { content, .. } => Some(content.as_str()),
+            PromptMessage::ToolResult { content, .. } => Some(content.as_str()),
             _ => None,
         })
         .collect()
 }
 
-/// Dense Qwen's chat template and native XML tool-call codec.
-pub struct Adapter;
+/// Encode worded messages as dense Qwen's chat template would.
+pub fn encode(tokenizer: &Tokenizer, messages: &[PromptMessage]) -> Result<Rendered> {
+    render(messages)?.encode(tokenizer)
+}
 
-impl DialectAdapter for Adapter {
-    fn encode(&self, tokenizer: &Tokenizer, messages: &[ConversationMessage]) -> Result<Rendered> {
-        render(messages)?.encode(tokenizer)
-    }
+/// Start decoding a response with its native XML tool calls.
+pub fn output_parser(tokenizer: &Tokenizer) -> Result<Box<dyn OutputParser + '_>> {
+    special(tokenizer, "<|im_end|>")?;
+    Ok(Box::new(output::Parser::new(tokenizer)?))
+}
 
-    fn output_parser<'a>(
-        &self,
-        tokenizer: &'a Tokenizer,
-    ) -> Result<Box<dyn DialectOutputParser + 'a>> {
-        special(tokenizer, "<|im_end|>")?;
-        Ok(Box::new(output::OutputParser::new(tokenizer)?))
-    }
-
-    /// Stop at the turn terminator or end of text, the checkpoint's generation stop set.
-    fn is_stop_token(&self, tokenizer: &Tokenizer, token: u32) -> bool {
-        ["<|im_end|>", "<|endoftext|>"]
-            .iter()
-            .any(|spelling| tokenizer.special_token(spelling) == Some(token))
-            || tokenizer.eos_token() == Some(token)
-    }
+/// Stop at the turn terminator or end of text, the checkpoint's generation stop set.
+pub fn is_stop_token(tokenizer: &Tokenizer, token: u32) -> bool {
+    ["<|im_end|>", "<|endoftext|>"]
+        .iter()
+        .any(|spelling| tokenizer.special_token(spelling) == Some(token))
+        || tokenizer.eos_token() == Some(token)
 }
 
 #[cfg(test)]

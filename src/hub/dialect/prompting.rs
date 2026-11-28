@@ -1,10 +1,10 @@
 //! What we tell the model, in every dialect: standing instructions, facts, notes, and the
 //! framing of piped data. Dialects only decide where each piece goes in their chat format.
-use super::conversation::ConversationMessage;
+use super::prompt::PromptMessage;
 use crate::protocol::{Note, Setting};
 
 /// The message that primes the assistant with its identity and capabilities.
-pub const SYSTEM_PREAMBLE: &str = r#"You are a terminal coding assistant.
+pub const ROLE: &str = r#"You are a terminal coding assistant.
 Follow the user's explicit instructions precisely and operate on their local environment when asked.
 Use tools to inspect and change the environment whenever the request depends on it; answer directly when it does not.
 
@@ -100,12 +100,12 @@ This is the exact patch text to pass as the `patch` string:
 
 /// Standing instructions first, then this invocation's facts; the instructions are the same
 /// for every invocation with this effort, so a hub can prefill them once and cache them.
-pub fn head(setting: &Setting) -> Vec<ConversationMessage> {
+pub fn preamble(setting: &Setting) -> Vec<PromptMessage> {
     vec![
-        ConversationMessage::Effort(setting.effort),
-        ConversationMessage::Instructions(SYSTEM_PREAMBLE.to_string()),
-        ConversationMessage::Instructions(TOOL_GUIDANCE.trim().to_string()),
-        ConversationMessage::Fact(format!("Current date: {}", setting.today)),
+        PromptMessage::Effort(setting.effort),
+        PromptMessage::Instructions(ROLE.to_string()),
+        PromptMessage::Instructions(TOOL_GUIDANCE.trim().to_string()),
+        PromptMessage::Fact(format!("Current date: {}", setting.today)),
     ]
 }
 

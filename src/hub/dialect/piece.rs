@@ -1,6 +1,6 @@
 //! Template output shared by the dialects, which insert control tokens by ID so their
 //! spellings inside user, stdin, or tool content stay ordinary text.
-use super::conversation::Rendered;
+use super::prompt::Rendered;
 use eyre::{Result, eyre};
 use oco::Tokenizer;
 
@@ -28,9 +28,9 @@ pub fn encode_pieces(tokenizer: &Tokenizer, pieces: &[Piece]) -> Result<Vec<u32>
 pub fn encode_prompt(tokenizer: &Tokenizer, pieces: &[Piece], head: usize) -> Result<Rendered> {
     let (head, tail) = pieces.split_at(head);
     let mut tokens = encode_pieces(tokenizer, head)?;
-    let preamble = tokens.len();
+    let head = tokens.len();
     tokens.extend(encode_pieces(tokenizer, tail)?);
-    Ok(Rendered { tokens, preamble })
+    Ok(Rendered { tokens, head })
 }
 
 /// Look up a control token a template needs, failing for checkpoints without it.

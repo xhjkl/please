@@ -3,24 +3,23 @@
 //! Structure comes only from the checkpoint's added tokens, which is how the model emits it
 //! under the template's own instructions; marker spellings the model writes out as ordinary
 //! text, for example when quoting documentation, stay content.
-use super::super::conversation::{Delta, FunctionCall};
+use super::super::OutputParser;
 use super::super::piece::special;
-use super::super::{Adapter as _, OutputParser as DialectOutputParser};
-use super::Adapter;
+use super::super::prompt::{Delta, FunctionCall};
 use crate::tools::{Param, ParamType};
 use eyre::{Result, eyre};
 use oco::Tokenizer;
 use serde_json::{Map, Value};
 
 /// Token-level front end: recognises stop and structure tokens by ID and decodes the rest.
-pub struct OutputParser<'a> {
+pub struct Parser<'a> {
     tokenizer: &'a Tokenizer,
     decoder: oco::Decoder<'a>,
     markers: [(u32, Event<'static>); 3],
-    stream: OutputStream,
+    stream: Stream,
 }
 
-impl<'a> OutputParser<'a> {
+impl<'a> Parser<'a> {
     pub fn new(tokenizer: &'a Tokenizer) -> Result<Self> {
         Ok(Self {
             tokenizer,
@@ -30,14 +29,14 @@ impl<'a> OutputParser<'a> {
                 (special(tokenizer, "<tool_call>")?, Event::CallStart),
                 (special(tokenizer, "</tool_call>")?, Event::CallEnd),
             ],
-            stream: OutputStream::default(),
+            stream: Stream::default(),
         })
     }
 }
 
-impl DialectOutputParser for OutputParser<'_> {
+impl OutputParser for Parser<'_> {
     fn push_token(&mut self, token: u32) -> Result<Vec<Delta>> {
-        let event = if Adapter.is_stop_token(self.tokenizer, token) {
+        let event = if super::is_stop_token(self.tokenizer, token) {
             Some(Event::End)
         } else {
             self.markers
@@ -75,7 +74,7 @@ pub(super) enum Event<'a> {
 /// Whitespace that the template puts around boundaries is structure, not content: it is
 /// dropped at the start of each section and held back until later text proves it inner.
 #[derive(Default)]
-pub(super) struct OutputStream {
+pub(super) struct Stream {
     answering: bool,
     /// Visible text has been emitted since the last boundary.
     inner: bool,
@@ -85,7 +84,7 @@ pub(super) struct OutputStream {
     calls: Vec<Result<FunctionCall>>,
 }
 
-impl OutputStream {
+impl Stream {
     pub(super) fn push(&mut self, event: Event) -> Vec<Delta> {
         let mut deltas = Vec::new();
         match event {
@@ -201,7 +200,7 @@ pub(super) fn parse_call(source: &str) -> Result<FunctionCall> {
     let (name, body) = source
         .split_once('>')
         .ok_or_else(|| eyre!("unterminated function name"))?;
-    let tools = crate::hub::dialect::conversation::tool_specs();
+    let tools = crate::hub::dialect::prompt::tool_specs();
     let (_, _, parameters) = tools
         .into_iter()
         .find(|(known, ..)| *known == name)

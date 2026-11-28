@@ -1,20 +1,21 @@
-//! Neutral conversation data shared by the hub-side adapters.
+//! The worded form of a prompt, between the protocol's neutral messages and a dialect's
+//! framing, with what every dialect needs to prepare it.
 use super::prompting;
 use crate::protocol::{Effort, Message, Note, Setting};
 use crate::tools::ParamType;
 use eyre::{Result, WrapErr};
 use serde_json::{Map, Value, json};
 
-/// A conversation with every message worded, ready for a dialect to frame.
+/// One message of a prompt, worded and ready for a dialect to frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConversationMessage {
+pub enum PromptMessage {
     /// Requested reasoning effort, stated wherever each dialect's chat template expects it.
     Effort(Effort),
     /// The harness's standing instructions, the same for every invocation.
     Instructions(String),
     /// A fact about this invocation (the date), placed after all standing text.
     Fact(String),
-    /// The harness's word in the middle of the conversation.
+    /// The harness's word in the middle of a turn.
     Note(String),
     User(String),
     Answer(String),
@@ -26,7 +27,8 @@ pub enum ConversationMessage {
     },
 }
 
-/// A dialect-neutral call, shared by decoded output and replayed tool history.
+/// A call as dialects read and write it, in decoded output and replayed history alike: a name
+/// and JSON arguments, with no ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionCall {
     pub name: String,
@@ -34,15 +36,11 @@ pub struct FunctionCall {
 }
 
 /// Split off the leading entries that dialects fold into their header.
-pub fn split_preamble(
-    messages: &[ConversationMessage],
-) -> (&[ConversationMessage], &[ConversationMessage]) {
+pub fn split_preamble(messages: &[PromptMessage]) -> (&[PromptMessage], &[PromptMessage]) {
     let preamble = messages.iter().take_while(|message| {
         matches!(
             message,
-            ConversationMessage::Effort(_)
-                | ConversationMessage::Instructions(_)
-                | ConversationMessage::Fact(_)
+            PromptMessage::Effort(_) | PromptMessage::Instructions(_) | PromptMessage::Fact(_)
         )
     });
     messages.split_at(preamble.count())
@@ -53,7 +51,7 @@ pub fn split_preamble(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
     pub tokens: Vec<u32>,
-    pub preamble: usize,
+    pub head: usize,
 }
 
 /// Newly visible generated text, by the section it belongs to.
@@ -138,21 +136,21 @@ fn trim_command_stream(result: &mut Value) -> usize {
 /// Give each tool exchange half the tail budget for command results, keeping the newest output.
 /// Trimming per exchange keeps earlier rendered steps reusable as a prefix.
 pub fn fit_command_results(
-    messages: &mut [ConversationMessage],
+    messages: &mut [PromptMessage],
     tail_budget: usize,
     count: impl Fn(&str) -> Result<usize>,
 ) -> Result<()> {
     let exchanges = messages.split_mut(|message| {
         !matches!(
             message,
-            ConversationMessage::ToolCall(_) | ConversationMessage::ToolResult { .. }
+            PromptMessage::ToolCall(_) | PromptMessage::ToolResult { .. }
         )
     });
     for exchange in exchanges {
         let contents: Vec<_> = exchange
             .iter_mut()
             .filter_map(|message| match message {
-                ConversationMessage::ToolResult { name, content }
+                PromptMessage::ToolResult { name, content }
                     if crate::tools::kind_of(name).has_command_output() =>
                 {
                     Some(content)
@@ -185,35 +183,35 @@ pub fn fit_command_results(
     Ok(())
 }
 
-/// Word the setting and the conversation: standing instructions first, then per-invocation
-/// facts, the conversation itself, and where the answer goes last, so a different redirect
+/// Word the setting and the history: standing instructions first, then per-invocation facts,
+/// the history itself, and where the answer goes last, so a different redirect leaves
 /// leaves everything before it reusable.
-pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<ConversationMessage>> {
-    let mut out = prompting::head(setting);
+pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<PromptMessage>> {
+    let mut out = prompting::preamble(setting);
     for message in history {
         let worded = match message {
-            Message::User(text) => ConversationMessage::User(text.clone()),
+            Message::User(text) => PromptMessage::User(text.clone()),
             Message::Input(data) => {
-                out.push(ConversationMessage::Note(prompting::INPUT.into()));
-                ConversationMessage::User(data.clone())
+                out.push(PromptMessage::Note(prompting::INPUT.into()));
+                PromptMessage::User(data.clone())
             }
             // The draft is the model's own message, and the chunk is material, not instructions.
             Message::Note(note @ Note::Summarize { draft, chunk }) => {
-                out.push(ConversationMessage::Note(prompting::note(note)));
+                out.push(PromptMessage::Note(prompting::note(note)));
                 if let Some(draft) = draft {
-                    out.push(ConversationMessage::Answer(draft.clone()));
+                    out.push(PromptMessage::Answer(draft.clone()));
                 }
-                ConversationMessage::User(chunk.clone())
+                PromptMessage::User(chunk.clone())
             }
-            Message::Note(note) => ConversationMessage::Note(prompting::note(note)),
-            Message::Thinking(text) => ConversationMessage::Thinking(text.clone()),
-            Message::Answer(text) => ConversationMessage::Answer(text.clone()),
-            Message::Call(call) => ConversationMessage::ToolCall(FunctionCall {
+            Message::Note(note) => PromptMessage::Note(prompting::note(note)),
+            Message::Thinking(text) => PromptMessage::Thinking(text.clone()),
+            Message::Answer(text) => PromptMessage::Answer(text.clone()),
+            Message::Call(call) => PromptMessage::ToolCall(FunctionCall {
                 name: call.name.clone(),
                 arguments: serde_json::from_str(&call.arguments)
                     .wrap_err_with(|| format!("tool call {} has invalid arguments", call.name))?,
             }),
-            Message::Result(result) => ConversationMessage::ToolResult {
+            Message::Result(result) => PromptMessage::ToolResult {
                 name: result.name.clone(),
                 content: result.content.clone(),
             },
@@ -221,7 +219,7 @@ pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<Conversatio
         out.push(worded);
     }
     if let Some(target) = &setting.redirection {
-        out.push(ConversationMessage::Note(prompting::redirection(target)));
+        out.push(PromptMessage::Note(prompting::redirection(target)));
     }
     Ok(out)
 }

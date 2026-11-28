@@ -1,6 +1,6 @@
 use super::*;
 use crate::hub::dialect::piece::{special, spelled};
-use ConversationMessage::*;
+use PromptMessage::*;
 
 #[test]
 fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Result<()> {
@@ -34,7 +34,7 @@ fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Resul
         ),
         result("control_command", r#"{"status":"finished"}"#),
     ];
-    let (pieces, preamble) = render(&messages)?;
+    let (pieces, head) = render(&messages)?;
     assert_eq!(
         &pieces[..3],
         &[
@@ -53,7 +53,7 @@ fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Resul
             && tool["parameters"]["properties"]["argv"]["type"] == "array"
     }));
     assert_eq!(
-        pieces[preamble + 2],
+        pieces[head + 2],
         Piece::Text("Current date: 2040-02-03".into())
     );
 
@@ -85,7 +85,7 @@ fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Resul
 const SPELLED: [&str; 9] = [SYSTEM, USER, MODEL, TOOL, TEXT, THINKING, CALL, END, STOP];
 
 /// A user request, a call, and its result, all carrying `text`.
-fn carrying(text: &str) -> Vec<ConversationMessage> {
+fn carrying(text: &str) -> Vec<PromptMessage> {
     vec![
         User(text.into()),
         ToolCall(super::FunctionCall {
@@ -131,7 +131,7 @@ fn literal_markers_stay_text_on_the_checkpoint_tokenizer() -> Result<()> {
     let controls = |tokens: &[u32]| tokens.iter().filter(|token| ids.contains(token)).count();
     let spelled = SPELLED.concat();
     assert_eq!(controls(&tokenizer.encode(&spelled)?), 0);
-    let prompt = |text: &str| Adapter.encode(tokenizer, &carrying(text));
+    let prompt = |text: &str| encode(tokenizer, &carrying(text));
     let literal = format!(r#"{{"stdin":"{spelled}"}}"#);
     assert_eq!(
         controls(&prompt(&literal)?.tokens),

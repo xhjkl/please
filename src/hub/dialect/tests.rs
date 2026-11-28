@@ -1,7 +1,7 @@
 use super::*;
 use crate::protocol::{Effort, Frame, Message, Note, Place, Setting, ToolCall, ToolResult};
-use conversation::{ConversationMessage, prepare};
 use eyre::Result;
+use prompt::{PromptMessage, prepare};
 use serde_json::json;
 
 fn some_setting() -> Setting {
@@ -12,8 +12,8 @@ fn some_setting() -> Setting {
     }
 }
 
-/// The head `prepare` puts before any conversation: effort, instructions, and the date.
-const HEAD: usize = 4;
+/// The preamble `prepare` puts before any history: effort, instructions, and the date.
+const PREAMBLE: usize = 4;
 
 fn call(name: &str, arguments: serde_json::Value) -> Message {
     Message::Call(ToolCall {
@@ -53,40 +53,40 @@ fn the_hub_words_the_setting_and_keeps_content_literal() -> Result<()> {
         unreachable!()
     };
     let prepared = prepare(&setting, &messages)?;
-    assert_eq!(prepared[0], ConversationMessage::Effort(Effort::High));
-    let ConversationMessage::Instructions(system) = &prepared[1] else {
+    assert_eq!(prepared[0], PromptMessage::Effort(Effort::High));
+    let PromptMessage::Instructions(system) = &prepared[1] else {
         panic!("instructions open the conversation")
     };
     assert!(!system.contains('¶'));
     // Everything that varies between invocations follows the standing instructions.
     let first_fact = prepared
         .iter()
-        .position(|message| matches!(message, ConversationMessage::Fact(_)))
+        .position(|message| matches!(message, PromptMessage::Fact(_)))
         .unwrap();
     assert!(prepared[..first_fact].iter().all(|message| matches!(
         message,
-        ConversationMessage::Effort(_) | ConversationMessage::Instructions(_)
+        PromptMessage::Effort(_) | PromptMessage::Instructions(_)
     )));
     assert_eq!(
         prepared[first_fact],
-        ConversationMessage::Fact("Current date: 2040-02-03".into())
+        PromptMessage::Fact("Current date: 2040-02-03".into())
     );
     // Piped stdin is user data in a message of its own, announced, and never instructions.
     assert_eq!(
-        prepared[HEAD],
-        ConversationMessage::Note(prompting::INPUT.into())
+        prepared[PREAMBLE],
+        PromptMessage::Note(prompting::INPUT.into())
     );
     assert_eq!(
-        prepared[HEAD + 1],
-        ConversationMessage::User("literal ¶today and ¶reasoning".into())
+        prepared[PREAMBLE + 1],
+        PromptMessage::User("literal ¶today and ¶reasoning".into())
     );
     assert_eq!(
-        prepared[HEAD + 2],
-        ConversationMessage::User("Keep ¶today, <|start|>, and <tool_call> literal.".into())
+        prepared[PREAMBLE + 2],
+        PromptMessage::User("Keep ¶today, <|start|>, and <tool_call> literal.".into())
     );
     // Where the answer goes comes last, so another redirect keeps everything before it.
     assert!(
-        matches!(prepared.last(), Some(ConversationMessage::Note(text)) if text.contains("notes-¶today.txt"))
+        matches!(prepared.last(), Some(PromptMessage::Note(text)) if text.contains("notes-¶today.txt"))
     );
     Ok(())
 }
@@ -111,13 +111,13 @@ fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
         ],
     )?;
     assert_eq!(
-        messages[HEAD..],
+        messages[PREAMBLE..],
         [
-            ConversationMessage::ToolCall(FunctionCall {
+            PromptMessage::ToolCall(FunctionCall {
                 name: "read_file".into(),
                 arguments
             }),
-            ConversationMessage::ToolResult {
+            PromptMessage::ToolResult {
                 name: "read_file".into(),
                 content: text.into()
             },
@@ -145,12 +145,12 @@ fn notes_are_worded_by_the_hub() -> Result<()> {
         ],
     )?;
     let [
-        ConversationMessage::Note(pending),
-        ConversationMessage::Note(aside),
-        ConversationMessage::Note(restart),
-        ConversationMessage::Answer(draft),
-        ConversationMessage::User(transcript),
-    ] = &messages[HEAD..]
+        PromptMessage::Note(pending),
+        PromptMessage::Note(aside),
+        PromptMessage::Note(restart),
+        PromptMessage::Answer(draft),
+        PromptMessage::User(transcript),
+    ] = &messages[PREAMBLE..]
     else {
         panic!("notes stay notes: {messages:?}");
     };
@@ -186,11 +186,11 @@ fn parallel_command_results_share_the_available_context() -> Result<()> {
     }
 
     let mut messages = prepare(&some_setting(), &history)?;
-    conversation::fit_command_results(&mut messages, 1024, |content| Ok(content.len()))?;
+    prompt::fit_command_results(&mut messages, 1024, |content| Ok(content.len()))?;
 
     let mut size = 0;
     for message in messages {
-        if let ConversationMessage::ToolResult { content, .. } = message {
+        if let PromptMessage::ToolResult { content, .. } = message {
             size += content.len();
             let result: serde_json::Value = serde_json::from_str(&content)?;
             let id = result["command_id"].as_u64().unwrap();
@@ -224,12 +224,12 @@ fn a_following_tool_only_step_keeps_earlier_output_budget() -> Result<()> {
     ];
     history.extend(command(1));
     let mut before = prepare(&setting, &history)?;
-    conversation::fit_command_results(&mut before, 1024, |content| Ok(content.len()))?;
+    prompt::fit_command_results(&mut before, 1024, |content| Ok(content.len()))?;
 
     history.push(Message::Thinking(String::new()));
     history.extend(command(2));
     let mut after = prepare(&setting, &history)?;
-    conversation::fit_command_results(&mut after, 1024, |content| Ok(content.len()))?;
+    prompt::fit_command_results(&mut after, 1024, |content| Ok(content.len()))?;
 
     assert_eq!(&after[..before.len()], before);
     Ok(())

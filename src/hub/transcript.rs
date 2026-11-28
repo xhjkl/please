@@ -1,6 +1,6 @@
 //! Reading a conversation's transcript back: abbreviated for condensing, listed and quoted for
 //! the recall tool, which the hub runs itself.
-use super::chats::{Chat, Entry};
+use super::rooms::{Entry, Room};
 use crate::protocol::{Message, ToolCall, ToolResult};
 use crate::tools::{Param, ParamType};
 use serde_json::{Value, json};
@@ -38,7 +38,7 @@ const SHOWN_ARGUMENTS: usize = 400;
 
 /// Answer a recall call: the list of entries, or one entry in full, a page at a time.
 /// Pages hold at most `page` characters.
-pub fn recall(chat: &Chat, arguments: &Value, page: usize) -> Value {
+pub fn recall(room: &Room, arguments: &Value, page: usize) -> Value {
     let entry = match arguments.get("entry") {
         None | Some(Value::Null) => None,
         Some(Value::String(name)) => Some(name.clone()),
@@ -47,8 +47,8 @@ pub fn recall(chat: &Chat, arguments: &Value, page: usize) -> Value {
     };
     let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let read = match entry {
-        None => chat.entries().map(|entries| index(&entries)),
-        Some(name) => chat.read(&name),
+        None => room.entries().map(|entries| index(&entries)),
+        Some(name) => room.read(&name),
     };
     let text = match read {
         Err(error) => return json!({ "error": format!("{error:#}") }),
@@ -73,11 +73,7 @@ fn index(entries: &[Entry]) -> String {
                 .lines()
                 .find(|line| !line.trim().is_empty())
                 .unwrap_or("");
-            let restarted = if entry.backup {
-                " (before a restart)"
-            } else {
-                ""
-            };
+            let restarted = if entry.old { " (before a restart)" } else { "" };
             format!(
                 "{} {kind}, {} characters{restarted}: {}",
                 entry.number,
@@ -94,7 +90,7 @@ fn index(entries: &[Entry]) -> String {
 pub fn chunks(entries: &[Entry], budget: usize) -> Vec<String> {
     let longest = budget / 2;
     let mut chunks: Vec<String> = Vec::new();
-    for (index, entry) in entries.iter().filter(|entry| !entry.backup).enumerate() {
+    for (index, entry) in entries.iter().filter(|entry| !entry.old).enumerate() {
         // A conversation that restarted before opens with the message it restarted from.
         // Numbering goes on across restarts, so its number tells even once `old` is erased.
         let previous =
@@ -177,7 +173,7 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    fn some_conversation() -> Vec<Message> {
+    fn some_messages() -> Vec<Message> {
         vec![
             Message::User("find me a gc implementation in this codebase".into()),
             Message::Thinking("x".repeat(2000)),
@@ -198,9 +194,9 @@ mod tests {
     #[test]
     fn chunks_abbreviate_bulk_and_keep_requests_whole() -> Result<(), eyre::Report> {
         let dir = TempDir::new()?;
-        let chat = Chat::at(dir.0.join("chat"))?;
-        chat.append(&some_conversation())?;
-        let all = chunks(&chat.entries()?, 1 << 20);
+        let room = Room::at(dir.0.join("room"))?;
+        room.append(&some_messages())?;
+        let all = chunks(&room.entries()?, 1 << 20);
         assert_eq!(all.len(), 1);
         let text = &all[0];
         assert!(text.starts_with("[1] user\nfind me a gc implementation in this codebase"));
@@ -210,7 +206,7 @@ mod tests {
         assert!(text.contains("[4] result of list_files, abbreviated"));
         assert!(text.ends_with("[5] answer\nNothing in ./core."));
         // A small budget splits between entries, never inside one.
-        let small = chunks(&chat.entries()?, 900);
+        let small = chunks(&room.entries()?, 900);
         assert!(small.len() > 1 && small.iter().all(|chunk| chunk.starts_with('[')));
         Ok(())
     }
@@ -218,15 +214,15 @@ mod tests {
     #[test]
     fn the_message_restarted_from_is_named_even_once_old_is_erased() -> Result<(), eyre::Report> {
         let dir = TempDir::new()?;
-        let chat = Chat::at(dir.0.join("chat"))?;
-        chat.append(&some_conversation())?;
-        chat.restart(&[Message::Answer("You asked me to find a GC.".into())])?;
-        chat.append(&[Message::User("look in ./gc".into())])?;
+        let room = Room::at(dir.0.join("room"))?;
+        room.append(&some_messages())?;
+        room.restart(&[Message::Answer("You asked me to find a GC.".into())])?;
+        room.append(&[Message::User("look in ./gc".into())])?;
         let restarted_from = "[6] the message the conversation last restarted from\n";
-        let kept = chunks(&chat.entries()?, 1 << 20);
+        let kept = chunks(&room.entries()?, 1 << 20);
         assert!(kept[0].starts_with(restarted_from));
-        std::fs::remove_dir_all(chat.dir().join("old"))?;
-        let erased = chunks(&chat.entries()?, 1 << 20);
+        std::fs::remove_dir_all(room.dir().join("old"))?;
+        let erased = chunks(&room.entries()?, 1 << 20);
         assert_eq!(erased, kept);
         Ok(())
     }
@@ -234,27 +230,27 @@ mod tests {
     #[test]
     fn recall_lists_entries_and_reads_them_across_restarts() -> Result<(), eyre::Report> {
         let dir = TempDir::new()?;
-        let chat = Chat::at(dir.0.join("chat"))?;
-        chat.append(&some_conversation())?;
-        chat.restart(&[Message::Answer("You asked me to find a GC.".into())])?;
-        let list = recall(&chat, &json!({}), RECALLED);
+        let room = Room::at(dir.0.join("room"))?;
+        room.append(&some_messages())?;
+        room.restart(&[Message::Answer("You asked me to find a GC.".into())])?;
+        let list = recall(&room, &json!({}), RECALLED);
         let list = list.as_str().unwrap();
         assert!(list.starts_with("1 user, 44 characters (before a restart): find me a gc"));
         assert!(list.ends_with("6 answer, 26 characters: You asked me to find a GC."));
         // A long entry comes back whole, a page at a time.
-        let page = recall(&chat, &json!({"entry": 4, "offset": 10}), RECALLED);
+        let page = recall(&room, &json!({"entry": 4, "offset": 10}), RECALLED);
         let length = "result list_files 3\n\n".len() + "alloc.rs\n".len() * 400;
         assert_eq!(page["from"].as_u64(), Some(10));
         assert_eq!(page["length"].as_u64(), Some(length as u64));
-        let first = recall(&chat, &json!({"entry": 1}), RECALLED);
+        let first = recall(&room, &json!({"entry": 1}), RECALLED);
         assert_eq!(
             first,
             "user\n\nfind me a gc implementation in this codebase"
         );
-        let missing = recall(&chat, &json!({"entry": "99"}), RECALLED);
+        let missing = recall(&room, &json!({"entry": "99"}), RECALLED);
         assert!(missing["error"].as_str().is_some());
         // The next condensing reads the restart message as such, not as an ordinary answer.
-        let next = chunks(&chat.entries()?, 1 << 20);
+        let next = chunks(&room.entries()?, 1 << 20);
         assert_eq!(
             next,
             ["[6] the message the conversation last restarted from\nYou asked me to find a GC."]

@@ -55,12 +55,12 @@ pub(super) async fn measure(
     messages: Vec<Message>,
     max_tokens: usize,
 ) -> Result<String> {
-    let connection = hub.connect();
-    let first = exchange(&hub, connection, &setting, messages.clone(), max_tokens).await?;
+    let owner = hub.new_owner();
+    let first = exchange(&hub, owner, &setting, messages.clone(), max_tokens).await?;
     let mut follow_up = messages;
     let next = follow_up.len() as u64 + 1;
     follow_up.extend(first.reply(next));
-    let second = exchange(&hub, connection, &setting, follow_up, max_tokens).await?;
+    let second = exchange(&hub, owner, &setting, follow_up, max_tokens).await?;
     let report = serde_json::json!({
         "model": hub.path, "load_seconds": hub.load_seconds,
         "first": first.report()?, "follow_up": second.report()?,
@@ -70,7 +70,7 @@ pub(super) async fn measure(
 
 /// One measured request and what it generated.
 struct Exchange {
-    turn: inference::Turn,
+    generation: inference::Generation,
     tokens: Vec<u32>,
     times: Vec<f64>,
     first_visible: Option<f64>,
@@ -79,11 +79,11 @@ struct Exchange {
     calls: Result<Vec<super::dialect::FunctionCall>>,
 }
 
-/// Send one request on the case's connection and record each token's arrival, as the probe
+/// Generate one reply to the case's history and record each token's arrival, as the probe
 /// would see it, without the socket in between.
 async fn exchange(
     hub: &Arc<Engine>,
-    connection: u64,
+    owner: u64,
     setting: &Setting,
     messages: Vec<Message>,
     max_tokens: usize,
@@ -99,17 +99,9 @@ async fn exchange(
     let setting = setting.clone();
     let started = Instant::now();
     let task = tokio::spawn(async move {
-        inference::generate(
-            &worker,
-            connection,
-            &setting,
-            &messages,
-            tx,
-            Some(max_tokens),
-        )
-        .await
+        inference::generate(&worker, owner, &setting, &messages, tx, Some(max_tokens)).await
     });
-    while let Some(inference::Generated::Token(token)) = rx.recv().await {
+    while let Some(token) = rx.recv().await {
         let elapsed = started.elapsed().as_secs_f64();
         times.push(elapsed);
         tokens.push(token);
@@ -122,10 +114,10 @@ async fn exchange(
             }
         }
     }
-    let turn = task.await??.ok_or_else(|| eyre!("no tokens generated"))?;
+    let generation = task.await??.ok_or_else(|| eyre!("no tokens generated"))?;
     let calls = parser.finish();
     Ok(Exchange {
-        turn,
+        generation,
         tokens,
         times,
         first_visible,
@@ -181,8 +173,8 @@ impl Exchange {
             ),
         };
         Ok(serde_json::json!({
-            "start": format!("{:?}", self.turn.start).to_lowercase(),
-            "prompt_tokens": self.turn.prompt_tokens, "reused_tokens": self.turn.reused_tokens,
+            "start": format!("{:?}", self.generation.start).to_lowercase(),
+            "prompt_tokens": self.generation.prompt_tokens, "reused_tokens": self.generation.reused_tokens,
             "generated_tokens": self.tokens.len(),
             "ttft_seconds": first, "first_visible_seconds": self.first_visible,
             "decode_tokens_per_second": (self.tokens.len() - 1) as f64 / (last - first),

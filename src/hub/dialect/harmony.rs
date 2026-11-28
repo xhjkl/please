@@ -9,11 +9,9 @@
 //! form the developer message, as gpt-oss's chat template places them. Unlike that template,
 //! the preamble's own "Current date" line stays in the instructions rather than moving into
 //! the system message.
-use super::conversation::{
-    ConversationMessage, FunctionCall, Rendered, split_preamble, tool_schemas,
-};
+use super::OutputParser;
 use super::piece::{Piece, encode_prompt};
-use super::{Adapter as DialectAdapter, OutputParser as DialectOutputParser};
+use super::prompt::{FunctionCall, PromptMessage, Rendered, split_preamble, tool_schemas};
 use crate::protocol::Effort;
 use eyre::Result;
 use oco::Tokenizer;
@@ -108,7 +106,7 @@ impl Prompt {
 
 /// Render a whole history, opening with the canonical system and developer messages and
 /// ending in the assistant's open turn; also return how many pieces form the static head.
-fn render(messages: &[ConversationMessage]) -> (Prompt, usize) {
+fn render(messages: &[PromptMessage]) -> (Prompt, usize) {
     let mut prompt = Prompt::default();
     let mut head = 0;
     if !messages.is_empty() {
@@ -128,21 +126,21 @@ fn render(messages: &[ConversationMessage]) -> (Prompt, usize) {
 /// out of the first developer message leaves the tool declarations in the static, cacheable
 /// head while the facts keep developer authority. Returns how many pieces the first two
 /// messages took.
-fn header(prompt: &mut Prompt, preamble: &[ConversationMessage]) -> usize {
+fn header(prompt: &mut Prompt, preamble: &[PromptMessage]) -> usize {
     let mut effort = "medium";
     let mut instructions = Vec::new();
     let mut facts = Vec::new();
     for message in preamble {
         match message {
-            ConversationMessage::Effort(level) => {
+            PromptMessage::Effort(level) => {
                 effort = match level {
                     Effort::High => "high",
                     Effort::Low => "low",
                     Effort::Medium => "medium",
                 }
             }
-            ConversationMessage::Instructions(text) => instructions.push(text.trim()),
-            ConversationMessage::Fact(text) => facts.push(text.trim()),
+            PromptMessage::Instructions(text) => instructions.push(text.trim()),
+            PromptMessage::Fact(text) => facts.push(text.trim()),
             _ => {}
         }
     }
@@ -224,22 +222,22 @@ fn typescript(schema: &Value) -> String {
 }
 
 /// Append a conversation entry; the harness's word mid-conversation is developer text.
-fn conversation_message(prompt: &mut Prompt, message: &ConversationMessage) {
+fn conversation_message(prompt: &mut Prompt, message: &PromptMessage) {
     let assistant = |channel| Header {
         author: "assistant",
         channel: Some(channel),
         ..Header::default()
     };
     match message {
-        ConversationMessage::Effort(_) => {}
-        ConversationMessage::Instructions(content)
-        | ConversationMessage::Fact(content)
-        | ConversationMessage::Note(content) => prompt.message(Header::of("developer"), content),
-        ConversationMessage::User(content) => prompt.message(Header::of("user"), content),
-        ConversationMessage::Answer(content) => prompt.message(assistant("final"), content),
-        ConversationMessage::Thinking(content) if content.is_empty() => {}
-        ConversationMessage::Thinking(content) => prompt.message(assistant("analysis"), content),
-        ConversationMessage::ToolCall(FunctionCall { name, arguments }) => {
+        PromptMessage::Effort(_) => {}
+        PromptMessage::Instructions(content)
+        | PromptMessage::Fact(content)
+        | PromptMessage::Note(content) => prompt.message(Header::of("developer"), content),
+        PromptMessage::User(content) => prompt.message(Header::of("user"), content),
+        PromptMessage::Answer(content) => prompt.message(assistant("final"), content),
+        PromptMessage::Thinking(content) if content.is_empty() => {}
+        PromptMessage::Thinking(content) => prompt.message(assistant("analysis"), content),
+        PromptMessage::ToolCall(FunctionCall { name, arguments }) => {
             let recipient = format!("functions.{name}");
             let header = Header {
                 recipient: Some(&recipient),
@@ -249,7 +247,7 @@ fn conversation_message(prompt: &mut Prompt, message: &ConversationMessage) {
             prompt.message(header, &arguments.to_string());
         }
         // Naming the author by its namespace, as gpt-oss's template and the call recipient do.
-        ConversationMessage::ToolResult { name, content } => {
+        PromptMessage::ToolResult { name, content } => {
             let author = format!("functions.{name}");
             let header = Header {
                 author: &author,
@@ -262,27 +260,21 @@ fn conversation_message(prompt: &mut Prompt, message: &ConversationMessage) {
     }
 }
 
-/// Harmony codec over the checkpoint's own vocabulary.
-pub struct Adapter;
+/// Encode worded messages as Harmony, over the checkpoint's own vocabulary.
+pub fn encode(tokenizer: &Tokenizer, messages: &[PromptMessage]) -> Result<Rendered> {
+    let (prompt, head) = render(messages);
+    encode_prompt(tokenizer, &prompt.pieces, head)
+}
 
-impl DialectAdapter for Adapter {
-    fn encode(&self, tokenizer: &Tokenizer, messages: &[ConversationMessage]) -> Result<Rendered> {
-        let (prompt, head) = render(messages);
-        encode_prompt(tokenizer, &prompt.pieces, head)
-    }
+/// Start decoding a response that resumes the prompt's open assistant header.
+pub fn output_parser(tokenizer: &Tokenizer) -> Result<Box<dyn OutputParser + '_>> {
+    Ok(Box::new(output::Parser::new(tokenizer)?))
+}
 
-    fn output_parser<'a>(
-        &self,
-        tokenizer: &'a Tokenizer,
-    ) -> Result<Box<dyn DialectOutputParser + 'a>> {
-        Ok(Box::new(output::OutputParser::new(tokenizer)?))
-    }
-
-    fn is_stop_token(&self, tokenizer: &Tokenizer, token: u32) -> bool {
-        [RETURN, CALL]
-            .iter()
-            .any(|spelling| tokenizer.special_token(spelling) == Some(token))
-    }
+pub fn is_stop_token(tokenizer: &Tokenizer, token: u32) -> bool {
+    [RETURN, CALL]
+        .iter()
+        .any(|spelling| tokenizer.special_token(spelling) == Some(token))
 }
 
 #[cfg(test)]

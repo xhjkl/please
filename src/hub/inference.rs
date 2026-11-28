@@ -1,13 +1,13 @@
-//! Oco token generation with model-specific conversation framing.
+//! Oco token generation with model-specific prompt framing.
 //!
 //! The hub keeps one session, sized at load to the GPU memory the weights leave, and every
 //! request feeds only what it does not already hold: the longest common prefix of the
 //! session's history and the newly rendered prompt stays, the session rewinds to it, and the
-//! rest is prefilled. Another conversation keeps at least the static head, whose end is a
+//! rest is prefilled. Another owner's history keeps at least the static head, whose end is a
 //! checkpoint; a different head is read from `~/.please/caches`, or prefilled and saved once.
-use super::dialect::{Adapter, Dialect, OutputParser, Rendered};
+use super::dialect::{Dialect, OutputParser, Rendered};
+use super::heads;
 use super::occupancy::Occupancy;
-use super::preamble;
 use crate::protocol::{Message, Setting};
 use eyre::{Result, bail, ensure, eyre};
 use std::ops::Range;
@@ -18,13 +18,13 @@ pub(super) mod clipping;
 mod reuse;
 
 const MAX_GENERATED_TOKENS: usize = 8_192;
-/// Room kept free for the reply when deciding whether a prompt still fits.
-const REPLY_ROOM: usize = 512;
+/// Tokens kept free for the reply when deciding whether a prompt still fits.
+const REPLY_RESERVE: usize = 512;
 /// Share of the GPU's working set the weights and the session's context may fill; the rest
 /// covers fixed-size scratch and recurrent memory, roughly, and leaves the machine breathing.
 const GPU_SHARE: f64 = 0.8;
 /// Smallest context worth serving: half for instructions and stdin, the rest for a reply.
-const MIN_CAPACITY: usize = 4 * REPLY_ROOM;
+const MIN_CAPACITY: usize = 4 * REPLY_RESERVE;
 
 /// Loaded checkpoint and codec shared by all hub connections.
 pub struct Engine {
@@ -32,33 +32,27 @@ pub struct Engine {
     pub path: std::path::PathBuf,
     pub load_seconds: f64,
     weights: oco::Weights,
-    adapter: Box<dyn Adapter>,
+    dialect: Dialect,
     /// What this checkpoint's saved heads are named after besides their IDs.
-    origin: preamble::Origin,
+    origin: heads::Origin,
     /// Tokens the session holds, fixed at load.
     capacity: usize,
     /// The only session, `None` until the first request or after a failed one. Holding the
     /// lock serializes the served probe's requests, which may overlap across a reconnection.
-    session: tokio::sync::Mutex<Option<Kept>>,
+    session: tokio::sync::Mutex<Option<KeptSession>>,
     /// The probe allowed to use the session.
     pub occupancy: Occupancy,
-    connections: std::sync::atomic::AtomicU64,
+    /// Owners issued by [`Engine::new_owner`].
+    owners: std::sync::atomic::AtomicU64,
 }
 
-/// The session with the conversation it last served.
-struct Kept {
+/// The session as kept between requests, with whose history it last consumed.
+struct KeptSession {
     session: oco::Session,
-    /// The conversation whose requests it last served.
+    /// Whose history the session last consumed: a room in one epoch, or a one-off.
     owner: u64,
-    /// That conversation's history indices clipped from every prompt it was fed.
+    /// The owner's history indices clipped from every prompt the session was fed.
     dropped: Vec<Range<usize>>,
-}
-
-/// Streamed prediction, or the end of one response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Generated {
-    Token(u32),
-    Stop,
 }
 
 /// Where a request's session came from, which decides what its first prefill had to cover.
@@ -74,9 +68,9 @@ pub enum Start {
     Fresh,
 }
 
-/// What one request cost before its first prediction, and how its reply ended.
+/// What one generation cost before its first prediction, and how its reply ended.
 #[derive(Debug, Clone, Copy)]
-pub struct Turn {
+pub struct Generation {
     pub start: Start,
     pub prompt_tokens: usize,
     pub reused_tokens: usize,
@@ -92,7 +86,7 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 impl Engine {
     /// Bind output parsing to this checkpoint's tokenizer and selected dialect.
     pub fn output_parser(&self) -> Result<Box<dyn OutputParser + '_>> {
-        self.adapter.output_parser(self.weights.tokenizer())
+        self.dialect.output_parser(self.weights.tokenizer())
     }
 
     /// Encode neutral history with this checkpoint's tokenizer and selected dialect.
@@ -102,7 +96,7 @@ impl Engine {
         history: &[Message],
         tail_budget: usize,
     ) -> Result<Rendered> {
-        self.adapter
+        self.dialect
             .render(self.weights.tokenizer(), setting, history, tail_budget)
     }
 
@@ -117,9 +111,9 @@ impl Engine {
         Ok(tokens as f64 / self.capacity as f64)
     }
 
-    /// Issue a conversation key shared with no other, for prompts that extend nothing kept.
-    pub fn connect(&self) -> u64 {
-        self.connections
+    /// Issue an owner shared with no other, for a history that extends nothing kept.
+    pub fn new_owner(&self) -> u64 {
+        self.owners
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -140,7 +134,7 @@ impl Engine {
             .inspect_err(|error| tracing::debug!("hub: no cached head: {error:#}"))
             .ok();
         if let Some(session) = reuse::adopt_head(opened, head) {
-            let touched = preamble::touch(&path);
+            let touched = heads::touch(&path);
             if let Err(error) = touched {
                 tracing::debug!("hub: cannot mark the head as used: {error:#}");
             }
@@ -154,7 +148,7 @@ impl Engine {
         session.checkpoint()?;
         let (session, saved) = blocking(move || {
             // A failed save costs the next invocation a prefill, never this request.
-            let saved = preamble::save(&path, |path| Ok(session.save(path)?));
+            let saved = heads::save(&path, |path| Ok(session.save(path)?));
             (session, saved.map(|()| path))
         })
         .await?;
@@ -190,31 +184,31 @@ pub async fn load_model(model_path: &std::path::Path, dialect: Dialect) -> Resul
         path.display()
     );
     tracing::info!("hub: context capacity {capacity} tokens");
-    let adapter = dialect.adapter();
-    let origin = preamble::Origin::new(&path)?;
+    let origin = heads::Origin::new(&path)?;
     let load_seconds = started.elapsed().as_secs_f64();
     Ok(Engine {
         path,
         load_seconds,
         weights,
-        adapter,
+        dialect,
         origin,
         capacity,
         session: tokio::sync::Mutex::new(None),
         occupancy: Occupancy::default(),
-        connections: std::sync::atomic::AtomicU64::new(0),
+        owners: std::sync::atomic::AtomicU64::new(0),
     })
 }
 
-/// Stream greedy predictions, stopping at a model boundary or a bounded output limit.
+/// Stream greedy predictions of the reply to `owner`'s `history`, stopping at a model boundary
+/// or a bounded output limit; `generated` closes when the reply ends.
 pub async fn generate(
     engine: &Engine,
-    conversation: u64,
+    owner: u64,
     setting: &Setting,
     history: &[Message],
-    generated: UnboundedSender<Generated>,
+    generated: UnboundedSender<u32>,
     max_tokens: Option<usize>,
-) -> Result<Option<Turn>> {
+) -> Result<Option<Generation>> {
     let mut held = engine.session.lock().await;
     let started = Instant::now();
     if generated.is_closed() {
@@ -227,10 +221,10 @@ pub async fn generate(
             "system instructions and stdin exceed half the {capacity}-token context; shorten the input"
         );
     }
-    let tail_budget = capacity - base - REPLY_ROOM;
+    let tail_budget = capacity - base - REPLY_RESERVE;
     let whole = engine.render(setting, history, tail_budget)?;
-    let head = &whole.tokens[..whole.preamble];
-    // Holding the head means rewinding to it is free, whichever conversation came before;
+    let head = &whole.tokens[..whole.head];
+    // Holding the head means rewinding to it is free, whoever owned the session before;
     // otherwise the old session goes before its replacement is allocated.
     let kept = held
         .take()
@@ -239,29 +233,29 @@ pub async fn generate(
         Some(kept) => (kept, Start::Kept),
         None => {
             let (session, start) = engine.start(head).await?;
-            let kept = Kept {
+            let kept = KeptSession {
                 session,
-                owner: conversation,
+                owner,
                 dropped: vec![],
             };
             (kept, start)
         }
     };
-    if kept.owner != conversation {
-        // Clipping indices describe the previous conversation's history.
-        kept.owner = conversation;
+    if kept.owner != owner {
+        // Clipping indices describe the previous owner's history.
+        kept.owner = owner;
         kept.dropped.clear();
     }
     let output_limit = max_tokens.unwrap_or(MAX_GENERATED_TOKENS);
     let mut reply = Vec::new();
-    let mut turn = None;
+    let mut generation = None;
     let ended = loop {
         // Coming around again means the context filled mid-reply: more history goes so the
         // reply can continue.
         let size = |visible: &[Message]| {
             Ok(engine.render(setting, visible, tail_budget)?.tokens.len() + reply.len())
         };
-        let limit = capacity - REPLY_ROOM;
+        let limit = capacity - REPLY_RESERVE;
         kept.dropped = clipping::choose(history, &kept.dropped, limit, capacity / 2, size)?;
         let visible = clipping::visible(history, &kept.dropped);
         let mut tokens = engine.render(setting, &visible, tail_budget)?.tokens;
@@ -274,8 +268,8 @@ pub async fn generate(
             "hub: feeding prompt"
         );
         let first = feed(&mut kept.session, &tokens, reused).await?;
-        turn.get_or_insert_with(|| {
-            let turn = Turn {
+        generation.get_or_insert_with(|| {
+            let generation = Generation {
                 start,
                 prompt_tokens: tokens.len(),
                 reused_tokens: reused,
@@ -283,8 +277,8 @@ pub async fn generate(
             };
             // Measured from taking the session, so it includes any head prefill.
             let seconds = started.elapsed().as_secs_f64();
-            tracing::debug!(?turn, seconds, "hub: first token");
-            turn
+            tracing::debug!(?generation, seconds, "hub: first token");
+            generation
         });
         let ended = decode(
             engine,
@@ -304,9 +298,9 @@ pub async fn generate(
     if ended == Ended::Limit && max_tokens.is_none() {
         bail!("model exceeded the {output_limit}-token output limit");
     }
-    Ok(turn.map(|turn| Turn {
+    Ok(generation.map(|generation| Generation {
         complete: ended == Ended::Finished,
-        ..turn
+        ..generation
     }))
 }
 
@@ -336,7 +330,7 @@ async fn decode(
     engine: &Engine,
     session: &mut oco::Session,
     first: u32,
-    generated: &UnboundedSender<Generated>,
+    generated: &UnboundedSender<u32>,
     reply: &mut Vec<u32>,
     limit: usize,
 ) -> Result<Option<Ended>> {
@@ -347,17 +341,15 @@ async fn decode(
             return Ok(Some(Ended::Finished));
         }
         if reply.len() == limit {
-            let _ = generated.send(Generated::Stop);
             return Ok(Some(Ended::Limit));
         }
         let stopped = engine
-            .adapter
+            .dialect
             .is_stop_token(engine.weights.tokenizer(), next);
-        if generated.send(Generated::Token(next)).is_err() {
+        if generated.send(next).is_err() {
             return Ok(Some(Ended::Finished));
         }
         if stopped {
-            let _ = generated.send(Generated::Stop);
             return Ok(Some(Ended::Finished));
         }
         reply.push(next);

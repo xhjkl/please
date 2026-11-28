@@ -175,7 +175,7 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
             } => {
                 tracing::info!("hub: received inference request");
                 let (mut reader, mut writer) = stream.split();
-                let turn = super::turn::serve(&mut writer, &hub, &place, &setting, id, messages);
+                let turn = super::turn::advance(&mut writer, &hub, &place, &setting, id, messages);
                 // Dropping the receiver stops generation even when there are no deltas.
                 let Some(served) = unless_hung_up(&mut reader, &mut store, turn).await? else {
                     return Ok(());

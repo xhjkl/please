@@ -1,7 +1,7 @@
-use super::output::{Event, OutputStream, parse_call};
+use super::output::{Event, Stream, parse_call};
 use super::*;
-use crate::hub::dialect::conversation::{Delta, prepare};
 use crate::hub::dialect::piece::spelled;
+use crate::hub::dialect::prompt::{Delta, prepare};
 use crate::protocol::{Effort, Message, Setting, ToolCall, ToolResult};
 use serde_json::json;
 
@@ -16,7 +16,7 @@ fn some_setting() -> Setting {
 /// Feed generated output where `¦</think>¦`-style spans stand for the structure tokens the
 /// model emits; everything else arrives one character per token, as plain decoded text.
 fn stream(output: &str) -> Result<(String, String, Vec<FunctionCall>)> {
-    let mut stream = OutputStream::default();
+    let mut stream = Stream::default();
     let mut deltas = Vec::new();
     for (index, part) in output.split('¦').enumerate() {
         let event = match part {
@@ -245,7 +245,7 @@ fn values_end_only_at_the_real_closing_structure() -> Result<()> {
 fn static_head_ends_where_session_facts_begin() -> Result<()> {
     let history = [Message::User("hi".into())];
     let prompt = render(&prepare(&some_setting(), &history)?)?;
-    let (whole, bytes) = prompt.preamble;
+    let (whole, bytes) = prompt.head;
     let mut head = spelled(&prompt.pieces[..whole]);
     let Some(Piece::Text(text)) = prompt.pieces.get(whole) else {
         panic!("facts continue the system text")

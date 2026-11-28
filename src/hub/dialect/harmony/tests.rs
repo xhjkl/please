@@ -1,7 +1,7 @@
-use super::super::conversation::Delta;
-use super::super::conversation::prepare;
 use super::super::piece::spelled;
-use super::output::{Event, Marker, OutputStream};
+use super::super::prompt::Delta;
+use super::super::prompt::prepare;
+use super::output::{Event, Marker, Stream};
 use super::*;
 use crate::protocol::{Effort, Message, Note, Setting, ToolCall, ToolResult};
 use serde_json::json;
@@ -18,7 +18,7 @@ fn setting(today: &str, effort: Effort) -> Setting {
 }
 
 /// A conversation exercising every message shape after the header.
-fn some_tool_loop() -> Vec<ConversationMessage> {
+fn some_tool_loop() -> Vec<PromptMessage> {
     let tool = |name: &str, arguments: serde_json::Value, result: serde_json::Value| {
         [
             Message::Call(ToolCall {
@@ -97,7 +97,7 @@ fn static_head_is_the_system_and_tool_messages_alone() -> Result<()> {
         ];
         prepare(&setting(today, effort), &messages)
     };
-    let spelled_head = |messages: &[ConversationMessage]| {
+    let spelled_head = |messages: &[PromptMessage]| {
         let (prompt, head) = render(messages);
         spelled(&prompt.pieces[..head])
     };
@@ -134,8 +134,8 @@ fn parameter_schemas_render_as_typescript() {
 }
 
 /// Feed a spelled-out continuation, splitting markers from text, into a fresh stream.
-fn stream(spelled: &str) -> (OutputStream, Vec<Delta>, Option<String>) {
-    let mut output = OutputStream::new(START_ID);
+fn stream(spelled: &str) -> (Stream, Vec<Delta>, Option<String>) {
+    let mut output = Stream::new(START_ID);
     let mut deltas = Vec::new();
     let mut rest = spelled;
     while !rest.is_empty() {
@@ -298,9 +298,9 @@ fn vendored_codec_round_trips_on_the_checkpoint_tokenizer() -> Result<()> {
         name: "read_file".into(),
         arguments: json!({"path": "¶<|start|><|end|><|call|><|return|>.txt"}),
     };
-    let call = ConversationMessage::ToolCall(expected.clone());
-    let rendered = Adapter.encode(tokenizer, &[call])?.tokens;
-    let open = Adapter.encode(tokenizer, &[])?.tokens;
+    let call = PromptMessage::ToolCall(expected.clone());
+    let rendered = encode(tokenizer, &[call])?.tokens;
+    let open = encode(tokenizer, &[])?.tokens;
     let start = rendered
         .windows(open.len())
         .rposition(|window| window == open)
@@ -309,7 +309,7 @@ fn vendored_codec_round_trips_on_the_checkpoint_tokenizer() -> Result<()> {
         .windows(open.len())
         .rposition(|window| window == open)
         .expect("the call is an assistant message");
-    let mut parser = Adapter.output_parser(tokenizer)?;
+    let mut parser = output_parser(tokenizer)?;
     for &token in &rendered[call_start + open.len()..start] {
         assert!(parser.push_token(token)?.is_empty());
     }

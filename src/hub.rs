@@ -11,7 +11,7 @@ pub const UNSUPPORTED: &str =
 #[error("no supported local weights found; run `please load`")]
 pub struct NoWeights;
 
-/// Locate please's own directory, `~/.please`, home to the socket, weights, caches, and chats.
+/// Locate please's own directory, `~/.please`, home to the socket, weights, caches, and rooms.
 pub fn directory() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
     std::path::PathBuf::from(home).join(".please")
@@ -25,8 +25,6 @@ pub fn socket_path() -> std::path::PathBuf {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod benchmark;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod chats;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod dialect;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod digest;
@@ -34,6 +32,8 @@ mod digest;
 mod discovery;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod download;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod heads;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod inference;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -43,7 +43,7 @@ mod local;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod occupancy;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod preamble;
+mod rooms;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod transcript;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

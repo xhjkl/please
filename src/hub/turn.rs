@@ -1,9 +1,9 @@
-//! One request's work on a place's conversation: keep what the request brings, condense the
-//! conversation when it nears the context's end, generate, run the hub's own tools, and keep
-//! each step. The probe sends only what is new; the conversation itself lives with the hub.
-use super::chats::{Chat, Entry};
+//! The hub's part of a turn, in the place's room: keep what the probe delivers, compact the
+//! room when it nears the context's end, generate, run the hub's own tools, and keep each
+//! step. The probe sends only what is new; everything said so far lives in the room.
 use super::dialect::{Delta, FunctionCall, prompting};
 use super::inference::{self, Engine, clipping};
+use super::rooms::{Entry, Room};
 use super::transcript;
 use crate::protocol::{Frame, Message, Note, Place, Setting, ToolCall, ToolResult, write_frame};
 use eyre::{Result, bail, eyre};
@@ -11,15 +11,17 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
-/// Share of the context a prompt may fill before the conversation is condensed and restarted.
-const CONDENSE_AT: f64 = 0.75;
-/// Share of what the instructions leave free that each condensing chunk may take, and the bytes
-/// a token is counted as; code tokens average more, so chunks come out smaller than allowed.
+/// Share of the context a prompt may fill before the room is compacted: restarted from a
+/// summary of it.
+const COMPACT_AT: f64 = 0.75;
+/// Share of what the instructions leave free that each chunk to summarize may take, and the
+/// bytes a token is counted as; code tokens average more, so chunks come out smaller than
+/// allowed.
 const CHUNK_SHARE: f64 = 0.5;
 const BYTES_PER_TOKEN: f64 = 2.5;
 /// Tokens kept free around each chunk for the instructions and the drafts, the new one at most
 /// `DRAFT_TOKENS` long.
-const CONDENSE_ROOM: usize = 2048;
+const COMPACT_RESERVE: usize = 2048;
 const DRAFT_TOKENS: usize = 1024;
 /// Share of the context the turn in progress may keep verbatim after the summary.
 const KEEP_SHARE: f64 = 0.25;
@@ -35,10 +37,10 @@ struct Step {
     complete: bool,
 }
 
-/// Serve one request: keep `messages` in the place's conversation and stream the reply.
-/// The request's messages are kept on arrival, once per request `id`, so a retry after a
-/// dropped connection never repeats them; each step is kept when it completes.
-pub async fn serve(
+/// Advance the turn: keep delivery `id`'s `messages` in the place's room and stream the reply.
+/// The messages are kept on arrival, once per delivery, so a retry after a dropped connection
+/// never repeats them; each step is kept when it completes.
+pub async fn advance(
     sink: &mut (impl AsyncWriteExt + Unpin),
     engine: &Arc<Engine>,
     place: &Place,
@@ -46,14 +48,14 @@ pub async fn serve(
     id: u64,
     messages: Vec<Message>,
 ) -> Result<()> {
-    let chat = Chat::open(place)?;
-    let _lock = lock(&chat).await?;
+    let room = Room::open(place)?;
+    let _lock = lock(&room).await?;
     let (mut notes, incoming): (Vec<_>, Vec<_>) = messages
         .into_iter()
         .partition(|message| matches!(message, Message::Note(_)));
     let own = |note: &Message| matches!(note, Message::Note(Note::Summarize { .. } | Note::Resume));
     if notes.iter().any(own) {
-        bail!("restart notes are the hub's own");
+        bail!("notes to summarize or resume are the hub's own");
     }
     // While commands run, an answer without calls is set aside by the probe, so it is not kept.
     let pending = notes.iter().any(|note| {
@@ -62,27 +64,27 @@ pub async fn serve(
             Message::Note(Note::Pending(_) | Note::AnswerSetAside(_))
         )
     });
-    keep_arrivals(&chat, id, incoming)?;
+    keep_delivery(&room, id, incoming)?;
     // A recalled page may take a tenth of the context, so recalling cannot crowd it out.
     let page =
         transcript::RECALLED.min((engine.capacity() as f64 * 0.1 * BYTES_PER_TOKEN) as usize);
-    let mut condensed = false;
+    let mut compacted = false;
     for _ in 0..HUB_STEPS {
-        let mut history = chat.messages()?;
+        let mut history = room.messages()?;
         history.extend(notes.iter().cloned());
-        if !condensed && engine.fill(setting, &history)? >= CONDENSE_AT {
-            condensed = true;
+        if !compacted && engine.fill(setting, &history)? >= COMPACT_AT {
+            compacted = true;
             let base = engine.fill(setting, &[])?;
             let fits = |kept: &[Message]| Ok(engine.fill(setting, kept)? - base <= KEEP_SHARE);
-            let entries = chat.entries()?;
+            let entries = room.entries()?;
             let (folded, kept) = cutover(entries, fits)?;
             // Models tend to end their turn after a message of their own.
             let resume = kept.is_empty();
-            let restarted = condense(sink, engine, setting, &chat, folded, kept).await;
+            let restarted = compact(sink, engine, setting, &room, folded, kept).await;
             match restarted {
-                // Clipping old messages still lets the conversation go on.
+                // Clipping old messages still lets the turn go on.
                 Err(error) => {
-                    let line = format!("cannot condense the conversation: {error:#}");
+                    let line = format!("cannot compact the conversation: {error:#}");
                     write_frame(sink, &Frame::Log(line)).await?;
                 }
                 Ok(summary) => {
@@ -90,24 +92,24 @@ pub async fn serve(
                     if resume {
                         notes.push(Message::Note(Note::Resume));
                     }
-                    history = chat.messages()?;
+                    history = room.messages()?;
                     history.extend(notes.iter().cloned());
                 }
             }
         }
-        let generation = chat.generation()?;
-        let key = conversation(place, generation);
-        let step = generate(Some(&mut *sink), engine, key, setting, &history, None).await?;
-        let mut kept = opening(step.thinking, step.answer);
+        let epoch = room.epoch()?;
+        let owner = owner(place, epoch);
+        let step = generate(Some(&mut *sink), engine, owner, setting, &history, None).await?;
+        let mut kept = prose(step.thinking, step.answer);
         // A call's ID is the number of the entry that first keeps it.
-        let first = chat.next()?;
+        let first = room.next()?;
         let entry = |kept: &[Message]| first + kept.len() as u64;
         let calls = match step.calls {
             Err(error) => {
                 // No call is kept for what could not be parsed, so its result has its own ID.
                 let content = prompting::unparsed(&error);
                 kept.push(result(entry(&kept), "tool_call_parse_error", content));
-                chat.append(&kept)?;
+                room.append(&kept)?;
                 continue;
             }
             Ok(calls) => calls,
@@ -129,7 +131,7 @@ pub async fn serve(
                 ),
                 false => (
                     format!("recall {}", call.arguments),
-                    transcript::recall(&chat, &call.arguments, page).to_string(),
+                    transcript::recall(&room, &call.arguments, page).to_string(),
                 ),
             };
             write_frame(sink, &Frame::Log(line)).await?;
@@ -143,7 +145,7 @@ pub async fn serve(
             kept.push(stored(&call, id));
             sent.push((id, call));
         }
-        chat.append(&kept)?;
+        room.append(&kept)?;
         if !sent.is_empty() || own.is_empty() {
             for (id, call) in sent {
                 let frame = Frame::Call(ToolCall {
@@ -161,7 +163,7 @@ pub async fn serve(
     ))
 }
 
-/// Restart the place's conversation, from a summary of it or from nothing.
+/// Restart the place's room, from a summary of it or from nothing.
 pub async fn restart(
     sink: &mut (impl AsyncWriteExt + Unpin),
     engine: &Arc<Engine>,
@@ -169,56 +171,56 @@ pub async fn restart(
     setting: &Setting,
     summarize: bool,
 ) -> Result<()> {
-    let chat = Chat::open(place)?;
-    let _lock = lock(&chat).await?;
-    let messages = chat.messages()?;
+    let room = Room::open(place)?;
+    let _lock = lock(&room).await?;
+    let messages = room.messages()?;
     if messages.is_empty() {
         write_frame(sink, &Frame::Log("the conversation is empty".into())).await?;
     } else if summarize {
-        let entries = chat.entries()?;
-        let summary = condense(sink, engine, setting, &chat, entries, vec![]).await?;
+        let entries = room.entries()?;
+        let summary = compact(sink, engine, setting, &room, entries, vec![]).await?;
         write_frame(sink, &Frame::Restarted(summary)).await?;
     } else {
-        chat.restart(&[])?;
+        room.restart(&[])?;
         write_frame(sink, &Frame::Log("started a new conversation".into())).await?;
     }
     write_frame(sink, &Frame::Stop).await
 }
 
-/// Hold the conversation for this hub, waiting for another hub to finish with it.
-async fn lock(chat: &Chat) -> Result<std::fs::File> {
-    let chat = chat.clone();
-    tokio::task::spawn_blocking(move || chat.lock()).await?
+/// Hold the room for this hub, waiting for another hub to finish with it.
+async fn lock(room: &Room) -> Result<std::fs::File> {
+    let room = room.clone();
+    tokio::task::spawn_blocking(move || room.lock()).await?
 }
 
-/// Keep request `id`'s messages unless a retry already did, answering first any calls the
-/// conversation ends with that the request does not answer.
-fn keep_arrivals(chat: &Chat, id: u64, incoming: Vec<Message>) -> Result<()> {
-    let retried = chat.last_request() == Some(id);
+/// Keep delivery `id`'s messages unless a retry already did, answering first any calls the
+/// room ends with that the delivery does not answer.
+fn keep_delivery(room: &Room, id: u64, incoming: Vec<Message>) -> Result<()> {
+    let retried = room.last_delivery() == Some(id);
     let answers = !retried && matches!(incoming.first(), Some(Message::Result(_)));
     let mut arriving = match answers {
         true => vec![],
         false => {
-            let kept = chat.messages()?;
+            let kept = room.messages()?;
             unanswered(&kept)
         }
     };
     if !retried {
         arriving.extend(incoming);
     }
-    chat.append(&arriving)?;
-    chat.set_last_request(id)
+    room.append(&arriving)?;
+    room.set_last_delivery(id)
 }
 
-/// Split a conversation for its restart into the entries its message is folded from and the
-/// messages that follow the message verbatim. The turn in progress follows whole if it `fits`;
+/// Split a room's entries for its restart into those its summary is folded from and the
+/// messages that follow the summary verbatim. The turn in progress follows whole if it `fits`;
 /// otherwise its request and as many of its newest steps as fit, then its request alone, then
 /// nothing, with the rest of the turn folded in.
 fn cutover(
     mut entries: Vec<Entry>,
     fits: impl Fn(&[Message]) -> Result<bool>,
 ) -> Result<(Vec<Entry>, Vec<Message>)> {
-    let since = entries.iter().take_while(|entry| entry.backup).count();
+    let since = entries.iter().take_while(|entry| entry.old).count();
     let current: Vec<_> = entries[since..]
         .iter()
         .map(|entry| entry.message.clone())
@@ -229,10 +231,7 @@ fn cutover(
     let Some(user) = user else {
         return Ok((entries, vec![]));
     };
-    let opens = match user.checked_sub(1).map(|index| &current[index]) {
-        Some(Message::Input(_)) => user - 1,
-        _ => user,
-    };
+    let opens = clipping::opening(&current, user);
     let (fold, kept) = if fits(&current[opens..])? {
         (opens, current[opens..].to_vec())
     } else {
@@ -256,16 +255,16 @@ fn cutover(
     Ok((entries, kept))
 }
 
-/// Who a prompt belongs to, keeping clipping choices with their own conversation; a restart
-/// makes it another.
-fn conversation(place: &Place, generation: u64) -> u64 {
+/// Whose history a prompt renders: the place's room in its current epoch. Clipping choices
+/// stay with their owner, and a restart makes the room another.
+fn owner(place: &Place, epoch: u64) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
-    (place, generation).hash(&mut hasher);
+    (place, epoch).hash(&mut hasher);
     hasher.finish()
 }
 
 /// A step's reasoning and answer; a response of calls alone still opens its own step.
-fn opening(thinking: String, answer: String) -> Vec<Message> {
+fn prose(thinking: String, answer: String) -> Vec<Message> {
     let mut kept = Vec::new();
     if !thinking.is_empty() || answer.is_empty() {
         kept.push(Message::Thinking(thinking));
@@ -329,19 +328,19 @@ fn unanswered(kept: &[Message]) -> Vec<Message> {
         .iter()
         .map(|message| match message {
             Message::Call(call) => result(call.id, &call.name, prompting::unrecorded()),
-            _ => unreachable!("only calls end the conversation here"),
+            _ => unreachable!("only calls end the room here"),
         })
         .collect()
 }
 
-/// Fold `folded`'s entries since the last restart into one message, a chunk at a time, and
-/// restart the conversation from it, followed by `kept`. Progress goes to the probe as log
-/// lines.
-async fn condense(
+/// Compact the room: fold `folded`'s entries since the last restart into one summary, a chunk
+/// at a time, and restart the room from it, followed by `kept`. Progress goes to the probe as
+/// log lines.
+async fn compact(
     sink: &mut (impl AsyncWriteExt + Unpin),
     engine: &Arc<Engine>,
     setting: &Setting,
-    chat: &Chat,
+    room: &Room,
     folded: Vec<Entry>,
     kept: Vec<Message>,
 ) -> Result<String> {
@@ -351,28 +350,28 @@ async fn condense(
         ..setting.clone()
     };
     let head = engine.fill(&setting, &[])?;
-    let free = engine.capacity() as f64 * (1.0 - head) - CONDENSE_ROOM as f64;
+    let free = engine.capacity() as f64 * (1.0 - head) - COMPACT_RESERVE as f64;
     let budget = (free * CHUNK_SHARE * BYTES_PER_TOKEN).max(1024.0) as usize;
     let chunks = transcript::chunks(&folded, budget);
     if chunks.is_empty() {
-        bail!("nothing to condense before the turn in progress");
+        bail!("nothing to compact before the turn in progress");
     }
     let parts = chunks.len();
     let mut draft: Option<String> = None;
     for (index, chunk) in chunks.into_iter().enumerate() {
         let part = index + 1;
-        let progress = format!("condensing the conversation ({part}/{parts})");
+        let progress = format!("compacting the conversation ({part}/{parts})");
         write_frame(sink, &Frame::Log(progress)).await?;
         let note = Note::Summarize {
             draft: draft.take(),
             chunk,
         };
-        // A fresh key: condensing prompts share no clipping with any conversation.
-        let key = engine.connect();
+        // A fresh owner: summarizing prompts share no clipping with any room.
+        let owner = engine.new_owner();
         let prompt = [Message::Note(note)];
         let quiet = None::<&mut tokio::io::Sink>;
         // Decoding is greedy, so asking again would write the same message.
-        let step = generate(quiet, engine, key, &setting, &prompt, Some(DRAFT_TOKENS)).await?;
+        let step = generate(quiet, engine, owner, &setting, &prompt, Some(DRAFT_TOKENS)).await?;
         if !step.complete {
             bail!("the message for part {part} of the transcript ran past {DRAFT_TOKENS} tokens");
         }
@@ -389,7 +388,7 @@ async fn condense(
     let restarted: Vec<_> = std::iter::once(Message::Answer(summary.clone()))
         .chain(kept)
         .collect();
-    chat.restart(&restarted)?;
+    room.restart(&restarted)?;
     Ok(summary)
 }
 
@@ -397,7 +396,7 @@ async fn condense(
 async fn generate(
     mut sink: Option<&mut (impl AsyncWriteExt + Unpin)>,
     engine: &Arc<Engine>,
-    key: u64,
+    owner: u64,
     setting: &Setting,
     history: &[Message],
     max_tokens: Option<usize>,
@@ -406,10 +405,10 @@ async fn generate(
     let (sender, mut generated) = tokio::sync::mpsc::unbounded_channel();
     let (engine, setting, history) = (engine.clone(), setting.clone(), history.to_vec());
     let task = tokio::spawn(async move {
-        inference::generate(&engine, key, &setting, &history, sender, max_tokens).await
+        inference::generate(&engine, owner, &setting, &history, sender, max_tokens).await
     });
     let (mut thinking, mut answer) = (String::new(), String::new());
-    while let Some(inference::Generated::Token(token)) = generated.recv().await {
+    while let Some(token) = generated.recv().await {
         for delta in parser.push_token(token)? {
             let frame = match delta {
                 Delta::Answer(text) => {
@@ -426,9 +425,9 @@ async fn generate(
             }
         }
     }
-    let turn = task.await??;
+    let generation = task.await??;
     let calls = parser.finish();
-    let complete = turn.is_some_and(|turn| turn.complete);
+    let complete = generation.is_some_and(|generation| generation.complete);
     Ok(Step {
         thinking,
         answer,
@@ -475,26 +474,26 @@ mod tests {
     }
 
     #[test]
-    fn a_request_is_kept_once_however_often_it_is_retried() -> Result<()> {
+    fn a_delivery_is_kept_once_however_often_it_is_retried() -> Result<()> {
         let dir = TempDir::new()?;
-        let chat = Chat::at(dir.0.join("chat"))?;
-        chat.append(&[
+        let room = Room::at(dir.0.join("room"))?;
+        room.append(&[
             Message::User("first".into()),
             Message::Thinking(String::new()),
             some_call(3, "read_file"),
         ])?;
         // Results answer the dangling call.
         let results = vec![result(3, "read_file", "x".into())];
-        keep_arrivals(&chat, 7, results.clone())?;
-        keep_arrivals(&chat, 7, results)?;
-        assert_eq!(chat.messages()?.len(), 4);
+        keep_delivery(&room, 7, results.clone())?;
+        keep_delivery(&room, 7, results)?;
+        assert_eq!(room.messages()?.len(), 4);
         // A new request after a step whose calls never got results answers them first.
-        chat.append(&[
+        room.append(&[
             Message::Thinking(String::new()),
             some_call(6, "run_command"),
         ])?;
-        keep_arrivals(&chat, 8, vec![Message::User("next".into())])?;
-        let messages = chat.messages()?;
+        keep_delivery(&room, 8, vec![Message::User("next".into())])?;
+        let messages = room.messages()?;
         let answer = Message::Result(ToolResult {
             id: 6,
             name: "run_command".into(),
@@ -508,23 +507,23 @@ mod tests {
     #[test]
     fn a_restart_keeps_as_much_of_the_turn_in_progress_as_fits() -> Result<()> {
         let dir = TempDir::new()?;
-        let chat = Chat::at(dir.0.join("chat"))?;
-        chat.append(&[Message::User("old".into()), Message::Answer("done".into())])?;
-        chat.restart(&[Message::Answer("You asked for the old thing.".into())])?;
-        chat.append(&[Message::Input("data".into()), Message::User("now".into())])?;
+        let room = Room::at(dir.0.join("room"))?;
+        room.append(&[Message::User("old".into()), Message::Answer("done".into())])?;
+        room.restart(&[Message::Answer("You asked for the old thing.".into())])?;
+        room.append(&[Message::Input("data".into()), Message::User("now".into())])?;
         for step in 0..3 {
             let content = format!("step {step}");
-            let id = chat.next()? + 1;
-            chat.append(&[
+            let id = room.next()? + 1;
+            room.append(&[
                 Message::Thinking(content.clone()),
                 some_call(id, "read_file"),
             ])?;
-            chat.append(&[result(id, "read_file", content)])?;
+            room.append(&[result(id, "read_file", content)])?;
         }
         // Entries 1 and 2 are set aside, 3 is the restart message, and the turn is 4 to 14.
         let split = |most: usize| {
             let fits = |kept: &[Message]| Ok(kept.len() <= most);
-            let (folded, kept) = cutover(chat.entries()?, fits)?;
+            let (folded, kept) = cutover(room.entries()?, fits)?;
             let last = folded.last().map(|entry| entry.number);
             Ok::<_, eyre::Report>((last, kept))
         };
@@ -602,12 +601,12 @@ mod tests {
     }
 
     #[test]
-    fn conversations_keep_their_key_until_they_restart() {
+    fn a_room_keeps_its_owner_until_it_restarts() {
         let place = Place {
             machine: "ssh-ed25519 AAAA".into(),
             cwd: "/".into(),
         };
-        assert_eq!(conversation(&place, 3), conversation(&place, 3));
-        assert_ne!(conversation(&place, 3), conversation(&place, 9));
+        assert_eq!(owner(&place, 3), owner(&place, 3));
+        assert_ne!(owner(&place, 3), owner(&place, 9));
     }
 }

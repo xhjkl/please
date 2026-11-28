@@ -1,7 +1,7 @@
 //! Inkling 2 chat framing from the checkpoint's `tokenizer.chat_template`.
-use super::conversation::{ConversationMessage, FunctionCall, Rendered, split_preamble};
+use super::OutputParser;
 use super::piece::{Piece, encode_prompt};
-use super::{Adapter as DialectAdapter, OutputParser};
+use super::prompt::{FunctionCall, PromptMessage, Rendered, split_preamble};
 use crate::protocol::Effort;
 use eyre::{Result, eyre};
 use oco::Tokenizer;
@@ -35,7 +35,7 @@ fn frame(prompt: &mut Vec<Piece>, role: &'static str, name: &str, kind: &'static
 
 /// Flatten the function declarations and sort their JSON keys as the checkpoint expects.
 fn tool_declarations() -> String {
-    let tools = super::conversation::tool_schemas();
+    let tools = super::prompt::tool_schemas();
     let mut tools = Value::Array(
         tools
             .into_iter()
@@ -60,8 +60,8 @@ fn effort(level: Effort) -> &'static str {
 }
 
 /// Replay one model step and its results, which may interleave with its calls.
-fn step(prompt: &mut Vec<Piece>, messages: &[ConversationMessage]) -> Result<usize> {
-    use ConversationMessage::*;
+fn step(prompt: &mut Vec<Piece>, messages: &[PromptMessage]) -> Result<usize> {
+    use PromptMessage::*;
     let text = messages
         .iter()
         .take_while(|message| matches!(message, Thinking(_) | Answer(_)))
@@ -101,8 +101,8 @@ fn emit_call(prompt: &mut Vec<Piece>, call: &FunctionCall) -> Result<()> {
 }
 
 /// Render complete messages. The next role token is sampled by the model.
-fn render(messages: &[ConversationMessage]) -> Result<(Vec<Piece>, usize)> {
-    use ConversationMessage::*;
+fn render(messages: &[PromptMessage]) -> Result<(Vec<Piece>, usize)> {
+    use PromptMessage::*;
     let mut prompt = Vec::new();
     let declarations = tool_declarations();
     frame(
@@ -112,21 +112,21 @@ fn render(messages: &[ConversationMessage]) -> Result<(Vec<Piece>, usize)> {
         "<|content_xml|>",
         &declarations,
     );
-    let (head, mut rest) = split_preamble(messages);
+    let (preamble, mut rest) = split_preamble(messages);
     let mut level = crate::protocol::Effort::High;
-    let mut preamble = None;
-    for message in head {
+    let mut head = None;
+    for message in preamble {
         match message {
             Effort(effort) => level = *effort,
             Instructions(text) => frame(&mut prompt, SYSTEM, "", TEXT, text),
             Fact(text) => {
-                preamble.get_or_insert(prompt.len());
+                head.get_or_insert(prompt.len());
                 frame(&mut prompt, SYSTEM, "", TEXT, text);
             }
             _ => unreachable!(),
         }
     }
-    let preamble = preamble.unwrap_or(prompt.len());
+    let head = head.unwrap_or(prompt.len());
     let level = effort(level);
     frame(
         &mut prompt,
@@ -152,23 +152,20 @@ fn render(messages: &[ConversationMessage]) -> Result<(Vec<Piece>, usize)> {
         }
         rest = next;
     }
-    Ok((prompt, preamble))
+    Ok((prompt, head))
 }
 
-/// Inkling's native conversation and JSON tool-call codec.
-pub struct Adapter;
+/// Encode worded messages in Inkling's native framing.
+pub fn encode(tokenizer: &Tokenizer, messages: &[PromptMessage]) -> Result<Rendered> {
+    let (pieces, head) = render(messages)?;
+    encode_prompt(tokenizer, &pieces, head)
+}
 
-impl DialectAdapter for Adapter {
-    fn encode(&self, tokenizer: &Tokenizer, messages: &[ConversationMessage]) -> Result<Rendered> {
-        let (pieces, head) = render(messages)?;
-        encode_prompt(tokenizer, &pieces, head)
-    }
+/// Start decoding a response with its JSON tool calls.
+pub fn output_parser(tokenizer: &Tokenizer) -> Result<Box<dyn OutputParser + '_>> {
+    Ok(Box::new(output::Parser::new(tokenizer)?))
+}
 
-    fn output_parser<'a>(&self, tokenizer: &'a Tokenizer) -> Result<Box<dyn OutputParser + 'a>> {
-        Ok(Box::new(output::Parser::new(tokenizer)?))
-    }
-
-    fn is_stop_token(&self, tokenizer: &Tokenizer, token: u32) -> bool {
-        tokenizer.eos_token() == Some(token)
-    }
+pub fn is_stop_token(tokenizer: &Tokenizer, token: u32) -> bool {
+    tokenizer.eos_token() == Some(token)
 }

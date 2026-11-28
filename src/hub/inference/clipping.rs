@@ -31,7 +31,7 @@ pub fn boundaries(history: &[Message]) -> Vec<usize> {
 }
 
 /// Find where the turn of the user message at `user` opens: at its piped input, if any.
-fn opening(history: &[Message], user: usize) -> usize {
+pub fn opening(history: &[Message], user: usize) -> usize {
     match user.checked_sub(1).map(|index| &history[index]) {
         Some(Message::Input(_)) => user - 1,
         _ => user,
