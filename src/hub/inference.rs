@@ -13,6 +13,7 @@ use eyre::{Result, bail, ensure, eyre};
 use std::ops::Range;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::spawn_blocking;
 
 pub(super) mod clipping;
 mod reuse;
@@ -78,18 +79,13 @@ pub struct Generation {
     pub complete: bool,
 }
 
-/// Run file or allocation work off the async runtime.
-async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
-    Ok(tokio::task::spawn_blocking(work).await?)
-}
-
 impl Engine {
     /// Load an existing checkpoint; neither the engine nor its tokenizer downloads weights.
     pub async fn load(checkpoint: &std::path::Path, dialect: Dialect) -> Result<Self> {
         let started = Instant::now();
         let path = std::fs::canonicalize(checkpoint)?;
         let load_path = path.clone();
-        let weights = blocking(move || oco::load(load_path)).await??;
+        let weights = spawn_blocking(move || oco::load(load_path)).await??;
         let capacity = weights.capacity_within(GPU_SHARE);
         // `PLEASE_CONTEXT` caps the context, to try a full context's behavior on a short history.
         let cap = std::env::var("PLEASE_CONTEXT").ok();
@@ -157,13 +153,13 @@ impl Engine {
         let capacity = self.capacity;
         let weights = self.weights.clone();
         if head.is_empty() {
-            let session = blocking(move || weights.new_session(capacity)).await??;
+            let session = spawn_blocking(move || weights.new_session(capacity)).await??;
             return Ok((session, Start::Fresh));
         }
         let path = self.origin.path(head);
         let opened = {
             let (weights, path) = (weights.clone(), path.clone());
-            blocking(move || weights.open_session(path, capacity)).await?
+            spawn_blocking(move || weights.open_session(path, capacity)).await?
         };
         let opened = opened
             .inspect_err(|error| tracing::debug!("hub: no cached head: {error:#}"))
@@ -175,13 +171,13 @@ impl Engine {
             }
             return Ok((session, Start::Opened));
         }
-        let mut session = blocking(move || weights.new_session(capacity)).await??;
+        let mut session = spawn_blocking(move || weights.new_session(capacity)).await??;
         let mut inference = session.infer(head)?;
         inference.next().await?;
         drop(inference);
         // The head stays a session checkpoint, so rewinds past it never replay it.
         session.checkpoint()?;
-        let (session, saved) = blocking(move || {
+        let (session, saved) = spawn_blocking(move || {
             // A failed save costs the next invocation a prefill, never this request.
             let saved = heads::save(&path, |path| Ok(session.save(path)?));
             (session, saved.map(|()| path))
