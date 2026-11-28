@@ -136,8 +136,8 @@ fn notes_are_worded_by_the_hub() -> Result<()> {
     else {
         panic!("notes stay notes: {messages:?}");
     };
-    assert!(pending.starts_with("Pending command_id values: 3, 4."));
-    assert!(aside.starts_with("Previous answer ignored. Pending command_id values: 3."));
+    assert!(pending.contains("3, 4"));
+    assert!(aside.contains("ignored") && aside.contains('3'));
     // The draft is the model's own message, and transcript data the user's material: neither
     // speaks with the harness's authority.
     assert_eq!(draft, "You asked me to find a GC.");

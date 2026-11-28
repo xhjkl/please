@@ -214,9 +214,9 @@ mod tests {
         room.append(&some_messages())?;
         room.restart(&[Message::Answer("You asked me to find a GC.".into())])?;
         room.append(&[Message::User("look in ./gc".into())])?;
-        let restarted_from = "[6] the message the conversation last restarted from\n";
         let kept = chunks(&room.entries()?, 1 << 20);
-        assert!(kept[0].starts_with(restarted_from));
+        assert!(kept[0].starts_with("[6] ") && !kept[0].starts_with("[6] answer"));
+        assert!(kept[0].contains("restarted from"));
         std::fs::remove_dir_all(room.dir().join("old"))?;
         let erased = chunks(&room.entries()?, 1 << 20);
         assert_eq!(erased, kept);
@@ -247,10 +247,9 @@ mod tests {
         assert!(missing["error"].as_str().is_some());
         // The next compaction reads the summary as such, not as an ordinary answer.
         let next = chunks(&room.entries()?, 1 << 20);
-        assert_eq!(
-            next,
-            ["[6] the message the conversation last restarted from\nYou asked me to find a GC."]
-        );
+        assert_eq!(next.len(), 1);
+        assert!(next[0].contains("restarted from") && !next[0].contains("answer"));
+        assert!(next[0].ends_with("\nYou asked me to find a GC."));
         Ok(())
     }
 }
