@@ -198,23 +198,23 @@ pub async fn greet(stream: &mut tokio::net::UnixStream) -> Result<()> {
     }
 }
 
-/// Serialize any frame-like value and write it to the sink.
-pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin, T: serde::Serialize>(
+/// Write a frame to the sink.
+pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
     sink: &mut W,
-    frame: &T,
+    frame: &Frame,
 ) -> Result<()> {
     let bytes = postcard::to_allocvec(frame)?;
     sink.write_all(&bytes).await?;
     Ok(())
 }
 
-/// Read a single postcard frame from the stream, buffering as needed. With `patience`, the
-/// whole frame must arrive within it.
-pub async fn read_frame<T: serde::de::DeserializeOwned>(
+/// Read one frame from the stream, buffering as needed. With `patience`, the whole frame
+/// must arrive within it.
+pub async fn read_frame(
     stream: &mut tokio::net::UnixStream,
     store: &mut Vec<u8>,
     patience: Option<std::time::Duration>,
-) -> std::result::Result<T, ProtocolError> {
+) -> std::result::Result<Frame, ProtocolError> {
     use tokio::io::AsyncReadExt;
 
     let deadline = patience.map(|patience| tokio::time::Instant::now() + patience);
@@ -222,7 +222,7 @@ pub async fn read_frame<T: serde::de::DeserializeOwned>(
 
     loop {
         if !store.is_empty() {
-            match postcard::take_from_bytes::<T>(&store[..]) {
+            match postcard::take_from_bytes::<Frame>(&store[..]) {
                 // Reading on for the rest of a frame split across reads.
                 Err(postcard::Error::DeserializeUnexpectedEnd) => {}
                 Err(e) => return Err(ProtocolError::Decode(e)),

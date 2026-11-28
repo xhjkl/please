@@ -31,7 +31,7 @@ pub async fn run(checkpoint: &str, cases_path: &str) -> Result<()> {
             max_tokens: case.max_tokens,
         };
         write_frame(&mut stream, &request).await?;
-        let response: Frame = read_frame(&mut stream, &mut store, None).await?;
+        let response = read_frame(&mut stream, &mut store, None).await?;
         let report = match response {
             Frame::Error(error) => return Err(eyre!(error)),
             Frame::BenchmarkResult(report) => report,

@@ -87,7 +87,7 @@ async fn running_checkpoint() -> Result<Option<PathBuf>> {
     write_frame(&mut stream, &Frame::CheckpointRequest).await?;
     let mut buffer = Vec::new();
     let patience = std::time::Duration::from_secs(2);
-    let response = read_frame::<Frame>(&mut stream, &mut buffer, Some(patience)).await;
+    let response = read_frame(&mut stream, &mut buffer, Some(patience)).await;
     let Ok(Frame::Checkpoint { path }) = response else {
         return Ok(None);
     };
