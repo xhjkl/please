@@ -4,7 +4,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use tokio::io::{Interest, unix::AsyncFd};
 
 /// Read canonical terminal input without leaving a blocking stdin read on cancellation.
-pub async fn read_line() -> io::Result<String> {
+pub async fn read_terminal_line() -> io::Result<String> {
     // kqueue needs the terminal device itself, since `/dev/tty` cannot be registered on macOS.
     let device = nix::unistd::ttyname(io::stdin())?;
     let tty = OpenOptions::new()

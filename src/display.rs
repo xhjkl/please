@@ -5,7 +5,7 @@ mod terminal;
 
 pub use approval::Approval;
 pub use spinner::Spinner;
-pub use terminal::read_line as read_terminal_line;
+pub use terminal::read_terminal_line;
 
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use std::io::IsTerminal;
