@@ -49,7 +49,12 @@ mod tests {
         assert_ne!(name, name_of(b"hello!"));
         assert!(is_name(&name) && name.len() <= 26);
         assert!(!is_name("00000001") && !is_name(""));
+        assert!(!is_name("ybnd.123.0.tmp") && !is_name(&"y".repeat(27)));
         assert_eq!(z_base_32(0), "y");
+        assert_eq!(z_base_32(1), "b");
         assert_eq!(z_base_32(32), "by");
+        let largest = z_base_32(u128::MAX);
+        assert_eq!(largest, format!("8{}", "9".repeat(25)));
+        assert!(is_name(&largest) && is_name("y"));
     }
 }

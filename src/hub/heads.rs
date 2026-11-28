@@ -19,12 +19,6 @@ fn directory() -> PathBuf {
     super::directory().join("caches")
 }
 
-/// Whether `name` could be a head this module wrote; anything else in the directory, such as
-/// a save still being written, is left alone.
-fn is_head(name: &str) -> bool {
-    super::digest::is_name(name)
-}
-
 /// What a saved head's bytes depend on besides its IDs.
 #[derive(Clone)]
 pub struct Origin(Sha256);
@@ -77,12 +71,13 @@ pub fn touch(path: &Path) -> std::io::Result<()> {
 }
 
 /// Delete heads beyond the [`KEPT`] most recently used; each is as large as its attention
-/// cache. Another hub pruning at the same time may have removed a file already.
+/// cache. Another hub pruning at the same time may have removed a file already. Whatever is
+/// not named as a head, such as a save still being written, is left alone.
 fn prune(directory: &Path) -> std::io::Result<()> {
     let mut heads = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
-        if is_head(&entry.file_name().to_string_lossy()) {
+        if super::digest::is_name(&entry.file_name().to_string_lossy()) {
             let modified = entry.metadata()?.modified()?;
             heads.push((modified, entry.path()));
         }
@@ -106,16 +101,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn cache_names_use_z_base_32() {
-        assert_eq!(z_base_32(0), "y");
-        assert_eq!(z_base_32(1), "b");
-        assert_eq!(z_base_32(32), "by");
-        assert_eq!(z_base_32(u128::MAX), format!("8{}", "9".repeat(25)));
-        assert!(is_head(&z_base_32(u128::MAX)) && is_head("y"));
-        assert!(!is_head("ybnd.123.0.tmp") && !is_head("") && !is_head(&"y".repeat(27)));
-    }
-
-    #[test]
     fn heads_are_named_by_checkpoint_build_and_content() -> Result<()> {
         let directory = TempDir::new()?;
         let model = directory.0.join("model.gguf");
@@ -124,7 +109,8 @@ mod tests {
         let first = origin.path(&[1, 2, 3]);
         assert_eq!(first, Origin::new(&model)?.path(&[1, 2, 3]));
         assert_ne!(first, origin.path(&[1, 2, 4]));
-        assert!(is_head(&first.file_name().unwrap().to_string_lossy()));
+        let name = first.file_name().unwrap().to_string_lossy();
+        assert!(crate::hub::digest::is_name(&name));
         // Replacing the checkpoint in place renames all of its heads.
         std::fs::write(&model, b"other weights")?;
         assert_ne!(first, Origin::new(&model)?.path(&[1, 2, 3]));
