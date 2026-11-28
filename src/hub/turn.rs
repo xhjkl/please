@@ -136,24 +136,19 @@ pub async fn advance(
             };
             write_frame(sink, &Frame::Log(line)).await?;
             let id = entry(&kept);
-            kept.push(stored(call, id));
+            kept.push(Message::Call(call.with_id(id)));
             kept.push(result(id, &call.name, content));
         }
         let mut sent = Vec::with_capacity(probe.len());
         for call in probe {
-            let id = entry(&kept);
-            kept.push(stored(&call, id));
-            sent.push((id, call));
+            let call = call.with_id(entry(&kept));
+            kept.push(Message::Call(call.clone()));
+            sent.push(call);
         }
         room.append(&kept)?;
         if !sent.is_empty() || own.is_empty() {
-            for (id, call) in sent {
-                let frame = Frame::Call(ToolCall {
-                    id,
-                    name: call.name,
-                    arguments: call.arguments.to_string(),
-                });
-                write_frame(sink, &frame).await?;
+            for call in sent {
+                write_frame(sink, &Frame::Call(call)).await?;
             }
             return write_frame(sink, &Frame::Stop).await;
         }
@@ -273,14 +268,6 @@ fn prose(thinking: String, answer: String) -> Vec<Message> {
         kept.push(Message::Answer(answer));
     }
     kept
-}
-
-fn stored(call: &FunctionCall, id: u64) -> Message {
-    Message::Call(ToolCall {
-        id,
-        name: call.name.clone(),
-        arguments: call.arguments.to_string(),
-    })
 }
 
 fn result(id: u64, name: &str, content: String) -> Message {
@@ -562,7 +549,7 @@ mod tests {
             let id = ids.get();
             vec![
                 thinking,
-                stored(made, id),
+                Message::Call(made.with_id(id)),
                 result(id, &made.name, content.into()),
             ]
         };

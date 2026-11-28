@@ -1,7 +1,7 @@
 //! A prompt before framing: its preamble, and its messages as worded from the protocol's
 //! neutral history, with what every dialect needs to prepare them.
 use super::wording;
-use crate::protocol::{Effort, Message, Note, Setting};
+use crate::protocol::{Effort, Message, Note, Setting, ToolCall};
 use crate::tools::{ParamKind, Spec};
 use eyre::{Result, WrapErr};
 use serde_json::{Map, Value, json};
@@ -74,6 +74,17 @@ pub enum PromptMessage {
 pub struct FunctionCall {
     pub name: String,
     pub arguments: Value,
+}
+
+impl FunctionCall {
+    /// This call as the protocol carries it and a room keeps it, under `id`.
+    pub fn with_id(&self, id: u64) -> ToolCall {
+        ToolCall {
+            id,
+            name: self.name.clone(),
+            arguments: self.arguments.to_string(),
+        }
+    }
 }
 
 /// Encoded prompt and how many of its leading tokens are the same for every invocation, at

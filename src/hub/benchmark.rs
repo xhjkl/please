@@ -3,7 +3,7 @@ use super::{
     dialect::Delta,
     inference::{self, Engine},
 };
-use crate::protocol::{Frame, Message, Setting, ToolCall, ToolResult, read_frame, write_frame};
+use crate::protocol::{Frame, Message, Setting, ToolResult, read_frame, write_frame};
 use eyre::{Result, eyre};
 use serde::Deserialize;
 use std::{sync::Arc, time::Instant};
@@ -141,11 +141,7 @@ impl Exchange {
         let calls = self.calls.as_deref().unwrap_or_default();
         for call in calls {
             let id = next + messages.len() as u64;
-            messages.push(Message::Call(ToolCall {
-                id,
-                name: call.name.clone(),
-                arguments: call.arguments.to_string(),
-            }));
+            messages.push(Message::Call(call.with_id(id)));
             messages.push(Message::Result(ToolResult {
                 id,
                 name: call.name.clone(),
