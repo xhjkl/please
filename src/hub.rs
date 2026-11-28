@@ -57,7 +57,7 @@ pub use benchmark::run as benchmark;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use discovery::checkpoint_paths;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use download::run as load_weights;
+pub use download::run as download_checkpoint;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use server::{embed, run};
 
@@ -77,7 +77,7 @@ pub async fn benchmark(_checkpoint: &str, _cases_path: &str) -> eyre::Result<()>
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub async fn load_weights() -> eyre::Result<()> {
+pub async fn download_checkpoint() -> eyre::Result<()> {
     Err(eyre::eyre!(UNSUPPORTED))
 }
 

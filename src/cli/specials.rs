@@ -57,7 +57,7 @@ pub async fn run(special: Special<'_>) -> Result<()> {
             println!("{}", env!("CARGO_PKG_VERSION"));
             print_checkpoints().await?;
         }
-        Special::Load => crate::hub::load_weights().await?,
+        Special::Load => crate::hub::download_checkpoint().await?,
         Special::Hub => crate::hub::run().await?,
         Special::Bench { checkpoint, cases } => crate::hub::benchmark(checkpoint, cases).await?,
         Special::Docker(args) => {
