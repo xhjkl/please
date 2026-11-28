@@ -1,11 +1,10 @@
 use super::model::{Hunk, PatchOp};
 use super::text::normalize_eol;
 
-#[derive(Copy, Clone)]
-enum Marker {
-    Begin,
-    End,
-}
+/// The lines that open and close a patch, lowercase and without whitespace, as `find_marker`
+/// compares them.
+const BEGIN: &str = "***beginpatch";
+const END: &str = "***endpatch";
 
 #[derive(Copy, Clone)]
 enum Header {
@@ -17,8 +16,8 @@ enum Header {
 pub fn parse_patch_ops(raw: &str) -> Result<Vec<PatchOp>, String> {
     let src = normalize_eol(raw);
     let lines: Vec<&str> = src.lines().collect();
-    let begin = find_marker(&lines, 0, Marker::Begin).ok_or("Missing *** Begin Patch")?;
-    let end = find_marker(&lines, begin + 1, Marker::End).ok_or("Missing *** End Patch")?;
+    let begin = find_marker(&lines, 0, BEGIN).ok_or("Missing *** Begin Patch")?;
+    let end = find_marker(&lines, begin + 1, END).ok_or("Missing *** End Patch")?;
 
     let mut ops = Vec::new();
     let mut i = begin + 1;
@@ -55,20 +54,16 @@ pub fn parse_patch_ops(raw: &str) -> Result<Vec<PatchOp>, String> {
 pub fn contains_patch_syntax(s: &str) -> bool {
     let src = normalize_eol(s);
     let lines: Vec<&str> = src.lines().collect();
-    find_marker(&lines, 0, Marker::Begin).is_some()
-        || find_marker(&lines, 0, Marker::End).is_some()
+    find_marker(&lines, 0, BEGIN).is_some()
+        || find_marker(&lines, 0, END).is_some()
         || lines
             .iter()
             .any(|line| line.trim().starts_with("***") && parse_header(line).is_some())
 }
 
-/// Find the first `*** Begin Patch` or `*** End Patch` line from `from`, in any case or spacing.
-/// Nothing looser counts: `*** Add File: src/patch/frontend.rs` names "end" and "patch" too.
-fn find_marker(lines: &[&str], from: usize, which: Marker) -> Option<usize> {
-    let marker = match which {
-        Marker::Begin => "***beginpatch",
-        Marker::End => "***endpatch",
-    };
+/// Find the first line from `from` that is `marker`, in any case or spacing. Nothing looser
+/// counts: `*** Add File: src/patch/frontend.rs` names "end" and "patch" too.
+fn find_marker(lines: &[&str], from: usize, marker: &str) -> Option<usize> {
     let found = lines[from..]
         .iter()
         .position(|line| squeezed(line) == marker)?;
