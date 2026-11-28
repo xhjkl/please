@@ -3,7 +3,7 @@
 //! The template is reproduced piece by piece rather than evaluated: control tokens are
 //! inserted by ID, so marker spellings inside user, stdin, or tool content stay ordinary text.
 //! Deliberate departures from the template: such literal markers are never promoted to
-//! control tokens; instructions that arrive mid-conversation become user messages instead of
+//! control tokens; instructions that arrive mid-prompt become user messages instead of
 //! an error; and tool exchanges with no intervening assistant entry share one assistant step.
 use super::OutputParser;
 use super::piece::{Piece, encode_pieces, special};
@@ -96,7 +96,7 @@ impl Prompt {
         self.pieces.push(Piece::Marker(spelling));
     }
 
-    /// Add template-owned text whose marker spellings are structure, unlike conversation content.
+    /// Add template-owned text whose marker spellings are structure, unlike message content.
     fn markup(&mut self, mut text: &str) {
         while let Some((index, marker)) = MARKERS
             .iter()

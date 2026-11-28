@@ -120,7 +120,7 @@ async fn connect_to_hub_at(path: &Path) -> Result<UnixStream> {
         return start_detached_hub(path).await;
     }
 
-    let stream = crate::hub::spawn(None).await?;
+    let stream = crate::hub::embed(None).await?;
     tracing::info!("probe: connected to the embedded hub");
     Ok(stream)
 }

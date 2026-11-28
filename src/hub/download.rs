@@ -18,7 +18,7 @@ const URL: &str = concat!(
 );
 
 /// Reuse a verified copy or publish the download after verifying its SHA-256.
-pub async fn run_download() -> Result<()> {
+pub async fn run() -> Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let directory = discovery::weights_dir();
     std::fs::create_dir_all(&directory)?;
@@ -39,7 +39,7 @@ pub async fn run_download() -> Result<()> {
         return Ok(());
     }
 
-    let budget = discovery::model_budget()?;
+    let budget = discovery::memory_budget()?;
     if BYTES > budget {
         bail!("{FILENAME} requires {BYTES} bytes and exceeds the {budget}-byte memory budget");
     }

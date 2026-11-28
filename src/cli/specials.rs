@@ -54,7 +54,7 @@ pub async fn run(special: Special<'_>) -> Result<()> {
         Special::Help => println!("{HELP}"),
         Special::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
-            print_models().await?;
+            print_checkpoints().await?;
         }
         Special::Load => crate::hub::load_weights().await?,
         Special::Hub => crate::hub::run().await?,
@@ -76,7 +76,7 @@ pub async fn run(special: Special<'_>) -> Result<()> {
 }
 
 /// Ask a running hub, local or forwarded, which checkpoint it has loaded.
-async fn running_model() -> Result<Option<PathBuf>> {
+async fn running_checkpoint() -> Result<Option<PathBuf>> {
     let socket = crate::hub::socket_path();
     let connected = dial(&socket).await;
     let mut stream = match connected {
@@ -100,9 +100,9 @@ async fn running_model() -> Result<Option<PathBuf>> {
 }
 
 /// Print the available checkpoints under a heading for each folder, relative to `~` if inside.
-async fn print_models() -> Result<()> {
-    let running = running_model().await?;
-    let paths = crate::hub::model_paths(running)?;
+async fn print_checkpoints() -> Result<()> {
+    let running = running_checkpoint().await?;
+    let paths = crate::hub::checkpoint_paths(running)?;
     let home = std::env::var_os("HOME");
     let home = home
         .as_deref()

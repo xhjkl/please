@@ -18,7 +18,7 @@ pub struct Display {
     shows_hub_logs: bool,
 }
 
-/// A visible reasoning line that ends when the subturn moves on or is interrupted.
+/// A visible reasoning line that ends when the step moves on or is interrupted.
 pub struct ThinkingLine(());
 
 impl ThinkingLine {

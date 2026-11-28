@@ -8,7 +8,7 @@ use eyre::{Result, eyre};
 use serde::Deserialize;
 use std::{sync::Arc, time::Instant};
 
-/// One benchmark conversation, read from the cases file.
+/// One benchmark case, read from the cases file: a history to generate a reply to.
 #[derive(Deserialize)]
 struct Case {
     name: String,
@@ -18,10 +18,10 @@ struct Case {
 }
 
 /// Send benchmark cases to a colocated hub using the normal socket boundary.
-pub async fn run(model_path: &str, cases_path: &str) -> Result<()> {
+pub async fn run(checkpoint: &str, cases_path: &str) -> Result<()> {
     let source = std::fs::read_to_string(cases_path)?;
     let cases: Vec<Case> = serde_json::from_str(&source)?;
-    let mut stream = super::spawn(Some(model_path)).await?;
+    let mut stream = super::embed(Some(checkpoint)).await?;
     crate::protocol::greet(&mut stream).await?;
     let mut store = Vec::new();
     for case in cases {
@@ -45,24 +45,24 @@ pub async fn run(model_path: &str, cases_path: &str) -> Result<()> {
 }
 
 /// Capture model-side timings so socket latency does not distort generation measurements.
-/// Each case opens a fresh conversation, as a new invocation would: `first` starts from the
+/// Each case has a history of its own, as a new room would: `first` starts from the
 /// static head, which the hub's session still holds from an earlier case or restores from the
 /// cache or prefills (`start` says which), and `follow_up` continues it with the reply and
 /// stub tool results, as the probe's next request would.
 pub(super) async fn measure(
-    hub: Arc<Engine>,
+    engine: Arc<Engine>,
     setting: Setting,
     messages: Vec<Message>,
     max_tokens: usize,
 ) -> Result<String> {
-    let owner = hub.new_owner();
-    let first = exchange(&hub, owner, &setting, messages.clone(), max_tokens).await?;
+    let owner = engine.new_owner();
+    let first = exchange(&engine, owner, &setting, messages.clone(), max_tokens).await?;
     let mut follow_up = messages;
     let next = follow_up.len() as u64 + 1;
     follow_up.extend(first.reply(next));
-    let second = exchange(&hub, owner, &setting, follow_up, max_tokens).await?;
+    let second = exchange(&engine, owner, &setting, follow_up, max_tokens).await?;
     let report = serde_json::json!({
-        "model": hub.path, "load_seconds": hub.load_seconds,
+        "model": engine.path, "load_seconds": engine.load_seconds,
         "first": first.report()?, "follow_up": second.report()?,
     });
     Ok(report.to_string())
@@ -82,20 +82,20 @@ struct Exchange {
 /// Generate one reply to the case's history and record each token's arrival, as the probe
 /// would see it, without the socket in between.
 async fn exchange(
-    hub: &Arc<Engine>,
+    engine: &Arc<Engine>,
     owner: u64,
     setting: &Setting,
     messages: Vec<Message>,
     max_tokens: usize,
 ) -> Result<Exchange> {
-    let mut parser = hub.output_parser()?;
+    let mut parser = engine.output_parser()?;
     let mut first_visible = None;
     let mut answer = String::new();
     let mut thinking = String::new();
     let mut tokens = Vec::new();
     let mut times = Vec::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let worker = hub.clone();
+    let worker = engine.clone();
     let setting = setting.clone();
     let started = Instant::now();
     let task = tokio::spawn(async move {

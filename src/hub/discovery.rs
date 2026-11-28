@@ -4,9 +4,9 @@ use eyre::{Result, bail};
 use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 
-/// A complete local checkpoint selected for the next hub.
+/// A complete checkpoint file on this machine, as its metadata describes it.
 #[derive(Debug)]
-pub struct Model {
+pub struct Checkpoint {
     pub path: PathBuf,
     pub dialect: Dialect,
     parameters: u64,
@@ -19,16 +19,16 @@ pub fn weights_dir() -> PathBuf {
 }
 
 /// Reserve working-set headroom for context, scratch storage, and the rest of the system.
-pub fn model_budget() -> Result<u64> {
+pub fn memory_budget() -> Result<u64> {
     let memory = super::intuition::available_memory_bytes()?;
     Ok(memory.saturating_mul(4) / 5)
 }
 
 /// Identify a checkpoint from its metadata without loading it onto Metal.
-pub fn inspect(path: PathBuf) -> Result<Model> {
+pub fn inspect(path: PathBuf) -> Result<Checkpoint> {
     let info = oco::inspect(&path).map_err(|error| eyre::eyre!("{}: {error:#}", path.display()))?;
     let dialect = Dialect::from_architecture(&info.architecture)?;
-    Ok(Model {
+    Ok(Checkpoint {
         path,
         dialect,
         parameters: info.parameters,
@@ -38,96 +38,103 @@ pub fn inspect(path: PathBuf) -> Result<Model> {
 
 /// Inspect the weights directory's `.gguf` files alone: a download still in progress
 /// (`.gguf.part`) or a checkpoint renamed to any other extension stays out of the choice.
-fn installed_models(directory: &Path) -> Result<Vec<Model>> {
+fn installed(directory: &Path) -> Result<Vec<Checkpoint>> {
     let entries = std::fs::read_dir(directory);
     let entries = match entries {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(error) => return Err(error.into()),
         Ok(entries) => entries,
     };
-    let mut models = Vec::new();
+    let mut checkpoints = Vec::new();
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_none_or(|extension| extension != "gguf") {
             continue;
         }
-        let model = inspect(path);
-        match model {
+        let checkpoint = inspect(path);
+        match checkpoint {
             Err(error) => tracing::debug!("ignoring checkpoint: {error:#}"),
-            Ok(model) => models.push(model),
+            Ok(checkpoint) => checkpoints.push(checkpoint),
         }
     }
-    let rank = |model: &Model| {
-        let family = match model.dialect {
+    let rank = |checkpoint: &Checkpoint| {
+        let family = match checkpoint.dialect {
             Dialect::Inkling => 0,
             Dialect::Qwenish => 1,
             Dialect::Harmony => 2,
         };
-        (family, Reverse(model.parameters), Reverse(model.bytes))
+        (
+            family,
+            Reverse(checkpoint.parameters),
+            Reverse(checkpoint.bytes),
+        )
     };
-    models.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.path.cmp(&b.path)));
-    Ok(models)
+    checkpoints.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.path.cmp(&b.path)));
+    Ok(checkpoints)
 }
 
 /// Choose fitting weights from the preferred family. Fallbacks require Inkling's absence.
-fn selected_index(models: &[Model], budget: u64) -> Result<Option<usize>> {
-    let smallest_inkling = models
+fn selected_index(checkpoints: &[Checkpoint], budget: u64) -> Result<Option<usize>> {
+    let smallest_inkling = checkpoints
         .iter()
-        .filter(|model| model.dialect == Dialect::Inkling)
-        .min_by_key(|model| model.bytes);
-    if let Some(model) = smallest_inkling
-        && model.bytes > budget
+        .filter(|checkpoint| checkpoint.dialect == Dialect::Inkling)
+        .min_by_key(|checkpoint| checkpoint.bytes);
+    if let Some(checkpoint) = smallest_inkling
+        && checkpoint.bytes > budget
     {
         bail!(
             "installed Inkling checkpoint {} requires {} bytes and exceeds the {budget}-byte memory budget",
-            model.path.display(),
-            model.bytes
+            checkpoint.path.display(),
+            checkpoint.bytes
         );
     }
-    let family = smallest_inkling.map(|model| model.dialect);
-    Ok(models.iter().position(|model| {
-        model.bytes <= budget && family.is_none_or(|family| model.dialect == family)
+    let family = smallest_inkling.map(|checkpoint| checkpoint.dialect);
+    Ok(checkpoints.iter().position(|checkpoint| {
+        checkpoint.bytes <= budget && family.is_none_or(|family| checkpoint.dialect == family)
     }))
 }
 
-fn select_installed(directory: &Path, budget: u64) -> Result<Option<Model>> {
-    let mut models = installed_models(directory)?;
-    let selection = selected_index(&models, budget)?;
-    Ok(selection.map(|index| models.swap_remove(index)))
+fn select_installed(directory: &Path, budget: u64) -> Result<Option<Checkpoint>> {
+    let mut checkpoints = installed(directory)?;
+    let selection = selected_index(&checkpoints, budget)?;
+    Ok(selection.map(|index| checkpoints.swap_remove(index)))
 }
 
-fn explicit_model() -> Option<PathBuf> {
+fn explicit() -> Option<PathBuf> {
     let path = std::env::var_os("PLEASE_MODEL");
     path.map(PathBuf::from)
 }
 
-/// Select a checkpoint for a new hub, honoring an explicit override first.
-pub fn selected_model() -> Result<Option<Model>> {
-    let explicit = explicit_model();
+/// Select the checkpoint a new hub loads, honoring an explicit override first.
+pub fn select() -> Result<Option<Checkpoint>> {
+    let explicit = explicit();
     if let Some(path) = explicit {
-        let model = inspect(path)?;
-        return Ok(Some(model));
+        let checkpoint = inspect(path)?;
+        return Ok(Some(checkpoint));
     }
     let directory = weights_dir();
-    let budget = model_budget()?;
+    let budget = memory_budget()?;
     select_installed(&directory, budget)
 }
 
-/// List supported checkpoints with the running or newly selected model first.
-pub fn model_paths(running: Option<PathBuf>) -> Result<Vec<PathBuf>> {
-    let explicit = explicit_model();
+/// List supported checkpoints with the running or newly selected one first.
+pub fn checkpoint_paths(running: Option<PathBuf>) -> Result<Vec<PathBuf>> {
+    let explicit = explicit();
     let picked = running.or(explicit);
     let directory = weights_dir();
-    let mut models = installed_models(&directory)?;
-    if picked.is_none() && models.len() > 1 {
-        let budget = model_budget();
-        let selection = budget.and_then(|budget| selected_index(&models, budget));
+    let mut checkpoints = installed(&directory)?;
+    if picked.is_none() && checkpoints.len() > 1 {
+        let budget = memory_budget();
+        let selection = budget.and_then(|budget| selected_index(&checkpoints, budget));
         if let Ok(Some(index)) = selection {
-            models[..=index].rotate_right(1);
+            checkpoints[..=index].rotate_right(1);
         }
     }
-    let mut paths: Vec<_> = models.into_iter().map(|model| model.path).collect();
+    let mut paths: Vec<_> = checkpoints
+        .into_iter()
+        .map(|checkpoint| checkpoint.path)
+        .collect();
     if let Some(picked) = picked {
         promote_path(&mut paths, picked);
     }
@@ -192,8 +199,11 @@ mod tests {
             1024,
         )?;
         std::fs::write(directory.0.join("broken.gguf"), b"GGUF")?;
-        let models = installed_models(&directory.0)?;
-        let paths: Vec<_> = models.iter().map(|model| &model.path).collect();
+        let checkpoints = installed(&directory.0)?;
+        let paths: Vec<_> = checkpoints
+            .iter()
+            .map(|checkpoint| &checkpoint.path)
+            .collect();
         assert_eq!(paths, [&inkling, &large, &small, &fallback]);
         let small_bytes = std::fs::metadata(&small)?.len();
         let selected = select_installed(&directory.0, u64::MAX)?;

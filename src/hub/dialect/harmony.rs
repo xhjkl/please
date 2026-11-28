@@ -27,7 +27,7 @@ const CHANNEL: &str = "<|channel|>";
 const CONSTRAIN: &str = "<|constrain|>";
 /// Ends the header; the content follows.
 const MESSAGE: &str = "<|message|>";
-/// Ends a message that the conversation continues after.
+/// Ends a message that another follows.
 const END: &str = "<|end|>";
 /// Ends an assistant message addressed to a tool; generation stops for the call.
 const CALL: &str = "<|call|>";
@@ -37,7 +37,7 @@ const RETURN: &str = "<|return|>";
 /// The encoder's default identity and knowledge cutoff, which gpt-oss was trained under.
 const IDENTITY: &str =
     "You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06";
-/// Channel rules. The last sentence is the encoder's addition for conversations declaring
+/// Channel rules. The last sentence is the encoder's addition for prompts declaring
 /// function tools, which please's always do.
 const CHANNELS: &str = "# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.";
 
@@ -113,7 +113,7 @@ fn render(messages: &[PromptMessage]) -> (Prompt, usize) {
         let (preamble, rest) = split_preamble(messages);
         head = header(&mut prompt, preamble);
         for message in rest {
-            conversation_message(&mut prompt, message);
+            frame(&mut prompt, message);
         }
     }
     prompt.marker(START);
@@ -221,8 +221,8 @@ fn typescript(schema: &Value) -> String {
     }
 }
 
-/// Append a conversation entry; the harness's word mid-conversation is developer text.
-fn conversation_message(prompt: &mut Prompt, message: &PromptMessage) {
+/// Frame one worded message; the harness's word mid-turn is developer text.
+fn frame(prompt: &mut Prompt, message: &PromptMessage) {
     let assistant = |channel| Header {
         author: "assistant",
         channel: Some(channel),

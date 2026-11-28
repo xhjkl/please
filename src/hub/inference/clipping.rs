@@ -1,4 +1,4 @@
-//! Which conversation messages a prompt leaves out once the context fills.
+//! Which messages of a history a prompt leaves out once the context fills.
 //!
 //! Messages are dropped whole, at step boundaries, and only when the rendered prompt no longer
 //! fits; then enough go to bring it down to about half the capacity. The choice is kept per
@@ -7,7 +7,7 @@ use crate::protocol::Message;
 use eyre::Result;
 use std::ops::Range;
 
-/// Copy the probe history without the dropped messages.
+/// Copy the history without the dropped messages.
 pub fn visible(history: &[Message], dropped: &[Range<usize>]) -> Vec<Message> {
     history
         .iter()
@@ -52,7 +52,7 @@ pub fn choose(
         return Ok(dropped.to_vec());
     }
     let cuts = boundaries(history);
-    // A conversation that restarted may hold no request yet: the message it restarted from
+    // A room that restarted may hold no request yet: the summary it restarted from anchors
     // anchors it instead.
     let user = history
         .iter()
@@ -84,7 +84,7 @@ pub fn choose(
 }
 
 /// Merge ranges that overlap or touch; each new cut tends to cover the last, so the list would
-/// otherwise grow with every clip of a long conversation.
+/// otherwise grow with every clip of a long history.
 fn merged(ranges: impl Iterator<Item = Range<usize>>) -> Vec<Range<usize>> {
     let mut ranges: Vec<_> = ranges.filter(|range| !range.is_empty()).collect();
     ranges.sort_by_key(|range| range.start);

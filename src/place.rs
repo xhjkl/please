@@ -1,4 +1,4 @@
-//! Where this probe runs, which names its conversation on the hub.
+//! Where this probe runs, which names its room on the hub.
 use crate::protocol::Place;
 use eyre::Result;
 

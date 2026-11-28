@@ -4,7 +4,7 @@
 //! request feeds only what it does not already hold: the longest common prefix of the
 //! session's history and the newly rendered prompt stays, the session rewinds to it, and the
 //! rest is prefilled. Another owner's history keeps at least the static head, whose end is a
-//! checkpoint; a different head is read from `~/.please/caches`, or prefilled and saved once.
+//! session checkpoint; a different head is read from `~/.please/caches`, or prefilled and saved once.
 use super::dialect::{Dialect, OutputParser, Rendered};
 use super::heads;
 use super::occupancy::Occupancy;
@@ -26,7 +26,7 @@ const GPU_SHARE: f64 = 0.8;
 /// Smallest context worth serving: half for instructions and stdin, the rest for a reply.
 const MIN_CAPACITY: usize = 4 * REPLY_RESERVE;
 
-/// Loaded checkpoint and codec shared by all hub connections.
+/// The loaded checkpoint with its dialect and its one session, shared by all hub connections.
 pub struct Engine {
     /// Canonical checkpoint path, reported to probes.
     pub path: std::path::PathBuf,
@@ -55,10 +55,10 @@ struct KeptSession {
     dropped: Vec<Range<usize>>,
 }
 
-/// Where a request's session came from, which decides what its first prefill had to cover.
+/// Where a generation's session came from, which decides what its first prefill had to cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Start {
-    /// The previous request's session, which already held this prompt's static head.
+    /// The previous generation's session, which already held this prompt's static head.
     Kept,
     /// A fresh session restored from the cached static head.
     Opened,
@@ -84,6 +84,41 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 }
 
 impl Engine {
+    /// Load an existing checkpoint; neither the engine nor its tokenizer downloads weights.
+    pub async fn load(checkpoint: &std::path::Path, dialect: Dialect) -> Result<Self> {
+        let started = Instant::now();
+        let path = std::fs::canonicalize(checkpoint)?;
+        let load_path = path.clone();
+        let weights = blocking(move || oco::load(load_path)).await??;
+        let capacity = weights.capacity_within(GPU_SHARE);
+        // `PLEASE_CONTEXT` caps the context, to try a full context's behavior on a short history.
+        let cap = std::env::var("PLEASE_CONTEXT").ok();
+        let capacity = match cap.map(|cap| cap.parse()) {
+            Some(Err(_)) => bail!("PLEASE_CONTEXT must be a number of tokens"),
+            Some(Ok(cap)) => capacity.min(cap),
+            None => capacity,
+        };
+        ensure!(
+            capacity >= MIN_CAPACITY,
+            "{} leaves too little GPU memory for a context ({capacity} tokens)",
+            path.display()
+        );
+        tracing::info!("hub: context capacity {capacity} tokens");
+        let origin = heads::Origin::new(&path)?;
+        let load_seconds = started.elapsed().as_secs_f64();
+        Ok(Engine {
+            path,
+            load_seconds,
+            weights,
+            dialect,
+            origin,
+            capacity,
+            session: tokio::sync::Mutex::new(None),
+            occupancy: Occupancy::default(),
+            owners: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
     /// Bind output parsing to this checkpoint's tokenizer and selected dialect.
     pub fn output_parser(&self) -> Result<Box<dyn OutputParser + '_>> {
         self.dialect.output_parser(self.weights.tokenizer())
@@ -144,7 +179,7 @@ impl Engine {
         let mut inference = session.infer(head)?;
         inference.next().await?;
         drop(inference);
-        // The head stays a checkpoint, so rewinds into the conversation never replay it.
+        // The head stays a session checkpoint, so rewinds past it never replay it.
         session.checkpoint()?;
         let (session, saved) = blocking(move || {
             // A failed save costs the next invocation a prefill, never this request.
@@ -162,41 +197,6 @@ impl Engine {
         }
         Ok((session, Start::Prefilled))
     }
-}
-
-/// Load an existing checkpoint; neither the engine nor its tokenizer downloads weights.
-pub async fn load_model(model_path: &std::path::Path, dialect: Dialect) -> Result<Engine> {
-    let started = Instant::now();
-    let path = std::fs::canonicalize(model_path)?;
-    let load_path = path.clone();
-    let weights = blocking(move || oco::load(load_path)).await??;
-    let capacity = weights.capacity_within(GPU_SHARE);
-    // `PLEASE_CONTEXT` caps the context, to try long-conversation behavior on short ones.
-    let cap = std::env::var("PLEASE_CONTEXT").ok();
-    let capacity = match cap.map(|cap| cap.parse()) {
-        Some(Err(_)) => bail!("PLEASE_CONTEXT must be a number of tokens"),
-        Some(Ok(cap)) => capacity.min(cap),
-        None => capacity,
-    };
-    ensure!(
-        capacity >= MIN_CAPACITY,
-        "{} leaves too little GPU memory for a context ({capacity} tokens)",
-        path.display()
-    );
-    tracing::info!("hub: context capacity {capacity} tokens");
-    let origin = heads::Origin::new(&path)?;
-    let load_seconds = started.elapsed().as_secs_f64();
-    Ok(Engine {
-        path,
-        load_seconds,
-        weights,
-        dialect,
-        origin,
-        capacity,
-        session: tokio::sync::Mutex::new(None),
-        occupancy: Occupancy::default(),
-        owners: std::sync::atomic::AtomicU64::new(0),
-    })
 }
 
 /// Stream greedy predictions of the reply to `owner`'s `history`, stopping at a model boundary

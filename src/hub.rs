@@ -1,5 +1,6 @@
-//! Own model selection, loading, framing, and inference behind the socket protocol.
-//! The probe executes tools; even an embedded hub serves it over a Unix socket pair.
+//! Own checkpoint selection, loading, prompt framing, inference, and the rooms behind the
+//! socket protocol. The probe executes tools; even an embedded hub serves it over a Unix
+//! socket pair.
 //! Only Apple Silicon builds carry a hub; others are probes for a forwarded one.
 
 /// Why a probe-only build cannot do what needs a local hub.
@@ -39,11 +40,11 @@ mod inference;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod intuition;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod local;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod occupancy;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod rooms;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod server;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod transcript;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -52,11 +53,11 @@ mod turn;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use benchmark::run as benchmark;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use discovery::model_paths;
+pub use discovery::checkpoint_paths;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use download::run_download as load_weights;
+pub use download::run as load_weights;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use local::{run, spawn};
+pub use server::{embed, run};
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub async fn run() -> eyre::Result<()> {
@@ -64,12 +65,12 @@ pub async fn run() -> eyre::Result<()> {
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub async fn spawn(_model_path: Option<&str>) -> eyre::Result<tokio::net::UnixStream> {
+pub async fn embed(_checkpoint: Option<&str>) -> eyre::Result<tokio::net::UnixStream> {
     Err(eyre::eyre!(UNSUPPORTED))
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub async fn benchmark(_model_path: &str, _cases_path: &str) -> eyre::Result<()> {
+pub async fn benchmark(_checkpoint: &str, _cases_path: &str) -> eyre::Result<()> {
     Err(eyre::eyre!(UNSUPPORTED))
 }
 
@@ -79,6 +80,8 @@ pub async fn load_weights() -> eyre::Result<()> {
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub fn model_paths(running: Option<std::path::PathBuf>) -> eyre::Result<Vec<std::path::PathBuf>> {
+pub fn checkpoint_paths(
+    running: Option<std::path::PathBuf>,
+) -> eyre::Result<Vec<std::path::PathBuf>> {
     Ok(running.into_iter().collect())
 }

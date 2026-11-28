@@ -1,5 +1,5 @@
-//! Reading a conversation's transcript back: abbreviated for condensing, listed and quoted for
-//! the recall tool, which the hub runs itself.
+//! Reading a room's transcript back: abbreviated for compacting, listed and quoted for the
+//! recall tool, which the hub runs itself.
 use super::rooms::{Entry, Room};
 use crate::protocol::{Message, ToolCall, ToolResult};
 use crate::tools::{Param, ParamType};
@@ -91,7 +91,7 @@ pub fn chunks(entries: &[Entry], budget: usize) -> Vec<String> {
     let longest = budget / 2;
     let mut chunks: Vec<String> = Vec::new();
     for (index, entry) in entries.iter().filter(|entry| !entry.old).enumerate() {
-        // A conversation that restarted before opens with the message it restarted from.
+        // A room that restarted before opens with the summary it restarted from.
         // Numbering goes on across restarts, so its number tells even once `old` is erased.
         let previous =
             index == 0 && entry.number > 1 && matches!(entry.message, Message::Answer(_));
