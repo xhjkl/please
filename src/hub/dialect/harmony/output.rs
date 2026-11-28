@@ -7,7 +7,7 @@
 //! headers instead of failing them, bytes after a replacement show at once instead of one
 //! token later, and an unfinished character before a marker stays unshown in its message.
 use super::super::piece::special;
-use super::super::prompt::{Delta, FunctionCall};
+use super::super::{Delta, FunctionCall};
 use super::{CALL, CHANNEL, CONSTRAIN, END, MESSAGE, RETURN, START};
 use eyre::{Result, bail, eyre};
 use oco::Tokenizer;

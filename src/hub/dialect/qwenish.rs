@@ -8,7 +8,8 @@
 //! the template's effort sentences follow the instructions, after the date, rather than open
 //! the system message, so one cacheable prefix serves every effort.
 use super::piece::{Piece, encode_pieces};
-use super::prompt::{FunctionCall, Grade, Preamble, PromptMessage, Rendered};
+use super::prompt::{Grade, Preamble, PromptMessage};
+use super::{FunctionCall, Rendered};
 use crate::hub::wording;
 use crate::protocol::Effort;
 use eyre::{Result, eyre};

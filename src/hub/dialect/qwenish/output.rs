@@ -4,7 +4,7 @@
 //! under the template's own instructions; marker spellings the model writes out as ordinary
 //! text, for example when quoting documentation, stay content.
 use super::super::piece::special;
-use super::super::prompt::{Delta, FunctionCall};
+use super::super::{Delta, FunctionCall};
 use crate::tools::spec::{Param, ParamKind};
 use eyre::{Result, eyre};
 use oco::Tokenizer;
@@ -201,7 +201,7 @@ fn parse_call(source: &str) -> Result<FunctionCall> {
     let (name, body) = source
         .split_once('>')
         .ok_or_else(|| eyre!("unterminated function name"))?;
-    let specs = crate::hub::dialect::prompt::tool_specs();
+    let specs = super::super::tool_specs();
     let spec = specs.into_iter().find(|spec| spec.name == name);
     let parameters = spec.ok_or_else(|| eyre!("unknown tool {name}"))?.params;
     let mut body = body

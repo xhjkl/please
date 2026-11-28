@@ -11,7 +11,8 @@
 //! message, so the cacheable prefix outlasts the day. The reasoning line stays in the system
 //! message, the one place gpt-oss heeds it, so its prefix differs by effort.
 use super::piece::{Piece, encode_prompt};
-use super::prompt::{FunctionCall, Grade, Preamble, PromptMessage, Rendered, tool_schemas};
+use super::prompt::{Grade, Preamble, PromptMessage, tool_schemas};
+use super::{FunctionCall, Rendered};
 use crate::hub::wording;
 use crate::protocol::Effort;
 use eyre::Result;

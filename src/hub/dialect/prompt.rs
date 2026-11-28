@@ -1,8 +1,9 @@
 //! A prompt before framing: its preamble, and its messages as worded from the protocol's
 //! neutral history, with what every dialect needs to prepare them.
+use super::{FunctionCall, tool_specs};
 use crate::hub::wording;
-use crate::protocol::{Effort, Message, Note, Setting, ToolCall};
-use crate::tools::spec::{ParamKind, Spec};
+use crate::protocol::{Effort, Message, Note, Setting};
+use crate::tools::spec::ParamKind;
 use eyre::{Result, WrapErr};
 use serde_json::{Map, Value, json};
 
@@ -66,50 +67,6 @@ pub enum PromptMessage {
         name: String,
         content: String,
     },
-}
-
-/// A call as dialects read and write it, in decoded output and replayed history alike: a name
-/// and JSON arguments, with no ID.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FunctionCall {
-    pub name: String,
-    pub arguments: Value,
-}
-
-impl FunctionCall {
-    /// This call as the protocol carries it and a room keeps it, under `id`.
-    pub fn with_id(&self, id: u64) -> ToolCall {
-        ToolCall {
-            id,
-            name: self.name.clone(),
-            arguments: self.arguments.to_string(),
-        }
-    }
-}
-
-/// Encoded prompt and how many of its leading tokens make its cacheable prefix: the part
-/// that is the same for every invocation, at this effort where the family states it there,
-/// which a hub may prefill once and save.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rendered {
-    pub tokens: Vec<u32>,
-    pub cacheable: usize,
-}
-
-/// Newly visible generated text, by the section it belongs to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Delta {
-    Answer(String),
-    Thinking(String),
-}
-
-/// Every tool the model may call, the probe's and the hub's own, by name.
-pub fn tool_specs() -> Vec<Spec> {
-    let probe = crate::tools::probe_tools().into_values();
-    let probe = probe.map(|tool| tool.spec);
-    let mut specs: Vec<_> = probe.chain([crate::hub::transcript::RECALL_SPEC]).collect();
-    specs.sort_by_key(|spec| spec.name);
-    specs
 }
 
 /// Declare every tool as an OpenAI-style function schema for the chat templates.

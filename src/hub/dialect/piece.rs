@@ -1,6 +1,6 @@
 //! Template output shared by the dialects, which insert control tokens by ID so their
 //! spellings inside user, stdin, or tool content stay ordinary text.
-use super::prompt::Rendered;
+use super::Rendered;
 use eyre::{Result, eyre};
 use oco::Tokenizer;
 

@@ -1,8 +1,10 @@
 //! Model dialects: how each family of checkpoints frames a prompt and spells its reply.
 //! Hub-private; no dialect is carried over the probe protocol.
-use crate::protocol::{Message, Setting};
+use crate::protocol::{Message, Setting, ToolCall};
+use crate::tools::spec::Spec;
 use eyre::Result;
 use oco::Tokenizer;
+use serde_json::Value;
 
 /// Prompt format a checkpoint was trained on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +12,50 @@ pub enum Dialect {
     Inkling,
     Qwenish,
     Harmony,
+}
+
+/// A call as dialects read and write it, in decoded output and replayed history alike: a name
+/// and JSON arguments, with no ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: Value,
+}
+
+impl FunctionCall {
+    /// This call as the protocol carries it and a room keeps it, under `id`.
+    pub fn with_id(&self, id: u64) -> ToolCall {
+        ToolCall {
+            id,
+            name: self.name.clone(),
+            arguments: self.arguments.to_string(),
+        }
+    }
+}
+
+/// Encoded prompt and how many of its leading tokens make its cacheable prefix: the part
+/// that is the same for every invocation, at this effort where the family states it there,
+/// which a hub may prefill once and save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    pub tokens: Vec<u32>,
+    pub cacheable: usize,
+}
+
+/// Newly visible generated text, by the section it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delta {
+    Answer(String),
+    Thinking(String),
+}
+
+/// Every tool the model may call, the probe's and the hub's own, by name.
+pub fn tool_specs() -> Vec<Spec> {
+    let probe = crate::tools::probe_tools().into_values();
+    let probe = probe.map(|tool| tool.spec);
+    let mut specs: Vec<_> = probe.chain([crate::hub::transcript::RECALL_SPEC]).collect();
+    specs.sort_by_key(|spec| spec.name);
+    specs
 }
 
 /// One response being decoded in its checkpoint's dialect: model tokens in, dialect-neutral
@@ -100,4 +146,3 @@ mod prompt;
 mod qwenish;
 #[cfg(test)]
 mod tests;
-pub use prompt::{Delta, FunctionCall, Rendered};

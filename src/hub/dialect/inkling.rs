@@ -1,6 +1,7 @@
 //! Inkling 2 chat framing from the checkpoint's `tokenizer.chat_template`.
 use super::piece::{Piece, encode_prompt};
-use super::prompt::{FunctionCall, Preamble, PromptMessage, Rendered};
+use super::prompt::{Preamble, PromptMessage};
+use super::{FunctionCall, Rendered};
 use crate::hub::wording;
 use crate::protocol::Effort;
 use eyre::{Result, eyre};
