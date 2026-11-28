@@ -185,7 +185,7 @@ async fn incomplete_step_preserves_reconnect_budget_and_request() {
 async fn pending_command_allows_other_tools_and_requires_collection_before_answer() -> Result<()> {
     let jobs = Jobs::default();
     let start = crate::tools::invoke(
-        &all_tools(),
+        &probe_tools(),
         ToolContext::new(&jobs, None),
         "run_command",
         json!({ "argv": ["sleep", "999"], "wait_seconds": 0 }),

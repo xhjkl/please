@@ -103,7 +103,7 @@ pub fn kind_of(name: &str) -> ToolKind {
 }
 
 /// Every tool the probe runs.
-pub fn all_tools() -> Tools {
+pub fn probe_tools() -> Tools {
     Tools::from([
         tool!(list_files::SPEC, list_files::call),
         tool!(read_file::SPEC, read_file::call),

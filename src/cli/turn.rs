@@ -11,7 +11,7 @@ use crate::protocol::{
     Frame, Message, Note, Place, ProtocolError, Restarted, Setting, ToolCall, ToolResult,
     read_frame, write_frame,
 };
-use crate::tools::{Jobs, ToolContext, ToolKind, Tools, all_tools, kind_of, preview_patch};
+use crate::tools::{Jobs, ToolContext, ToolKind, Tools, kind_of, preview_patch, probe_tools};
 
 use super::commands::Command;
 use super::connect::connect_to_hub;
@@ -63,7 +63,7 @@ async fn attempt_turn(
     reconnect_attempts: &mut usize,
     display: &Display,
 ) -> Result<String> {
-    let tools = all_tools();
+    let tools = probe_tools();
 
     loop {
         let command_ids = jobs.pending_ids();

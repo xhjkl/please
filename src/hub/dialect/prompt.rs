@@ -105,7 +105,7 @@ pub enum Delta {
 
 /// Every tool the model may call, the probe's and the hub's own, by name.
 pub fn tool_specs() -> Vec<Spec> {
-    let probe = crate::tools::all_tools().into_values();
+    let probe = crate::tools::probe_tools().into_values();
     let probe = probe.map(|tool| tool.spec);
     let mut specs: Vec<_> = probe.chain([crate::hub::transcript::RECALL_SPEC]).collect();
     specs.sort_by_key(|spec| spec.name);
