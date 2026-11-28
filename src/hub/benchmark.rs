@@ -180,13 +180,7 @@ impl Exchange {
     /// What the probe would append before its next delivery, its calls numbered as the hub
     /// would number their entries from `next`; tools are never executed here.
     fn reply(&self, next: u64) -> Vec<Message> {
-        let mut messages = Vec::new();
-        if !self.thinking.is_empty() {
-            messages.push(Message::Thinking(self.thinking.clone()));
-        }
-        if !self.answer.is_empty() {
-            messages.push(Message::Answer(self.answer.clone()));
-        }
+        let mut messages = super::step::prose(self.thinking.clone(), self.answer.clone());
         let calls = self.calls.as_deref().unwrap_or_default();
         for call in calls {
             let id = next + messages.len() as u64;

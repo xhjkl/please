@@ -30,6 +30,8 @@ mod benchmark;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod clipping;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod compaction;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod dialect;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod digest;
@@ -45,6 +47,8 @@ mod prefix_cache;
 mod rooms;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod server;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod step;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod transcript;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

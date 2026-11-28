@@ -1,44 +1,23 @@
 //! The hub's part of a turn, in the place's room: keep what the probe delivers, compact the
-//! conversation when it nears the context's end, generate, run the hub's own tools, and keep
-//! each step. The probe sends only what is new; the conversation so far lives in the room.
-use super::clipping;
-use super::dialect::{Delta, FunctionCall};
-use super::inference::{self, Engine};
-use super::rooms::{Entry, Room};
+//! conversation when it nears the context's end, generate a step, run the hub's own tools,
+//! and keep each step. The probe sends only what is new; the conversation so far lives in the
+//! room.
+use super::compaction;
+use super::dialect::FunctionCall;
+use super::inference::Engine;
+use super::rooms::Room;
+use super::step;
 use super::transcript;
 use super::wording;
 use crate::protocol::{
-    Destination, Frame, Message, Note, Place, Restarted, Setting, ToolCall, ToolResult, write_frame,
+    Frame, Message, Note, Place, Restarted, Setting, ToolCall, ToolResult, write_frame,
 };
 use eyre::{Result, bail, eyre};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
-/// Share of the context a prompt may fill before the conversation is compacted: restarted
-/// from a summary of it.
-const COMPACT_AT: f64 = 0.75;
-/// Share of what the instructions leave free that each chunk to summarize may take, and the
-/// bytes a token is counted as; code tokens average more, so chunks come out smaller than
-/// allowed.
-const CHUNK_SHARE: f64 = 0.5;
-const BYTES_PER_TOKEN: f64 = 2.5;
-/// Tokens kept free around each chunk for the instructions and the drafts, the new one at most
-/// `DRAFT_TOKENS` long.
-const COMPACT_RESERVE: usize = 2048;
-const DRAFT_TOKENS: usize = 1024;
-/// Share of the context the turn in progress may keep verbatim after the summary.
-const KEEP_SHARE: f64 = 0.25;
 /// Consecutive steps the hub may take by itself before handing the turn back to the probe.
 const HUB_STEPS: usize = 16;
-
-/// What the model produced in one response.
-struct Step {
-    thinking: String,
-    answer: String,
-    calls: Result<Vec<FunctionCall>>,
-    /// The response ended by itself rather than at its token limit.
-    complete: bool,
-}
 
 /// Advance the turn: keep delivery `id`'s `messages` in the place's room and stream the reply.
 /// The messages are kept on arrival, once per delivery, so a retry after a dropped connection
@@ -69,31 +48,26 @@ pub async fn advance(
     });
     keep_delivery(&room, id, incoming)?;
     // A recalled page may take a tenth of the context, so recalling cannot crowd it out.
-    let page =
-        transcript::RECALL_PAGE.min((engine.capacity as f64 * 0.1 * BYTES_PER_TOKEN) as usize);
+    let page = transcript::RECALL_PAGE
+        .min((engine.capacity as f64 * 0.1 * compaction::BYTES_PER_TOKEN) as usize);
     let mut compacted = false;
     for _ in 0..HUB_STEPS {
         let mut history = room.history()?;
         history.extend(notes.iter().cloned());
-        if !compacted && engine.fill(setting, &history)? >= COMPACT_AT {
+        if !compacted && compaction::is_due(engine, setting, &history)? {
             compacted = true;
-            let base = engine.fill(setting, &[])?;
-            let fits = |kept: &[Message]| Ok(engine.fill(setting, kept)? - base <= KEEP_SHARE);
-            let conversation = room.conversation()?;
-            let (folded, kept) = cutover(conversation, fits)?;
-            // Models tend to end their turn after a message of their own.
-            let resume = kept.is_empty();
-            let restarted = compact(sink, engine, setting, &room, folded, kept).await;
+            let restarted = compaction::compact_mid_turn(sink, engine, setting, &room).await;
             match restarted {
                 // Clipping old messages still lets the turn go on.
                 Err(error) => {
                     let line = format!("cannot compact the conversation: {error:#}");
                     write_frame(sink, &Frame::Log(line)).await?;
                 }
-                Ok(summary) => {
+                Ok((summary, continues)) => {
                     let restarted = Restarted::Summarized(summary);
                     write_frame(sink, &Frame::Restarted(restarted)).await?;
-                    if resume {
+                    // Models tend to end their turn after a message of their own.
+                    if !continues {
                         notes.push(Message::Note(Note::Resume));
                     }
                     history = room.history()?;
@@ -103,8 +77,8 @@ pub async fn advance(
         }
         // The conversation owns its history, so a restart brings another owner.
         let owner = room.epoch()?;
-        let step = generate(Some(&mut *sink), engine, owner, setting, &history, None).await?;
-        let mut kept = prose(step.thinking, step.answer);
+        let step = step::generate(Some(&mut *sink), engine, owner, setting, &history, None).await?;
+        let mut kept = step::prose(step.thinking, step.answer);
         // A call's ID is the number of the entry that first keeps it.
         let first = room.next()?;
         let entry = |kept: &[Message]| first + kept.len() as u64;
@@ -176,7 +150,8 @@ pub async fn restart(
     let restarted = if conversation.is_empty() {
         Restarted::Empty
     } else if summarize {
-        let summary = compact(sink, engine, setting, &room, conversation, vec![]).await?;
+        let summary =
+            compaction::compact(sink, engine, setting, &room, conversation, vec![]).await?;
         Restarted::Summarized(summary)
     } else {
         room.restart(&[])?;
@@ -209,57 +184,6 @@ fn keep_delivery(room: &Room, id: u64, incoming: Vec<Message>) -> Result<()> {
     }
     room.append(&arriving)?;
     room.set_last_delivery(id)
-}
-
-/// Split a conversation for its restart into the entries its summary is folded from and the
-/// messages that follow the summary verbatim. The turn in progress follows whole if it `fits`;
-/// otherwise its request and as many of its newest steps as fit, then its request alone, then
-/// nothing, with the rest of the turn folded in.
-fn cutover(
-    mut entries: Vec<Entry>,
-    fits: impl Fn(&[Message]) -> Result<bool>,
-) -> Result<(Vec<Entry>, Vec<Message>)> {
-    let current: Vec<_> = entries.iter().map(|entry| entry.message.clone()).collect();
-    let user = current
-        .iter()
-        .rposition(|message| matches!(message, Message::User(_)));
-    let Some(user) = user else {
-        return Ok((entries, vec![]));
-    };
-    let opens = clipping::opening(&current, user);
-    let (fold, kept) = if fits(&current[opens..])? {
-        (opens, current[opens..].to_vec())
-    } else {
-        let request = &current[opens..=user];
-        let mut kept = (current.len(), vec![]);
-        if fits(request)? {
-            kept.1 = request.to_vec();
-            // Each earlier step boundary keeps more of the turn.
-            let steps = clipping::boundaries(&current).into_iter().rev();
-            for step in steps.take_while(|&step| step > user + 1) {
-                let candidate: Vec<_> = request.iter().chain(&current[step..]).cloned().collect();
-                if !fits(&candidate)? {
-                    break;
-                }
-                kept = (step, candidate);
-            }
-        }
-        kept
-    };
-    entries.truncate(fold);
-    Ok((entries, kept))
-}
-
-/// A step's reasoning and answer; a response of calls alone still opens its own step.
-fn prose(thinking: String, answer: String) -> Vec<Message> {
-    let mut kept = Vec::new();
-    if !thinking.is_empty() || answer.is_empty() {
-        kept.push(Message::Thinking(thinking));
-    }
-    if !answer.is_empty() {
-        kept.push(Message::Answer(answer));
-    }
-    kept
 }
 
 fn result(id: u64, name: &str, content: String) -> Message {
@@ -310,109 +234,6 @@ fn unanswered(kept: &[Message]) -> Vec<Message> {
             _ => unreachable!("only calls end the conversation here"),
         })
         .collect()
-}
-
-/// Compact the room's conversation: fold the entries in `folded` into one summary, a chunk
-/// at a time, and restart from it, followed by `kept`. Progress goes to the
-/// probe as log lines.
-async fn compact(
-    sink: &mut (impl AsyncWriteExt + Unpin),
-    engine: &Arc<Engine>,
-    setting: &Setting,
-    room: &Room,
-    folded: Vec<Entry>,
-    kept: Vec<Message>,
-) -> Result<String> {
-    // The answer's destination does not apply to the summary.
-    let setting = Setting {
-        destination: Destination::Terminal,
-        ..setting.clone()
-    };
-    let base = engine.fill(&setting, &[])?;
-    let free = engine.capacity as f64 * (1.0 - base) - COMPACT_RESERVE as f64;
-    let budget = (free * CHUNK_SHARE * BYTES_PER_TOKEN).max(1024.0) as usize;
-    let chunks = transcript::chunks(&folded, budget);
-    if chunks.is_empty() {
-        bail!("nothing to compact before the turn in progress");
-    }
-    let parts = chunks.len();
-    let mut draft: Option<String> = None;
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        let part = index + 1;
-        let progress = format!("compacting the conversation ({part}/{parts})");
-        write_frame(sink, &Frame::Log(progress)).await?;
-        let note = Note::Summarize {
-            draft: draft.take(),
-            chunk,
-        };
-        // A fresh owner: summarizing prompts share no clipping with any conversation.
-        let owner = crate::protocol::fresh_id();
-        let prompt = [Message::Note(note)];
-        let quiet = None::<&mut tokio::io::Sink>;
-        // Decoding is greedy, so asking again would write the same message.
-        let step = generate(quiet, engine, owner, &setting, &prompt, Some(DRAFT_TOKENS)).await?;
-        if !step.complete {
-            bail!("the message for part {part} of the transcript ran past {DRAFT_TOKENS} tokens");
-        }
-        if !matches!(&step.calls, Ok(calls) if calls.is_empty()) {
-            bail!("the model called tools instead of writing part {part}'s message");
-        }
-        let message = step.answer.trim();
-        if message.is_empty() {
-            bail!("the model wrote nothing for part {part} of the transcript");
-        }
-        draft = Some(message.to_string());
-    }
-    let summary = draft.unwrap_or_default();
-    let restarted: Vec<_> = std::iter::once(Message::Answer(summary.clone()))
-        .chain(kept)
-        .collect();
-    room.restart(&restarted)?;
-    Ok(summary)
-}
-
-/// Generate one response to `history`, streaming its text to `sink` when given.
-async fn generate(
-    mut sink: Option<&mut (impl AsyncWriteExt + Unpin)>,
-    engine: &Arc<Engine>,
-    owner: u64,
-    setting: &Setting,
-    history: &[Message],
-    max_tokens: Option<usize>,
-) -> Result<Step> {
-    let mut parser = engine.output_parser()?;
-    let (sender, mut generated) = tokio::sync::mpsc::unbounded_channel();
-    let (engine, setting, history) = (engine.clone(), setting.clone(), history.to_vec());
-    let task = tokio::spawn(async move {
-        inference::generate(&engine, owner, &setting, &history, sender, max_tokens).await
-    });
-    let (mut thinking, mut answer) = (String::new(), String::new());
-    while let Some(token) = generated.recv().await {
-        for delta in parser.push_token(token)? {
-            let frame = match delta {
-                Delta::Answer(text) => {
-                    answer.push_str(&text);
-                    Frame::Answer(text)
-                }
-                Delta::Thinking(text) => {
-                    thinking.push_str(&text);
-                    Frame::Thinking(text)
-                }
-            };
-            if let Some(sink) = sink.as_mut() {
-                write_frame(sink, &frame).await?;
-            }
-        }
-    }
-    let generation = task.await??;
-    let calls = parser.finish();
-    let complete = generation.is_some_and(|generation| generation.complete);
-    Ok(Step {
-        thinking,
-        answer,
-        calls,
-        complete,
-    })
 }
 
 #[cfg(test)]
