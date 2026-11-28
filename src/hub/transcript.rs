@@ -91,7 +91,7 @@ pub fn chunks(entries: &[Entry], budget: usize) -> Vec<String> {
     let longest = budget / 2;
     let mut chunks: Vec<String> = Vec::new();
     for (index, entry) in entries.iter().filter(|entry| !entry.old).enumerate() {
-        // A room that restarted before opens with the summary it restarted from.
+        // A conversation that restarted opens with the summary it restarted from.
         // Numbering goes on across restarts, so its number tells even once `old` is erased.
         let previous =
             index == 0 && entry.number > 1 && matches!(entry.message, Message::Answer(_));

@@ -26,17 +26,17 @@ const SPECIAL_PATIENCE: Duration = Duration::from_millis(100);
 enum Invocation<'a> {
     /// A command to `please` itself.
     Special(Special<'a>),
-    /// Talk with the model, as nearly every run does.
-    Conversation(Conversation),
+    /// Work with the model, as nearly every run is, in one of its modes.
+    Ordinary(Mode),
 }
 
-/// How a run of `please` talks with the model, in the room of the place it runs in.
-enum Conversation {
-    /// At the prompt, a request or a command per line, until the user leaves.
+/// How an ordinary run of `please` works with the model.
+enum Mode {
+    /// At the prompt: a request or a command per line, until the user leaves.
     Interactive,
-    /// A command given as the whole one-shot request.
+    /// One command, given as the whole one-shot request.
     Command(Command),
-    /// A one-shot request, opening with any data piped along with it.
+    /// One request, opening with any data piped along with it.
     Request(Vec<Message>),
 }
 
@@ -52,24 +52,24 @@ fn invocation<'a>(
     let prompt = args.join(" ");
     if let Some(input) = input {
         let request = vec![Message::Input(input), Message::User(prompt)];
-        return Ok(Invocation::Conversation(Conversation::Request(request)));
+        return Ok(Invocation::Ordinary(Mode::Request(request)));
     }
     if let Some(special) = special {
         return Ok(Invocation::Special(special));
     }
-    let conversation = if terminal && prompt.is_empty() {
-        Conversation::Interactive
+    let mode = if terminal && prompt.is_empty() {
+        Mode::Interactive
     } else {
         match commands::parse_one_shot(&prompt) {
             Some(Err(error)) => eyre::bail!(error),
-            Some(Ok(command)) => Conversation::Command(command),
-            None => Conversation::Request(vec![Message::User(prompt)]),
+            Some(Ok(command)) => Mode::Command(command),
+            None => Mode::Request(vec![Message::User(prompt)]),
         }
     };
-    Ok(Invocation::Conversation(conversation))
+    Ok(Invocation::Ordinary(mode))
 }
 
-/// Run a special, or hold a conversation: at the prompt, or one-shot.
+/// Run a special, or work with the model: at the prompt, or one-shot.
 pub async fn run() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let special = specials::parse(&args);
@@ -87,12 +87,12 @@ pub async fn run() -> Result<ExitCode> {
     let display = Arc::new(Display::new(hub_in_foreground));
     crate::logging::route_to_display(display.clone());
 
-    let conversation = match invocation {
+    let mode = match invocation {
         Invocation::Special(special) => {
             specials::run(special).await?;
             return Ok(ExitCode::SUCCESS);
         }
-        Invocation::Conversation(conversation) => conversation,
+        Invocation::Ordinary(mode) => mode,
     };
     // Redirected stdout is worth telling the model about even when its path is unknown.
     let redirection = io::stdout_redirection_path();
@@ -103,8 +103,8 @@ pub async fn run() -> Result<ExitCode> {
         place: &place,
         setting: &setting,
     };
-    let conversed = converse(&display, scene, conversation).await;
-    match conversed {
+    let outcome = run_ordinary(&display, scene, mode).await;
+    match outcome {
         Err(error) if error.downcast_ref::<HubBusy>().is_some() => {
             eprintln!("please: {error}");
             Ok(ExitCode::from(EX_TEMPFAIL))
@@ -118,8 +118,9 @@ pub async fn run() -> Result<ExitCode> {
     }
 }
 
-/// Connect to the hub, maybe starting a new hub process, and hold the conversation.
-async fn converse(display: &Display, scene: Scene<'_>, conversation: Conversation) -> Result<()> {
+/// Run an ordinary invocation in its mode, connecting to the hub first and maybe starting a
+/// new hub process.
+async fn run_ordinary(display: &Display, scene: Scene<'_>, mode: Mode) -> Result<()> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let little_snake = display.start_spinning();
     let stream = tokio::select! {
@@ -140,10 +141,10 @@ async fn converse(display: &Display, scene: Scene<'_>, conversation: Conversatio
     };
     let mut stream = Some(stream);
 
-    match conversation {
-        Conversation::Interactive => interact(&mut stream, display, scene).await?,
-        Conversation::Command(command) => restart(&mut stream, display, scene, command).await?,
-        Conversation::Request(request) => {
+    match mode {
+        Mode::Interactive => interact(&mut stream, display, scene).await?,
+        Mode::Command(command) => restart(&mut stream, display, scene, command).await?,
+        Mode::Request(request) => {
             run_turn(&mut stream, display, scene, request).await?;
         }
     }
@@ -171,9 +172,7 @@ mod tests {
     #[test]
     fn piped_data_makes_any_invocation_a_request() -> Result<()> {
         let (help, compact) = (words("help"), words("compact"));
-        let Invocation::Conversation(Conversation::Request(request)) =
-            read(&help, Some("data"), false)?
-        else {
+        let Invocation::Ordinary(Mode::Request(request)) = read(&help, Some("data"), false)? else {
             panic!("piped data with a special's name is a request");
         };
         assert_eq!(
@@ -182,7 +181,7 @@ mod tests {
         );
         assert!(matches!(
             read(&compact, Some("data"), false)?,
-            Invocation::Conversation(Conversation::Request(_))
+            Invocation::Ordinary(Mode::Request(_))
         ));
 
         assert!(matches!(
@@ -191,11 +190,11 @@ mod tests {
         ));
         assert!(matches!(
             read(&compact, None, false)?,
-            Invocation::Conversation(Conversation::Command(Command::Compact))
+            Invocation::Ordinary(Mode::Command(Command::Compact))
         ));
         assert!(matches!(
             read(&[], None, true)?,
-            Invocation::Conversation(Conversation::Interactive)
+            Invocation::Ordinary(Mode::Interactive)
         ));
         assert!(read(&words("/frobnicate"), None, false).is_err());
         Ok(())

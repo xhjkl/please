@@ -52,7 +52,7 @@ pub fn choose(
         return Ok(dropped.to_vec());
     }
     let cuts = boundaries(history);
-    // A room that restarted may hold no request yet: the summary it restarted from anchors
+    // A conversation that restarted may hold no request yet: the summary it restarted from
     // anchors it instead.
     let user = history
         .iter()

@@ -45,7 +45,7 @@ pub async fn run(checkpoint: &str, cases_path: &str) -> Result<()> {
 }
 
 /// Capture model-side timings so socket latency does not distort generation measurements.
-/// Each case has a history of its own, as a new room would: `first` starts from the
+/// Each case has a history of its own, as a new conversation would: `first` starts from the
 /// static head, which the hub's session still holds from an earlier case or restores from the
 /// cache or prefills (`start` says which), and `follow_up` continues it with the reply and
 /// stub tool results, as the probe's next request would.

@@ -8,7 +8,7 @@ use crate::protocol::{HubBusy, Message};
 use super::commands;
 use super::turn::{Scene, is_cancelled, restart, run_turn};
 
-/// Read requests and commands until an empty line or end of input; the room carries what was
+/// Read requests and commands until an empty line or end of input; the room carries the
 /// conversation from one to the next.
 pub async fn interact(
     stream: &mut Option<UnixStream>,

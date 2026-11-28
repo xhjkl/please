@@ -1,8 +1,10 @@
 //! Rooms the hub keeps on disk, one directory each under `~/.please/rooms`.
 //!
 //! Each place a probe runs in, a machine and working directory, has its own room, which keeps
-//! what is said there from one run of please to the next: the directory is named after the
-//! place, which its `.where` file spells out. `/new` starts the room over.
+//! the conversation held there from one run of please to the next: the directory is named
+//! after the place, which its `.where` file spells out. The conversation is what was said since
+//! it last restarted, from a summary of it or, with `/new`, from nothing; what was said before
+//! stays in the room, set aside.
 //!
 //! A room is a directory of plain-text entries named by eight-digit sequence numbers, so they
 //! list in order. An entry is its kind on the first line (`user`, `input`, `thinking`,
@@ -14,8 +16,9 @@
 //! is kept there yet. Restarting sets the entries so far aside in the `old` subdirectory, which
 //! `rm -r old` erases; until then recall still reads them. The harness's notes are not kept.
 //!
-//! Everything besides the entries and `old` is a dotfile, so the directory lists as what was
-//! said alone. Everything is private to its owner, and one hub at a time works in a room.
+//! Everything besides the entries and `old` is a dotfile, so the directory lists as the
+//! conversation alone. Everything is private to its owner, and one hub at a time works in a
+//! room.
 use crate::protocol::{Message, Place, ToolCall, ToolResult};
 use eyre::{Result, WrapErr, bail, eyre};
 use std::fs::{File, OpenOptions};
@@ -83,20 +86,20 @@ impl Room {
         Ok(lock)
     }
 
-    /// Every readable entry, old ones included, oldest first. Unreadable ones are left out with
-    /// a warning rather than costing the room.
+    /// The transcript: every readable entry, old ones included, oldest first. Unreadable ones
+    /// are left out with a warning rather than costing the rest.
     pub fn entries(&self) -> Result<Vec<Entry>> {
         self.read_entries(|_| true)
     }
 
-    /// What was said since the last restart.
-    pub fn messages(&self) -> Result<Vec<Message>> {
+    /// The conversation: what was said since the last restart.
+    pub fn conversation(&self) -> Result<Vec<Message>> {
         let entries = self.read_entries(|old| !old)?;
         Ok(entries.into_iter().map(|entry| entry.message).collect())
     }
 
-    /// The number of the room's first entry since the last restart, which changes with every
-    /// restart; zero before anything is said.
+    /// The number of the conversation's first entry, which changes with every restart; zero
+    /// while the conversation is empty.
     pub fn epoch(&self) -> Result<u64> {
         let current = self.names()?.into_iter().find(|&(_, old)| !old);
         Ok(current.map_or(0, |(number, _)| number))
@@ -115,8 +118,9 @@ impl Room {
         Ok(())
     }
 
-    /// Continue from `messages` alone, setting every entry so far aside in `old`. The new
-    /// entries come first, so a failure midway never leaves the room empty.
+    /// Restart the conversation from `messages` alone, setting every entry so far aside in
+    /// `old`. The new entries come first, so a failure midway never leaves the conversation
+    /// empty.
     pub fn restart(&self, messages: &[Message]) -> Result<()> {
         make_dir(&self.dir.join(OLD))?;
         let before = self.names()?;
@@ -342,7 +346,7 @@ mod tests {
             .into_iter()
             .filter(|message| !matches!(message, Message::Note(_)))
             .collect();
-        assert_eq!(room.messages()?, kept);
+        assert_eq!(room.conversation()?, kept);
         let user = std::fs::read_to_string(room.dir().join("00000002"))?;
         assert_eq!(user, "user\n\nfind me a gc implementation");
         let call = std::fs::read_to_string(room.dir().join("00000004"))?;
@@ -377,7 +381,7 @@ mod tests {
         room.append(&some_messages())?;
         let summary = Message::Answer("You asked me to find a GC; next I'll read ./gc.".into());
         room.restart(std::slice::from_ref(&summary))?;
-        assert_eq!(room.messages()?, std::slice::from_ref(&summary));
+        assert_eq!(room.conversation()?, std::slice::from_ref(&summary));
         assert!(room.dir().join("old/00000002").exists());
         assert!(room.dir().join("00000007").exists());
         assert_eq!(room.read("2")?, "user\n\nfind me a gc implementation");
@@ -399,16 +403,16 @@ mod tests {
         let room = Room::at(dir.0.join("room"))?;
         std::fs::write(room.dir().join("notes.txt"), "mine")?;
         std::fs::write(room.dir().join(".00000001.partial"), "user\n\nhalf")?;
-        assert!(room.messages()?.is_empty());
+        assert!(room.conversation()?.is_empty());
         std::fs::write(room.dir().join("00000001"), "letter\n\nhi")?;
         std::fs::create_dir(room.dir().join("old"))?;
         std::fs::write(room.dir().join("old/00000002"), "")?;
         std::fs::write(room.dir().join("00000003"), "call list_files\n\n{}")?;
         room.append(&[Message::User("still here".into())])?;
-        assert_eq!(room.messages()?, [Message::User("still here".into())]);
+        assert_eq!(room.conversation()?, [Message::User("still here".into())]);
         // A restart sets entries aside without reading them.
         room.restart(&[])?;
-        assert!(room.messages()?.is_empty() && room.dir().join("old/00000001").exists());
+        assert!(room.conversation()?.is_empty() && room.dir().join("old/00000001").exists());
         Ok(())
     }
 
@@ -424,7 +428,7 @@ mod tests {
         });
         room.append(std::slice::from_ref(&spaced))?;
         room.append(&[Message::Answer("x".into())])?;
-        assert_eq!(room.messages()?[0], spaced);
+        assert_eq!(room.conversation()?[0], spaced);
         let nameless = Message::Result(ToolResult {
             id: 1,
             name: String::new(),

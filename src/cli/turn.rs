@@ -41,8 +41,8 @@ pub struct Scene<'a> {
     pub setting: &'a Setting,
 }
 
-/// What the probe has for the room next: a request, or a step's tool results, under an ID that
-/// stays the same when a reconnect delivers them again.
+/// What the probe adds to the conversation next: a request, or a step's tool results, under an
+/// ID that stays the same when a reconnect delivers them again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
     pub id: u64,
@@ -364,8 +364,8 @@ async fn run_with_reconnect(
     }
 }
 
-/// Carry out a command: restart the scene's room on the hub, from a summary of it or from
-/// nothing, showing what the hub reports.
+/// Carry out a command: restart the conversation in the scene's room, from a summary of it or
+/// from nothing, showing what the hub reports.
 pub async fn restart(
     stream: &mut Option<UnixStream>,
     display: &Display,

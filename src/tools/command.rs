@@ -17,7 +17,7 @@ pub const RUN_NAME: &str = "run_command";
 pub const CONTROL_NAME: &str = "control_command";
 const DEFAULT_WAIT: Duration = Duration::from_secs(40);
 const CLEANUP_WAIT: Duration = Duration::from_secs(2);
-/// IDs stay distinct across the turns of an interactive conversation.
+/// IDs stay distinct across the turns of an interactive run.
 static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize)]

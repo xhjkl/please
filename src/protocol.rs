@@ -29,8 +29,8 @@ pub struct Place {
     pub cwd: String,
 }
 
-/// One thing said in a room, in terms no model's chat format dictates; the hub words and
-/// frames them for the loaded checkpoint.
+/// One thing said in a conversation, in terms no model's chat format dictates; the hub words
+/// and frames it for the loaded checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     /// What the person asked.
@@ -62,7 +62,7 @@ pub enum Note {
         draft: Option<String>,
         chunk: String,
     },
-    /// The room just restarted in the middle of a task: carry on from its summary.
+    /// The conversation just restarted in the middle of a task: carry on from its summary.
     Resume,
 }
 
@@ -94,14 +94,15 @@ pub enum Frame {
         id: u64,
         messages: Vec<Message>,
     },
-    /// Restart the place's room: from a message summing it up, or from nothing.
+    /// Restart the conversation in the place's room: from a message summing it up, or from
+    /// nothing.
     Restart {
         place: Place,
         setting: Setting,
         summarize: bool,
     },
     Log(String),
-    /// The summary the room restarted from; the probe shows it apart from the answer.
+    /// The summary the conversation restarted from; the probe shows it apart from the answer.
     Restarted(String),
     Answer(String),
     Thinking(String),

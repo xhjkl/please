@@ -1,6 +1,6 @@
 //! The hub's part of a turn, in the place's room: keep what the probe delivers, compact the
-//! room when it nears the context's end, generate, run the hub's own tools, and keep each
-//! step. The probe sends only what is new; everything said so far lives in the room.
+//! conversation when it nears the context's end, generate, run the hub's own tools, and keep
+//! each step. The probe sends only what is new; the conversation so far lives in the room.
 use super::dialect::{Delta, FunctionCall, prompting};
 use super::inference::{self, Engine, clipping};
 use super::rooms::{Entry, Room};
@@ -11,8 +11,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
-/// Share of the context a prompt may fill before the room is compacted: restarted from a
-/// summary of it.
+/// Share of the context a prompt may fill before the conversation is compacted: restarted
+/// from a summary of it.
 const COMPACT_AT: f64 = 0.75;
 /// Share of what the instructions leave free that each chunk to summarize may take, and the
 /// bytes a token is counted as; code tokens average more, so chunks come out smaller than
@@ -70,7 +70,7 @@ pub async fn advance(
         transcript::RECALL_PAGE.min((engine.capacity() as f64 * 0.1 * BYTES_PER_TOKEN) as usize);
     let mut compacted = false;
     for _ in 0..HUB_STEPS {
-        let mut history = room.messages()?;
+        let mut history = room.conversation()?;
         history.extend(notes.iter().cloned());
         if !compacted && engine.fill(setting, &history)? >= COMPACT_AT {
             compacted = true;
@@ -92,7 +92,7 @@ pub async fn advance(
                     if resume {
                         notes.push(Message::Note(Note::Resume));
                     }
-                    history = room.messages()?;
+                    history = room.conversation()?;
                     history.extend(notes.iter().cloned());
                 }
             }
@@ -163,7 +163,7 @@ pub async fn advance(
     ))
 }
 
-/// Restart the place's room, from a summary of it or from nothing.
+/// Restart the conversation in the place's room, from a summary of it or from nothing.
 pub async fn restart(
     sink: &mut (impl AsyncWriteExt + Unpin),
     engine: &Arc<Engine>,
@@ -173,8 +173,8 @@ pub async fn restart(
 ) -> Result<()> {
     let room = Room::open(place)?;
     let _lock = lock(&room).await?;
-    let messages = room.messages()?;
-    if messages.is_empty() {
+    let conversation = room.conversation()?;
+    if conversation.is_empty() {
         write_frame(sink, &Frame::Log("the conversation is empty".into())).await?;
     } else if summarize {
         let entries = room.entries()?;
@@ -194,15 +194,15 @@ async fn lock(room: &Room) -> Result<std::fs::File> {
 }
 
 /// Keep delivery `id`'s messages unless a retry already did, answering first any calls the
-/// room ends with that the delivery does not answer.
+/// conversation ends with that the delivery does not answer.
 fn keep_delivery(room: &Room, id: u64, incoming: Vec<Message>) -> Result<()> {
     let retried = room.last_delivery() == Some(id);
     let answers = !retried && matches!(incoming.first(), Some(Message::Result(_)));
     let mut arriving = match answers {
         true => vec![],
         false => {
-            let kept = room.messages()?;
-            unanswered(&kept)
+            let conversation = room.conversation()?;
+            unanswered(&conversation)
         }
     };
     if !retried {
@@ -255,8 +255,8 @@ fn cutover(
     Ok((entries, kept))
 }
 
-/// Whose history a prompt renders: the place's room in its current epoch. Clipping choices
-/// stay with their owner, and a restart makes the room another.
+/// Whose history a prompt renders: the place's room in its current epoch, so a restart brings
+/// another owner. Clipping choices stay with their owner.
 fn owner(place: &Place, epoch: u64) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     (place, epoch).hash(&mut hasher);
@@ -328,14 +328,14 @@ fn unanswered(kept: &[Message]) -> Vec<Message> {
         .iter()
         .map(|message| match message {
             Message::Call(call) => result(call.id, &call.name, prompting::unrecorded()),
-            _ => unreachable!("only calls end the room here"),
+            _ => unreachable!("only calls end the conversation here"),
         })
         .collect()
 }
 
-/// Compact the room: fold `folded`'s entries since the last restart into one summary, a chunk
-/// at a time, and restart the room from it, followed by `kept`. Progress goes to the probe as
-/// log lines.
+/// Compact the room's conversation: fold `folded`'s entries since the last restart into one
+/// summary, a chunk at a time, and restart from it, followed by `kept`. Progress goes to the
+/// probe as log lines.
 async fn compact(
     sink: &mut (impl AsyncWriteExt + Unpin),
     engine: &Arc<Engine>,
@@ -486,21 +486,21 @@ mod tests {
         let results = vec![result(3, "read_file", "x".into())];
         keep_delivery(&room, 7, results.clone())?;
         keep_delivery(&room, 7, results)?;
-        assert_eq!(room.messages()?.len(), 4);
+        assert_eq!(room.conversation()?.len(), 4);
         // A new request after a step whose calls never got results answers them first.
         room.append(&[
             Message::Thinking(String::new()),
             some_call(6, "run_command"),
         ])?;
         keep_delivery(&room, 8, vec![Message::User("next".into())])?;
-        let messages = room.messages()?;
+        let conversation = room.conversation()?;
         let answer = Message::Result(ToolResult {
             id: 6,
             name: "run_command".into(),
             content: prompting::unrecorded(),
         });
-        assert_eq!(messages[6], answer);
-        assert_eq!(messages[7], Message::User("next".into()));
+        assert_eq!(conversation[6], answer);
+        assert_eq!(conversation[7], Message::User("next".into()));
         Ok(())
     }
 
