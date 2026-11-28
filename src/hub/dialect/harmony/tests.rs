@@ -96,25 +96,25 @@ fn literal_markers_in_content_stay_text() -> Result<()> {
 }
 
 #[test]
-fn static_head_is_the_system_and_tool_messages_alone() -> Result<()> {
+fn cacheable_prefix_is_the_system_and_tool_messages_alone() -> Result<()> {
     let history = [
         Message::Input("piped".into()),
         Message::User("hello".into()),
     ];
-    let spelled_head = |today: &str, effort: Effort| -> Result<String> {
-        let (prompt, head) = rendered(today, effort, &history)?;
-        Ok(spelled(&prompt.pieces[..head]))
+    let spelled_prefix = |today: &str, effort: Effort| -> Result<String> {
+        let (prompt, prefix) = rendered(today, effort, &history)?;
+        Ok(spelled(&prompt.pieces[..prefix]))
     };
-    // The head outlasts the day, and holds the effort, which gpt-oss heeds nowhere else.
-    let head = spelled_head("2040-02-03", Effort::MEDIUM)?;
-    assert_eq!(head, spelled_head("2041-05-06", Effort::MEDIUM)?);
+    // The prefix outlasts the day, and holds the effort, which gpt-oss heeds nowhere else.
+    let prefix = spelled_prefix("2040-02-03", Effort::MEDIUM)?;
+    assert_eq!(prefix, spelled_prefix("2041-05-06", Effort::MEDIUM)?);
     assert!(
-        head.contains("Reasoning: medium") && head.ends_with("} // namespace functions<|end|>")
+        prefix.contains("Reasoning: medium") && prefix.ends_with("} // namespace functions<|end|>")
     );
-    assert!(!head.contains("Current date") && !head.contains("piped"));
+    assert!(!prefix.contains("Current date") && !prefix.contains("piped"));
     // A level between the names takes the nearest one.
     let nearly_hard = Effort::new(0.85).expect("a level on the scale");
-    assert!(spelled_head("2040-02-03", nearly_hard)?.contains("Reasoning: high"));
+    assert!(spelled_prefix("2040-02-03", nearly_hard)?.contains("Reasoning: high"));
     Ok(())
 }
 

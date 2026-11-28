@@ -23,14 +23,14 @@ pub fn encode_pieces(tokenizer: &Tokenizer, pieces: &[Piece]) -> Result<Vec<u32>
     Ok(tokens)
 }
 
-/// Encode a prompt whose first `head` pieces are its static head; pieces encode on their own,
-/// so the head's tokens are a prefix of the whole.
-pub fn encode_prompt(tokenizer: &Tokenizer, pieces: &[Piece], head: usize) -> Result<Rendered> {
-    let (head, tail) = pieces.split_at(head);
-    let mut tokens = encode_pieces(tokenizer, head)?;
-    let head = tokens.len();
-    tokens.extend(encode_pieces(tokenizer, tail)?);
-    Ok(Rendered { tokens, head })
+/// Encode a prompt whose first `prefix` pieces are its cacheable prefix. Pieces encode on their
+/// own, so those pieces' tokens open the whole prompt's unchanged.
+pub fn encode_prompt(tokenizer: &Tokenizer, pieces: &[Piece], prefix: usize) -> Result<Rendered> {
+    let (prefix, rest) = pieces.split_at(prefix);
+    let mut tokens = encode_pieces(tokenizer, prefix)?;
+    let cacheable = tokens.len();
+    tokens.extend(encode_pieces(tokenizer, rest)?);
+    Ok(Rendered { tokens, cacheable })
 }
 
 /// Look up a control token a template needs, failing for checkpoints without it.

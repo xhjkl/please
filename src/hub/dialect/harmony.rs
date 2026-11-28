@@ -8,8 +8,8 @@
 //! The system message is the encoder's canonical one; please's instructions and tool schemas
 //! form the developer message, as gpt-oss's chat template places them. Unlike that template,
 //! the "Current date" line comes in a second developer message rather than in the system
-//! message, so the head outlasts the day. The reasoning line stays in the system message, the
-//! one place gpt-oss heeds it, so its head differs by effort.
+//! message, so the cacheable prefix outlasts the day. The reasoning line stays in the system
+//! message, the one place gpt-oss heeds it, so its prefix differs by effort.
 use super::piece::{Piece, encode_prompt};
 use super::prompt::{FunctionCall, Grade, Preamble, PromptMessage, Rendered, tool_schemas};
 use crate::hub::wording;
@@ -108,21 +108,21 @@ impl Prompt {
 
 /// Render the preamble and worded history, opening with the canonical system and developer
 /// messages and ending in the assistant's open turn; also return how many pieces form the
-/// static head.
+/// cacheable prefix.
 fn render(preamble: &Preamble, messages: &[PromptMessage]) -> (Prompt, usize) {
     let mut prompt = Prompt::default();
-    let head = header(&mut prompt, preamble);
+    let prefix = header(&mut prompt, preamble);
     for message in messages {
         frame(&mut prompt, message);
     }
     prompt.marker(START);
     prompt.text("assistant");
-    (prompt, head)
+    (prompt, prefix)
 }
 
 /// Append the canonical system message with the requested effort, then please's instructions
 /// and tools, then a second developer message with the date. Keeping the date out of the
-/// first two leaves the tool declarations in the cacheable head while the date keeps
+/// first two leaves the tool declarations in the cacheable prefix while the date keeps
 /// developer authority. Returns how many pieces the first two messages took.
 fn header(prompt: &mut Prompt, preamble: &Preamble) -> usize {
     let instructions: Vec<_> = preamble
@@ -139,11 +139,11 @@ fn header(prompt: &mut Prompt, preamble: &Preamble) -> usize {
     );
     prompt.message(Header::of("system"), &system);
     prompt.message(Header::of("developer"), &developer);
-    let head = prompt.pieces.len();
+    let prefix = prompt.pieces.len();
     let today = wording::date(&preamble.today);
     let facts = format!("# Instructions\n\n{today}");
     prompt.message(Header::of("developer"), &facts);
-    head
+    prefix
 }
 
 /// The requested effort as the encoder's reasoning line, at the nearest of the three levels
@@ -260,8 +260,8 @@ pub fn encode(
     preamble: &Preamble,
     messages: &[PromptMessage],
 ) -> Result<Rendered> {
-    let (prompt, head) = render(preamble, messages);
-    encode_prompt(tokenizer, &prompt.pieces, head)
+    let (prompt, prefix) = render(preamble, messages);
+    encode_prompt(tokenizer, &prompt.pieces, prefix)
 }
 
 pub fn is_stop_token(tokenizer: &Tokenizer, token: u32) -> bool {

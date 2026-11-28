@@ -338,8 +338,8 @@ async fn compact(
         redirection: None,
         ..setting.clone()
     };
-    let head = engine.fill(&setting, &[])?;
-    let free = engine.capacity as f64 * (1.0 - head) - COMPACT_RESERVE as f64;
+    let base = engine.fill(&setting, &[])?;
+    let free = engine.capacity as f64 * (1.0 - base) - COMPACT_RESERVE as f64;
     let budget = (free * CHUNK_SHARE * BYTES_PER_TOKEN).max(1024.0) as usize;
     let chunks = transcript::chunks(&folded, budget);
     if chunks.is_empty() {

@@ -6,7 +6,7 @@
 //! control tokens; instructions that arrive mid-prompt become user messages instead of
 //! an error; tool exchanges with no intervening assistant entry share one assistant step; and
 //! the template's effort sentences follow the instructions, after the date, rather than open
-//! the system message, so one head serves every effort.
+//! the system message, so one cacheable prefix serves every effort.
 use super::piece::{Piece, encode_pieces};
 use super::prompt::{FunctionCall, Grade, Preamble, PromptMessage, Rendered};
 use crate::hub::wording;
@@ -83,8 +83,8 @@ fn template_json(value: &Value) -> String {
 #[derive(Debug, Default)]
 struct Prompt {
     pieces: Vec<Piece>,
-    /// End of the invocation-independent head: whole pieces, then bytes of the next text.
-    head: (usize, usize),
+    /// End of the invocation-independent prefix: whole pieces, then bytes of the next text.
+    prefix: (usize, usize),
 }
 
 impl Prompt {
@@ -114,9 +114,9 @@ impl Prompt {
         self.text(text);
     }
 
-    /// Mark the end of the static head; the next text starts the per-invocation facts.
+    /// Mark the end of the cacheable prefix; the next text starts the per-invocation facts.
     fn boundary(&mut self) {
-        self.head = match self.pieces.last() {
+        self.prefix = match self.pieces.last() {
             Some(Piece::Text(text)) => (self.pieces.len() - 1, text.len()),
             _ => (self.pieces.len(), 0),
         };
@@ -124,18 +124,18 @@ impl Prompt {
 
     fn encode(&self, tokenizer: &Tokenizer) -> Result<Rendered> {
         let tokens = encode_pieces(tokenizer, &self.pieces)?;
-        let (whole, bytes) = self.head;
-        let mut head = encode_pieces(tokenizer, &self.pieces[..whole])?;
+        let (whole, bytes) = self.prefix;
+        let mut prefix = encode_pieces(tokenizer, &self.pieces[..whole])?;
         if let Some(Piece::Text(text)) = self.pieces.get(whole) {
-            head.extend(tokenizer.encode(&text[..bytes])?);
+            prefix.extend(tokenizer.encode(&text[..bytes])?);
         }
-        // A BPE merge across the boundary would make the head a different prefix; cache nothing then.
-        let head = if tokens.starts_with(&head) {
-            head.len()
+        // A BPE merge across the boundary would change the prefix's last tokens; cache nothing then.
+        let cacheable = if tokens.starts_with(&prefix) {
+            prefix.len()
         } else {
             0
         };
-        Ok(Rendered { tokens, head })
+        Ok(Rendered { tokens, cacheable })
     }
 
     fn message(&mut self, role: &str, content: &str) {

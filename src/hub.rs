@@ -36,11 +36,11 @@ mod discovery;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod download;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod heads;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod inference;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod occupancy;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod prefix_cache;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod rooms;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

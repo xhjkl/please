@@ -113,8 +113,8 @@ fn render(preamble: &Preamble, messages: &[PromptMessage]) -> Result<(Vec<Piece>
     for instructions in &preamble.instructions {
         frame(&mut prompt, SYSTEM, "", TEXT, instructions);
     }
-    // The head ends here: what follows differs from one invocation to the next.
-    let head = prompt.len();
+    // The cacheable prefix ends here: what follows differs from one invocation to the next.
+    let prefix = prompt.len();
     let today = wording::date(&preamble.today);
     frame(&mut prompt, SYSTEM, "", TEXT, &today);
     frame(&mut prompt, SYSTEM, "", TEXT, &effort(preamble.effort));
@@ -133,7 +133,7 @@ fn render(preamble: &Preamble, messages: &[PromptMessage]) -> Result<(Vec<Piece>
         }
         rest = next;
     }
-    Ok((prompt, head))
+    Ok((prompt, prefix))
 }
 
 /// Encode the preamble and worded messages in Inkling's native framing.
@@ -142,8 +142,8 @@ pub fn encode(
     preamble: &Preamble,
     messages: &[PromptMessage],
 ) -> Result<Rendered> {
-    let (pieces, head) = render(preamble, messages)?;
-    encode_prompt(tokenizer, &pieces, head)
+    let (pieces, prefix) = render(preamble, messages)?;
+    encode_prompt(tokenizer, &pieces, prefix)
 }
 
 pub fn is_stop_token(tokenizer: &Tokenizer, token: u32) -> bool {

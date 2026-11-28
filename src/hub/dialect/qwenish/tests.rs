@@ -89,23 +89,23 @@ fn template_json_matches_python_separators() {
 }
 
 #[test]
-fn static_head_ends_where_session_facts_begin() -> Result<()> {
+fn cacheable_prefix_ends_where_session_facts_begin() -> Result<()> {
     let history = [Message::User("hi".into())];
     let prompt = rendered(&history)?;
-    let (whole, bytes) = prompt.head;
-    let mut head = spelled(&prompt.pieces[..whole]);
+    let (whole, bytes) = prompt.prefix;
+    let mut prefix = spelled(&prompt.pieces[..whole]);
     let Some(Piece::Text(text)) = prompt.pieces.get(whole) else {
         panic!("facts continue the system text")
     };
-    head.push_str(&text[..bytes]);
-    assert!(head.ends_with("*** End Patch\n"));
+    prefix.push_str(&text[..bytes]);
+    assert!(prefix.ends_with("*** End Patch\n"));
     assert!(text[bytes..].starts_with("Current date: 2040-02-03"));
-    assert!(spelled(&prompt.pieces).starts_with(&head));
+    assert!(spelled(&prompt.pieces).starts_with(&prefix));
     Ok(())
 }
 
 #[test]
-fn effort_follows_the_date_and_leaves_the_head_alone() -> Result<()> {
+fn effort_follows_the_date_and_leaves_the_prefix_alone() -> Result<()> {
     let history = [Message::User("hi".into())];
     let split = |effort: Effort| -> Result<(String, String)> {
         let setting = Setting {
@@ -113,18 +113,18 @@ fn effort_follows_the_date_and_leaves_the_head_alone() -> Result<()> {
             ..some_setting()
         };
         let prompt = render(&Preamble::new(&setting), &prepare(&setting, &history)?)?;
-        let (whole, bytes) = prompt.head;
+        let (whole, bytes) = prompt.prefix;
         let Some(Piece::Text(text)) = prompt.pieces.get(whole) else {
             panic!("facts continue the system text")
         };
-        let head = spelled(&prompt.pieces[..whole]) + &text[..bytes];
-        Ok((head, text[bytes..].to_owned()))
+        let prefix = spelled(&prompt.pieces[..whole]) + &text[..bytes];
+        Ok((prefix, text[bytes..].to_owned()))
     };
     // The template has no sentence for medium effort.
-    let (head, facts) = split(Effort::MEDIUM)?;
+    let (prefix, facts) = split(Effort::MEDIUM)?;
     assert_eq!(facts, "Current date: 2040-02-03");
     let (hard, facts) = split(Effort::HIGH)?;
-    assert_eq!(head, hard);
+    assert_eq!(prefix, hard);
     assert!(facts.starts_with("Current date: 2040-02-03\nReasoning effort is set to xhigh."));
     Ok(())
 }

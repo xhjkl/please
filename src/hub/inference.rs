@@ -3,12 +3,13 @@
 //! The hub keeps one session, sized at load to the GPU memory the weights leave, and every
 //! request feeds only what it does not already hold: the longest common prefix of the
 //! session's history and the newly rendered prompt stays, the session rewinds to it, and the
-//! rest is prefilled. Another owner's history keeps at least the static head, whose end is a
-//! session checkpoint; a different head is read from `~/.please/caches`, or prefilled and saved once.
+//! rest is prefilled. Another owner's history keeps at least the cacheable prefix, whose end is a
+//! session checkpoint; a different prefix is read from `~/.please/caches`, or prefilled and
+//! saved once.
 use super::clipping;
 use super::dialect::{Dialect, OutputParser, Rendered};
-use super::heads;
 use super::occupancy::Occupancy;
+use super::prefix_cache;
 use crate::protocol::{Message, Setting};
 use eyre::{Result, bail, ensure, eyre};
 use std::ops::Range;
@@ -34,8 +35,8 @@ pub struct Engine {
     pub load_seconds: f64,
     weights: oco::Weights,
     dialect: Dialect,
-    /// What this checkpoint's saved heads are named after besides their IDs.
-    origin: heads::Origin,
+    /// What this checkpoint's saved prefixes are named after besides their IDs.
+    origin: prefix_cache::Origin,
     /// Tokens the session holds, fixed at load.
     pub capacity: usize,
     /// The only session, `None` until the first request or after a failed one. Holding the
@@ -59,13 +60,13 @@ struct KeptSession {
 /// Where a generation's session came from, which decides what its first prefill had to cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Start {
-    /// The previous generation's session, which already held this prompt's static head.
+    /// The previous generation's session, which already held this prompt's cacheable prefix.
     Kept,
-    /// A fresh session restored from the cached static head.
+    /// A fresh session restored from the cached cacheable prefix.
     Opened,
-    /// A fresh session that prefilled the static head and saved it.
+    /// A fresh session that prefilled the cacheable prefix and saved it.
     Prefilled,
-    /// A fresh, empty session: the history has no cacheable head.
+    /// A fresh, empty session: the history has no cacheable prefix.
     Fresh,
 }
 
@@ -100,7 +101,7 @@ impl Engine {
             path.display()
         );
         tracing::info!("hub: context capacity {capacity} tokens");
-        let origin = heads::Origin::new(&path)?;
+        let origin = prefix_cache::Origin::new(&path)?;
         let load_seconds = started.elapsed().as_secs_f64();
         Ok(Engine {
             path,
@@ -143,51 +144,51 @@ impl Engine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Start a session from the static head: restored from the cache, or prefilled and saved.
-    async fn start(&self, head: &[u32]) -> Result<(oco::Session, Start)> {
+    /// Start a session from the cacheable prefix: restored from the cache, or prefilled and saved.
+    async fn start(&self, prefix: &[u32]) -> Result<(oco::Session, Start)> {
         let capacity = self.capacity;
         let weights = self.weights.clone();
-        if head.is_empty() {
+        if prefix.is_empty() {
             let session = spawn_blocking(move || weights.new_session(capacity)).await??;
             return Ok((session, Start::Fresh));
         }
-        let path = self.origin.path(head);
+        let path = self.origin.path(prefix);
         let opened = {
             let (weights, path) = (weights.clone(), path.clone());
             spawn_blocking(move || weights.open_session(path, capacity)).await?
         };
         // The file name is a hash, and a collision or a stale file must cost a prefill, not a
-        // wrong prompt: a restored session is trusted only if it holds exactly this head.
+        // wrong prompt: a restored session is trusted only if it holds exactly this prefix.
         let opened = opened
-            .inspect_err(|error| tracing::debug!("hub: no cached head: {error:#}"))
+            .inspect_err(|error| tracing::debug!("hub: no cached prefix: {error:#}"))
             .ok()
-            .filter(|session| session.history() == head);
+            .filter(|session| session.history() == prefix);
         if let Some(session) = opened {
-            let touched = heads::touch(&path);
+            let touched = prefix_cache::touch(&path);
             if let Err(error) = touched {
-                tracing::debug!("hub: cannot mark the head as used: {error:#}");
+                tracing::debug!("hub: cannot mark the prefix as used: {error:#}");
             }
             return Ok((session, Start::Opened));
         }
         let mut session = spawn_blocking(move || weights.new_session(capacity)).await??;
-        let mut inference = session.infer(head)?;
+        let mut inference = session.infer(prefix)?;
         inference.next().await?;
         drop(inference);
-        // The head stays a session checkpoint, so rewinds past it never replay it.
+        // The prefix stays a session checkpoint, so rewinds past it never replay it.
         session.checkpoint()?;
         let (session, saved) = spawn_blocking(move || {
             // A failed save costs the next invocation a prefill, never this request.
-            let saved = heads::save(&path, |path| Ok(session.save(path)?));
+            let saved = prefix_cache::save(&path, |path| Ok(session.save(path)?));
             (session, saved.map(|()| path))
         })
         .await?;
         match saved {
             Ok(path) => tracing::debug!(
-                "hub: saved {} head tokens to {}",
-                head.len(),
+                "hub: saved {} prefix tokens to {}",
+                prefix.len(),
                 path.display()
             ),
-            Err(error) => tracing::warn!("hub: cannot cache the head: {error:#}"),
+            Err(error) => tracing::warn!("hub: cannot cache the prefix: {error:#}"),
         }
         Ok((session, Start::Prefilled))
     }
@@ -217,16 +218,16 @@ pub async fn generate(
     }
     let tail_budget = capacity - base - REPLY_RESERVE;
     let whole = engine.render(setting, history, tail_budget)?;
-    let head = &whole.tokens[..whole.head];
-    // Holding the head means rewinding to it is free, whoever owned the session before;
+    let prefix = &whole.tokens[..whole.cacheable];
+    // Holding the prefix means rewinding to it is free, whoever owned the session before;
     // otherwise the old session goes before its replacement is allocated.
     let kept = held
         .take()
-        .filter(|kept| kept.session.history().starts_with(head));
+        .filter(|kept| kept.session.history().starts_with(prefix));
     let (mut kept, start) = match kept {
         Some(kept) => (kept, Start::Kept),
         None => {
-            let (session, start) = engine.start(head).await?;
+            let (session, start) = engine.start(prefix).await?;
             let kept = KeptSession {
                 session,
                 owner,
@@ -269,7 +270,7 @@ pub async fn generate(
                 reused_tokens: reused,
                 complete: false,
             };
-            // Measured from taking the session, so it includes any head prefill.
+            // Measured from taking the session, so it includes any prefix prefill.
             let seconds = started.elapsed().as_secs_f64();
             tracing::debug!(?generation, seconds, "hub: first token");
             generation

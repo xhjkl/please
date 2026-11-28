@@ -40,7 +40,7 @@ fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Resul
         ),
         result("control_command", r#"{"status":"finished"}"#),
     ];
-    let (pieces, head) = render(&some_preamble(), &messages)?;
+    let (pieces, prefix) = render(&some_preamble(), &messages)?;
     assert_eq!(
         &pieces[..3],
         &[
@@ -59,7 +59,7 @@ fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Resul
             && tool["parameters"]["properties"]["argv"]["type"] == "array"
     }));
     assert_eq!(
-        pieces[head + 2],
+        pieces[prefix + 2],
         Piece::Text("Current date: 2040-02-03".into())
     );
 

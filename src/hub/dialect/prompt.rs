@@ -7,9 +7,9 @@ use eyre::{Result, WrapErr};
 use serde_json::{Map, Value, json};
 
 /// What opens every prompt. The instructions are the same for every invocation, so with the
-/// tool declarations they make the head a hub may prefill once and cache. This invocation's
-/// facts, the date and the effort, each family states in its own words: after the head,
-/// unless the family heeds one only inside it, as gpt-oss does the effort.
+/// tool declarations they make the cacheable prefix, which a hub may prefill once and save.
+/// This invocation's facts, the date and the effort, each family states in its own words:
+/// after that prefix, unless the family heeds one only inside it, as gpt-oss does the effort.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Preamble {
     pub instructions: Vec<&'static str>,
@@ -87,12 +87,13 @@ impl FunctionCall {
     }
 }
 
-/// Encoded prompt and how many of its leading tokens are the same for every invocation, at
-/// this effort where the family's head holds it: the head a hub may prefill once and cache.
+/// Encoded prompt and how many of its leading tokens make its cacheable prefix: the part
+/// that is the same for every invocation, at this effort where the family states it there,
+/// which a hub may prefill once and save.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
     pub tokens: Vec<u32>,
-    pub head: usize,
+    pub cacheable: usize,
 }
 
 /// Newly visible generated text, by the section it belongs to.
