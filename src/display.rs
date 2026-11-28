@@ -54,11 +54,7 @@ impl Display {
 
     /// Start a spinner on stderr, or an inert one when stderr is not a terminal.
     pub fn start_spinning(&self) -> Spinner {
-        if self.stderr_is_tty {
-            Spinner::start()
-        } else {
-            Spinner::start_empty()
-        }
+        Spinner::start(self.stderr_is_tty)
     }
 
     /// Show a line of the hub's log, if those are shown.

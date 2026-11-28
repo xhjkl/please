@@ -29,14 +29,10 @@ pub struct Spinner {
 }
 
 impl Spinner {
-    /// Make a spinner that draws nothing, for output that is not a terminal.
-    pub fn start_empty() -> Self {
-        Spinner { task: None }
-    }
-
-    pub fn start() -> Self {
+    /// Start a spinner, one that draws nothing unless `visible`.
+    pub fn start(visible: bool) -> Self {
         Spinner {
-            task: Some(tokio::spawn(spin())),
+            task: visible.then(|| tokio::spawn(spin())),
         }
     }
 
