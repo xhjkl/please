@@ -264,5 +264,4 @@ fn serve_connection(mut stream: UnixStream, engine: Arc<Engine>) {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;
