@@ -46,10 +46,7 @@ pub struct Delivery {
 impl Delivery {
     /// Carry `messages` under a fresh ID.
     pub fn new(messages: Vec<Message>) -> Self {
-        use std::hash::BuildHasher;
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let count = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let id = std::hash::RandomState::new().hash_one((count, std::process::id()));
+        let id = crate::protocol::fresh_id();
         Self { id, messages }
     }
 }

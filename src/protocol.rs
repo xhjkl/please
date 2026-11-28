@@ -170,12 +170,19 @@ pub enum ProtocolError {
 #[error("the model is busy serving another please session; retry once that session ends")]
 pub struct HubBusy;
 
-/// This process's name for the hub: random, so probes on different machines never collide,
-/// and fixed for the process, so its reconnections are recognized.
-fn probe_id() -> u64 {
+/// Make an ID no other call gets: random, so probes on different machines never collide.
+pub fn fresh_id() -> u64 {
     use std::hash::BuildHasher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let count = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::hash::RandomState::new().hash_one((count, std::process::id()))
+}
+
+/// This process's name for the hub, fixed for the process, so its reconnections are recognized.
+fn probe_id() -> u64 {
     static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *ID.get_or_init(|| std::hash::RandomState::new().hash_one(std::process::id()))
+    *ID.get_or_init(fresh_id)
 }
 
 /// Introduce this probe on a fresh connection and wait until the hub takes it.
