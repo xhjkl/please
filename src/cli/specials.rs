@@ -22,8 +22,9 @@ pub enum Special<'a> {
     Load,
     /// Serve as the hub in the foreground.
     Hub,
+    /// Measure generation on a checkpoint over the cases a tab-separated file holds.
     Bench {
-        model: &'a str,
+        checkpoint: &'a str,
         cases: &'a str,
     },
     /// Run docker with these arguments and the hub's socket mounted.
@@ -39,7 +40,7 @@ pub fn parse(args: &[String]) -> Option<Special<'_>> {
     let name = first.strip_prefix('/').unwrap_or(first).to_lowercase();
     match (name.as_str(), rest) {
         ("docker", rest) => Some(Special::Docker(rest)),
-        ("bench", [model, cases]) => Some(Special::Bench { model, cases }),
+        ("bench", [checkpoint, cases]) => Some(Special::Bench { checkpoint, cases }),
         ("help" | "--help" | "-h" | "-?", []) => Some(Special::Help),
         ("version" | "--version" | "-v", []) => Some(Special::Version),
         ("load" | "download", []) => Some(Special::Load),
@@ -58,7 +59,7 @@ pub async fn run(special: Special<'_>) -> Result<()> {
         }
         Special::Load => crate::hub::load_weights().await?,
         Special::Hub => crate::hub::run().await?,
-        Special::Bench { model, cases } => crate::hub::benchmark(model, cases).await?,
+        Special::Bench { checkpoint, cases } => crate::hub::benchmark(checkpoint, cases).await?,
         Special::Docker(args) => {
             // Mounting the host socket where a container's root user looks for it.
             let socket = crate::hub::socket_path();
@@ -146,8 +147,8 @@ mod tests {
         assert_eq!(parse(&words("")), None);
         let docker = words("docker run --rm bash");
         assert_eq!(parse(&docker), Some(Special::Docker(&docker[1..])));
-        let bench = words("bench model.gguf cases.json");
-        let (model, cases) = ("model.gguf", "cases.json");
-        assert_eq!(parse(&bench), Some(Special::Bench { model, cases }));
+        let bench = words("bench model.gguf cases.tsv");
+        let (checkpoint, cases) = ("model.gguf", "cases.tsv");
+        assert_eq!(parse(&bench), Some(Special::Bench { checkpoint, cases }));
     }
 }

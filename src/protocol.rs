@@ -135,13 +135,6 @@ pub enum Frame {
         path: String,
     },
     Error(String),
-    BenchmarkRequest {
-        setting: Setting,
-        messages: Vec<Message>,
-        max_tokens: usize,
-    },
-    /// Hub-side measurements encoded as JSON for the benchmark's JSON-lines output.
-    BenchmarkResult(String),
     /// A probe's first frame on a connection, naming its process so the hub tells that probe
     /// reconnecting apart from another one wanting in.
     Hello {

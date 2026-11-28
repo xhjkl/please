@@ -67,7 +67,7 @@ pub async fn run() -> eyre::Result<()> {
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub async fn embed(_checkpoint: Option<&str>) -> eyre::Result<tokio::net::UnixStream> {
+pub async fn embed() -> eyre::Result<tokio::net::UnixStream> {
     Err(eyre::eyre!(UNSUPPORTED))
 }
 

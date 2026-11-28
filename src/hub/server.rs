@@ -9,15 +9,10 @@ use tokio::net::{UnixListener, UnixStream};
 use super::inference::Engine;
 use crate::protocol::{Frame, ProtocolError, read_frame, write_frame};
 
-/// Load the hub's explicit checkpoint, or the best one installed on this machine.
-async fn load(checkpoint: Option<&str>) -> Result<Arc<Engine>> {
-    let checkpoint = match checkpoint {
-        Some(path) => super::discovery::inspect(path.into())?,
-        None => {
-            let selected = super::discovery::select()?;
-            selected.ok_or(super::NoWeights)?
-        }
-    };
+/// Load the checkpoint `PLEASE_MODEL` names, or the best one installed on this machine.
+async fn load() -> Result<Arc<Engine>> {
+    let selected = super::discovery::select()?;
+    let checkpoint = selected.ok_or(super::NoWeights)?;
     tracing::info!(path=%checkpoint.path.display(), dialect=?checkpoint.dialect, "hub: selected checkpoint");
     let engine = Engine::load(&checkpoint.path, checkpoint.dialect).await?;
     tracing::info!("hub: model loaded");
@@ -156,9 +151,7 @@ async fn serve_requests(stream: &mut UnixStream, engine: Arc<Engine>) -> Result<
                 admission = Some(admitted);
                 write_frame(stream, &Frame::Welcome).await
             }
-            Frame::Advance { .. } | Frame::Restart { .. } | Frame::BenchmarkRequest { .. }
-                if admission.is_none() =>
-            {
+            Frame::Advance { .. } | Frame::Restart { .. } if admission.is_none() => {
                 let refusal = Frame::Error(
                     "the probe did not say hello; probe and hub are probably different versions of please"
                         .into(),
@@ -196,19 +189,6 @@ async fn serve_requests(stream: &mut UnixStream, engine: Arc<Engine>) -> Result<
                 };
                 served
             }
-            Frame::BenchmarkRequest {
-                setting,
-                messages,
-                max_tokens,
-            } => {
-                tracing::info!("hub: received benchmark request");
-                let report =
-                    super::benchmark::measure(engine.clone(), setting, messages, max_tokens).await;
-                match report {
-                    Err(error) => Err(error),
-                    Ok(report) => write_frame(stream, &Frame::BenchmarkResult(report)).await,
-                }
-            }
             _ => bail!("bad request: {frame:?}"),
         };
 
@@ -229,7 +209,7 @@ pub async fn run() -> Result<()> {
     let path = socket_path();
     let (listener, _lock) = bind_listener(&path).await?;
     tracing::info!("hub: listening at {}", path.display());
-    let engine = load(None).await?;
+    let engine = load().await?;
 
     loop {
         let (stream, _addr) = listener.accept().await?;
@@ -238,15 +218,11 @@ pub async fn run() -> Result<()> {
 }
 
 /// Embed a hub in this process and return the probe's end of its Unix socket pair.
-/// An explicit checkpoint is used only by the local benchmark harness.
 /// The embedded engine lives as long as the process: reconnecting after Ctrl-C only opens a
 /// new socket pair onto it, keeping the model and its session loaded.
-pub async fn embed(checkpoint: Option<&str>) -> Result<UnixStream> {
+pub async fn embed() -> Result<UnixStream> {
     static EMBEDDED: tokio::sync::OnceCell<Arc<Engine>> = tokio::sync::OnceCell::const_new();
-    let engine = match checkpoint {
-        Some(_) => load(checkpoint).await?,
-        None => EMBEDDED.get_or_try_init(|| load(None)).await?.clone(),
-    };
+    let engine = EMBEDDED.get_or_try_init(load).await?.clone();
     let (probe_end, hub_end) = UnixStream::pair()?;
     serve_connection(hub_end, engine);
     Ok(probe_end)
