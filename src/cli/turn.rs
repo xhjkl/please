@@ -8,8 +8,8 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::display::{Approval, Display};
 use crate::protocol::{
-    Frame, Message, Note, Place, ProtocolError, Setting, ToolCall, ToolResult, read_frame,
-    write_frame,
+    Frame, Message, Note, Place, ProtocolError, Restarted, Setting, ToolCall, ToolResult,
+    read_frame, write_frame,
 };
 use crate::tools::{Jobs, ToolContext, ToolKind, Tools, all_tools, kind_of, preview_patch};
 
@@ -100,7 +100,7 @@ async fn attempt_turn(
             match frame {
                 Frame::Log(line) => display.show_log(&line),
                 // Shown apart from the answer, which may be going to a file.
-                Frame::Restarted(summary) => {
+                Frame::Restarted(Restarted::Summarized(summary)) => {
                     thinking = None;
                     eprintln!("[the conversation restarted from this message]\n{summary}\n");
                 }
@@ -366,26 +366,33 @@ pub async fn restart(
             summarize: command == Command::Compact,
         };
         write_frame(connection, &restart).await?;
-        let spinner = display.start_spinning();
+        let mut spinner = Some(display.start_spinning());
         let mut store = Vec::new();
-        let mut answered = false;
         loop {
             let frame = read_frame(connection, &mut store, None).await?;
-            match frame {
-                Frame::Log(line) => display.show_log(&line),
-                // Asked for, the summary is the answer.
-                Frame::Restarted(text) => {
-                    answered = true;
-                    display.show_answer(&text);
+            let restarted = match frame {
+                Frame::Log(line) => {
+                    display.show_log(&line);
+                    continue;
                 }
+                Frame::Restarted(restarted) => restarted,
                 Frame::Stop => break,
                 Frame::Error(error) => return Err(eyre!(error)),
                 frame => return Err(eyre!("unexpected hub frame: {frame:?}")),
+            };
+            // Stopping the spinner first; clearing its line would erase what is shown next.
+            if let Some(spinner) = spinner.take() {
+                spinner.stop().await;
             }
-        }
-        spinner.stop().await;
-        if answered {
-            display.end_answer();
+            match restarted {
+                // Asked for, the summary is the answer.
+                Restarted::Summarized(summary) => {
+                    display.show_answer(&summary);
+                    display.end_answer();
+                }
+                Restarted::Cleared => eprintln!("please: started a new conversation"),
+                Restarted::Empty => eprintln!("please: the conversation is empty"),
+            }
         }
         Ok(())
     };

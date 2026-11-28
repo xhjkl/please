@@ -112,6 +112,17 @@ pub struct ToolResult {
     pub content: String,
 }
 
+/// How a conversation restarted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Restarted {
+    /// From this summary of it.
+    Summarized(String),
+    /// From nothing, with what was said set aside.
+    Cleared,
+    /// Not at all: nothing had been said yet.
+    Empty,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Frame {
     /// Advance the turn in the place's room by what is new since the hub's last reply: a
@@ -131,8 +142,9 @@ pub enum Frame {
         summarize: bool,
     },
     Log(String),
-    /// The summary the conversation restarted from; the probe shows it apart from the answer.
-    Restarted(String),
+    /// The conversation restarted, as a command asked or because the context filled in the
+    /// middle of a turn; the probe shows a summary apart from the turn's answer.
+    Restarted(Restarted),
     Answer(String),
     Thinking(String),
     /// A call for the probe to answer with a result under the same ID.

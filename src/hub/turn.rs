@@ -8,7 +8,7 @@ use super::rooms::{Entry, Room};
 use super::transcript;
 use super::wording;
 use crate::protocol::{
-    Destination, Frame, Message, Note, Place, Setting, ToolCall, ToolResult, write_frame,
+    Destination, Frame, Message, Note, Place, Restarted, Setting, ToolCall, ToolResult, write_frame,
 };
 use eyre::{Result, bail, eyre};
 use std::hash::{Hash, Hasher};
@@ -92,7 +92,8 @@ pub async fn advance(
                     write_frame(sink, &Frame::Log(line)).await?;
                 }
                 Ok(summary) => {
-                    write_frame(sink, &Frame::Restarted(summary)).await?;
+                    let restarted = Restarted::Summarized(summary);
+                    write_frame(sink, &Frame::Restarted(restarted)).await?;
                     if resume {
                         notes.push(Message::Note(Note::Resume));
                     }
@@ -173,16 +174,17 @@ pub async fn restart(
     let room = Room::open(place)?;
     let _lock = lock(&room).await?;
     let conversation = room.conversation()?;
-    if conversation.is_empty() {
-        write_frame(sink, &Frame::Log("the conversation is empty".into())).await?;
+    let restarted = if conversation.is_empty() {
+        Restarted::Empty
     } else if summarize {
         let entries = room.entries()?;
         let summary = compact(sink, engine, setting, &room, entries, vec![]).await?;
-        write_frame(sink, &Frame::Restarted(summary)).await?;
+        Restarted::Summarized(summary)
     } else {
         room.restart(&[])?;
-        write_frame(sink, &Frame::Log("started a new conversation".into())).await?;
-    }
+        Restarted::Cleared
+    };
+    write_frame(sink, &Frame::Restarted(restarted)).await?;
     write_frame(sink, &Frame::Stop).await
 }
 
