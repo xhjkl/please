@@ -11,13 +11,13 @@
 //! message, so the cacheable prefix outlasts the day. The reasoning line stays in the system
 //! message, the one place gpt-oss heeds it, so its prefix differs by effort.
 use super::piece::{Piece, encode_prompt};
-use super::prompt::{Grade, Preamble, PromptMessage, tool_schemas};
+use super::prompt::{Grade, Preamble, PromptMessage};
 use super::{FunctionCall, Rendered};
 use crate::hub::wording;
 use crate::protocol::Effort;
+use crate::tools::spec::{Param, ParamKind};
 use eyre::Result;
 use oco::Tokenizer;
-use serde_json::Value;
 
 mod output;
 pub use output::Parser;
@@ -164,58 +164,51 @@ fn tools_section() -> String {
         "## functions\n".to_string(),
         "namespace functions {\n".into(),
     ];
-    for schema in tool_schemas() {
-        let function = &schema["function"];
-        let description = function["description"].as_str().unwrap_or_default();
-        for line in description.lines() {
+    for spec in super::tool_specs() {
+        for line in spec.description.lines() {
             lines.push(format!("// {line}"));
         }
-        let name = function["name"].as_str().unwrap_or_default();
-        let parameters = parameters(&function["parameters"]);
+        let (name, parameters) = (spec.name, parameters(spec.params));
         lines.push(format!("type {name} = (_: {parameters}) => any;\n"));
     }
     lines.push("} // namespace functions".into());
     format!("# Tools\n\n{}", lines.join("\n"))
 }
 
-/// Spell a tool's parameters as the encoder's TypeScript object type, for what please's tool
-/// schemas hold: described properties whose types are strings, string enums, numbers, or
-/// arrays of those.
-fn parameters(schema: &Value) -> String {
-    let required = schema["required"].as_array();
-    let required = |key: &str| required.is_some_and(|keys| keys.iter().any(|k| k == key));
+/// Spell a tool's parameters as the encoder's TypeScript object type, in the order the tool
+/// declares them; a description, if there is one, comes as a comment above its parameter.
+fn parameters(params: &[Param]) -> String {
     let mut out = String::from("{\n");
-    for (key, property) in schema["properties"].as_object().into_iter().flatten() {
-        if let Some(description) = property["description"].as_str() {
+    for param in params {
+        let Param {
+            name,
+            description,
+            kind,
+            required,
+        } = param;
+        if !description.is_empty() {
             out.push_str(&format!("// {description}\n"));
         }
-        let optional = if required(key) { "" } else { "?" };
-        out.push_str(&format!("{key}{optional}: {},\n", typescript(property)));
+        let optional = if *required { "" } else { "?" };
+        out.push_str(&format!("{name}{optional}: {},\n", typescript(kind)));
     }
     out.push('}');
     out
 }
 
-/// Spell a property's type as the encoder does; anything else becomes `any`, as there.
-fn typescript(schema: &Value) -> String {
-    match schema["type"].as_str() {
-        Some("string") => {
-            let choices: Vec<_> = schema["enum"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
+/// Spell a parameter's type as the encoder does.
+fn typescript(kind: &ParamKind) -> String {
+    match kind {
+        ParamKind::String => "string".into(),
+        ParamKind::StringArray => "string[]".into(),
+        ParamKind::Number => "number".into(),
+        ParamKind::Choice(choices) => {
+            let quoted: Vec<_> = choices
+                .iter()
                 .map(|choice| format!("\"{choice}\""))
                 .collect();
-            if choices.is_empty() {
-                "string".into()
-            } else {
-                choices.join(" | ")
-            }
+            quoted.join(" | ")
         }
-        Some("number") => "number".into(),
-        Some("array") => format!("{}[]", typescript(&schema["items"])),
-        _ => "any".into(),
     }
 }
 

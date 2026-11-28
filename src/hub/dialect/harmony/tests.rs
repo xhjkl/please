@@ -120,18 +120,26 @@ fn cacheable_prefix_is_the_system_and_tool_messages_alone() -> Result<()> {
 
 #[test]
 fn parameter_schemas_render_as_typescript() {
-    let schema = json!({
-        "type": "object",
-        "properties": {
-            "location": {"type": "string", "description": "The city and state, e.g. San Francisco, CA"},
-            "format": {"type": "string", "enum": ["celsius", "fahrenheit"]},
-            "days": {"type": "number", "description": "How many days"},
-            "tags": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["location", "days"],
-    });
+    let param = |name, description, kind, required| Param {
+        name,
+        description,
+        kind,
+        required,
+    };
+    let location = "The city and state, e.g. San Francisco, CA";
+    let params = [
+        param("location", location, ParamKind::String, true),
+        param(
+            "format",
+            "",
+            ParamKind::Choice(&["celsius", "fahrenheit"]),
+            false,
+        ),
+        param("days", "How many days", ParamKind::Number, true),
+        param("tags", "", ParamKind::StringArray, false),
+    ];
     let expected = "{\n// The city and state, e.g. San Francisco, CA\nlocation: string,\nformat?: \"celsius\" | \"fahrenheit\",\n// How many days\ndays: number,\ntags?: string[],\n}";
-    assert_eq!(parameters(&schema), expected);
+    assert_eq!(parameters(&params), expected);
 }
 
 /// The checkpoint's vocabulary must carry Harmony's control tokens, and a rendered call must
