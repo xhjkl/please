@@ -3,7 +3,6 @@
 //! Structure comes only from the checkpoint's added tokens, which is how the model emits it
 //! under the template's own instructions; marker spellings the model writes out as ordinary
 //! text, for example when quoting documentation, stay content.
-use super::super::OutputParser;
 use super::super::piece::special;
 use super::super::prompt::{Delta, FunctionCall};
 use crate::tools::{Param, ParamKind};
@@ -21,6 +20,8 @@ pub struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     pub fn new(tokenizer: &'a Tokenizer) -> Result<Self> {
+        // Failing early for a checkpoint whose generation could never stop at the turn's end.
+        special(tokenizer, "<|im_end|>")?;
         Ok(Self {
             tokenizer,
             decoder: tokenizer.decoder(),
@@ -34,8 +35,8 @@ impl<'a> Parser<'a> {
     }
 }
 
-impl OutputParser for Parser<'_> {
-    fn push_token(&mut self, token: u32) -> Result<Vec<Delta>> {
+impl Parser<'_> {
+    pub fn push_token(&mut self, token: u32) -> Result<Vec<Delta>> {
         let event = if super::is_stop_token(self.tokenizer, token) {
             Some(Event::End)
         } else {
@@ -56,7 +57,7 @@ impl OutputParser for Parser<'_> {
         Ok(self.stream.push(Event::Text(&text)))
     }
 
-    fn finish(&mut self) -> Result<Vec<FunctionCall>> {
+    pub fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         self.stream.finish()
     }
 }

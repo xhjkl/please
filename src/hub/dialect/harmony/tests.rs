@@ -172,7 +172,7 @@ fn vendored_codec_round_trips_on_the_checkpoint_tokenizer() -> Result<()> {
         .windows(open.len())
         .rposition(|window| window == open)
         .expect("the call is an assistant message");
-    let mut parser = output_parser(tokenizer)?;
+    let mut parser = Parser::new(tokenizer)?;
     for &token in &rendered[call_start + open.len()..start] {
         assert!(parser.push_token(token)?.is_empty());
     }

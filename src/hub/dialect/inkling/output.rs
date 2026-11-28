@@ -1,6 +1,6 @@
 //! Decode Inkling messages incrementally, recognizing framing only by token ID.
 use super::{CALL, END, MODEL, SYSTEM, TEXT, THINKING, TOOL, USER};
-use crate::hub::dialect::{Delta, FunctionCall, OutputParser, piece::special};
+use crate::hub::dialect::{Delta, FunctionCall, piece::special};
 use eyre::{Result, WrapErr, bail, eyre};
 use oco::Tokenizer;
 use serde_json::Value;
@@ -42,8 +42,8 @@ impl<'a> Parser<'a> {
     }
 }
 
-impl OutputParser for Parser<'_> {
-    fn push_token(&mut self, token: u32) -> Result<Vec<Delta>> {
+impl Parser<'_> {
+    pub fn push_token(&mut self, token: u32) -> Result<Vec<Delta>> {
         let marker = self
             .markers
             .iter()
@@ -60,7 +60,7 @@ impl OutputParser for Parser<'_> {
         Ok(self.stream.text(&text).into_iter().collect())
     }
 
-    fn finish(&mut self) -> Result<Vec<FunctionCall>> {
+    pub fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         self.stream.finish()
     }
 }

@@ -45,8 +45,8 @@ impl<'a> Parser<'a> {
     }
 }
 
-impl super::OutputParser for Parser<'_> {
-    fn push_token(&mut self, token: u32) -> Result<Vec<Delta>> {
+impl Parser<'_> {
+    pub fn push_token(&mut self, token: u32) -> Result<Vec<Delta>> {
         let marker = self.markers.iter().find(|(id, _)| *id == token);
         if let Some(&(_, marker)) = marker {
             self.flush();
@@ -56,7 +56,7 @@ impl super::OutputParser for Parser<'_> {
         self.stream.push(token, Event::Text(&text))
     }
 
-    fn finish(&mut self) -> Result<Vec<FunctionCall>> {
+    pub fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         self.flush();
         self.stream.finish()
     }

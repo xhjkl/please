@@ -116,7 +116,7 @@ impl Engine {
     }
 
     /// Bind output parsing to this checkpoint's tokenizer and selected dialect.
-    pub fn output_parser(&self) -> Result<Box<dyn OutputParser + '_>> {
+    pub fn output_parser(&self) -> Result<OutputParser<'_>> {
         self.dialect.output_parser(self.weights.tokenizer())
     }
 

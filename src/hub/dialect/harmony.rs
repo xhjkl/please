@@ -10,7 +10,6 @@
 //! the "Current date" line comes in a second developer message rather than in the system
 //! message, so the head outlasts the day. The reasoning line stays in the system message, the
 //! one place gpt-oss heeds it, so its head differs by effort.
-use super::OutputParser;
 use super::piece::{Piece, encode_prompt};
 use super::prompt::{FunctionCall, Grade, Preamble, PromptMessage, Rendered, tool_schemas};
 use crate::hub::wording;
@@ -20,6 +19,7 @@ use oco::Tokenizer;
 use serde_json::Value;
 
 mod output;
+pub use output::Parser;
 
 /// Opens a message, whose header follows.
 const START: &str = "<|start|>";
@@ -262,11 +262,6 @@ pub fn encode(
 ) -> Result<Rendered> {
     let (prompt, head) = render(preamble, messages);
     encode_prompt(tokenizer, &prompt.pieces, head)
-}
-
-/// Start decoding a response that resumes the prompt's open assistant header.
-pub fn output_parser(tokenizer: &Tokenizer) -> Result<Box<dyn OutputParser + '_>> {
-    Ok(Box::new(output::Parser::new(tokenizer)?))
 }
 
 pub fn is_stop_token(tokenizer: &Tokenizer, token: u32) -> bool {

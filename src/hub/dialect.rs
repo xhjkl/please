@@ -12,12 +12,32 @@ pub enum Dialect {
     Harmony,
 }
 
-/// Incremental conversion from model tokens to dialect-neutral content and tool calls.
-pub trait OutputParser: Send {
+/// One response being decoded in its checkpoint's dialect: model tokens in, dialect-neutral
+/// content and tool calls out.
+pub enum OutputParser<'a> {
+    Inkling(inkling::Parser<'a>),
+    Qwenish(qwenish::Parser<'a>),
+    Harmony(harmony::Parser<'a>),
+}
+
+impl OutputParser<'_> {
     /// Consume one generated token and return newly visible text.
-    fn push_token(&mut self, token: u32) -> Result<Vec<Delta>>;
+    pub fn push_token(&mut self, token: u32) -> Result<Vec<Delta>> {
+        match self {
+            Self::Inkling(parser) => parser.push_token(token),
+            Self::Qwenish(parser) => parser.push_token(token),
+            Self::Harmony(parser) => parser.push_token(token),
+        }
+    }
+
     /// Return the tool calls of the finished response.
-    fn finish(&mut self) -> Result<Vec<FunctionCall>>;
+    pub fn finish(&mut self) -> Result<Vec<FunctionCall>> {
+        match self {
+            Self::Inkling(parser) => parser.finish(),
+            Self::Qwenish(parser) => parser.finish(),
+            Self::Harmony(parser) => parser.finish(),
+        }
+    }
 }
 
 impl Dialect {
@@ -55,12 +75,12 @@ impl Dialect {
     }
 
     /// Start decoding one response that continues the rendered prompt.
-    pub fn output_parser<'a>(self, tokenizer: &'a Tokenizer) -> Result<Box<dyn OutputParser + 'a>> {
-        match self {
-            Self::Inkling => inkling::output_parser(tokenizer),
-            Self::Qwenish => qwenish::output_parser(tokenizer),
-            Self::Harmony => harmony::output_parser(tokenizer),
-        }
+    pub fn output_parser(self, tokenizer: &Tokenizer) -> Result<OutputParser<'_>> {
+        Ok(match self {
+            Self::Inkling => OutputParser::Inkling(inkling::Parser::new(tokenizer)?),
+            Self::Qwenish => OutputParser::Qwenish(qwenish::Parser::new(tokenizer)?),
+            Self::Harmony => OutputParser::Harmony(harmony::Parser::new(tokenizer)?),
+        })
     }
 
     /// Whether generation ends at this token.

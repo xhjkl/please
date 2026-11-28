@@ -7,8 +7,7 @@
 //! an error; tool exchanges with no intervening assistant entry share one assistant step; and
 //! the template's effort sentences follow the instructions, after the date, rather than open
 //! the system message, so one head serves every effort.
-use super::OutputParser;
-use super::piece::{Piece, encode_pieces, special};
+use super::piece::{Piece, encode_pieces};
 use super::prompt::{FunctionCall, Grade, Preamble, PromptMessage, Rendered};
 use crate::hub::wording;
 use crate::protocol::Effort;
@@ -17,6 +16,7 @@ use oco::Tokenizer;
 use serde_json::Value;
 
 mod output;
+pub use output::Parser;
 
 /// Tool-calling rules, quoted from the checkpoint's chat template.
 const CALL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
@@ -313,12 +313,6 @@ pub fn encode(
     messages: &[PromptMessage],
 ) -> Result<Rendered> {
     render(preamble, messages)?.encode(tokenizer)
-}
-
-/// Start decoding a response with its native XML tool calls.
-pub fn output_parser(tokenizer: &Tokenizer) -> Result<Box<dyn OutputParser + '_>> {
-    special(tokenizer, "<|im_end|>")?;
-    Ok(Box::new(output::Parser::new(tokenizer)?))
 }
 
 /// Stop at the turn terminator or end of text, the checkpoint's generation stop set.

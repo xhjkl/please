@@ -1,5 +1,4 @@
 //! Inkling 2 chat framing from the checkpoint's `tokenizer.chat_template`.
-use super::OutputParser;
 use super::piece::{Piece, encode_prompt};
 use super::prompt::{FunctionCall, Preamble, PromptMessage, Rendered};
 use crate::hub::wording;
@@ -9,6 +8,7 @@ use oco::Tokenizer;
 use serde_json::{Value, json};
 
 mod output;
+pub use output::Parser;
 #[cfg(test)]
 mod tests;
 
@@ -144,11 +144,6 @@ pub fn encode(
 ) -> Result<Rendered> {
     let (pieces, head) = render(preamble, messages)?;
     encode_prompt(tokenizer, &pieces, head)
-}
-
-/// Start decoding a response with its JSON tool calls.
-pub fn output_parser(tokenizer: &Tokenizer) -> Result<Box<dyn OutputParser + '_>> {
-    Ok(Box::new(output::Parser::new(tokenizer)?))
 }
 
 pub fn is_stop_token(tokenizer: &Tokenizer, token: u32) -> bool {
