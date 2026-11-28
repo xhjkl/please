@@ -24,6 +24,8 @@ pub fn socket_path() -> std::path::PathBuf {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod admission;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod benchmark;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod clipping;
@@ -37,8 +39,6 @@ mod discovery;
 mod download;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod inference;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod occupancy;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod prefix_cache;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -6,9 +6,9 @@
 //! rest is prefilled. Another owner's history keeps at least the cacheable prefix, whose end is a
 //! session checkpoint; a different prefix is read from `~/.please/caches`, or prefilled and
 //! saved once.
+use super::admission::Admission;
 use super::clipping;
 use super::dialect::{Dialect, OutputParser, Rendered};
-use super::occupancy::Occupancy;
 use super::prefix_cache;
 use crate::protocol::{Message, Setting};
 use eyre::{Result, bail, ensure, eyre};
@@ -43,7 +43,7 @@ pub struct Engine {
     /// lock serializes the served probe's requests, which may overlap across a reconnection.
     session: tokio::sync::Mutex<Option<KeptSession>>,
     /// The probe allowed to use the session.
-    pub occupancy: Occupancy,
+    pub admission: Admission,
     /// Owners issued by [`Engine::new_owner`].
     owners: std::sync::atomic::AtomicU64,
 }
@@ -111,7 +111,7 @@ impl Engine {
             origin,
             capacity,
             session: tokio::sync::Mutex::new(None),
-            occupancy: Occupancy::default(),
+            admission: Admission::default(),
             owners: std::sync::atomic::AtomicU64::new(0),
         })
     }

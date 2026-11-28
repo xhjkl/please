@@ -127,7 +127,7 @@ async fn serve_requests(stream: &mut UnixStream, engine: Arc<Engine>) -> Result<
     let mut store = Vec::with_capacity(4096);
     let mut request = read_request(stream, &mut store).await;
     // Only an introduced probe may use the engine, and only one probe at a time.
-    let mut admission = None;
+    let mut admitted = None;
 
     loop {
         let frame = match request {
@@ -144,14 +144,14 @@ async fn serve_requests(stream: &mut UnixStream, engine: Arc<Engine>) -> Result<
                 write_frame(stream, &response).await
             }
             Frame::Hello { probe } => {
-                let Some(admitted) = engine.occupancy.admit(probe) else {
+                let Some(connection) = engine.admission.admit(probe) else {
                     tracing::info!("hub: turned away probe {probe:016x} while serving another");
                     return write_frame(stream, &Frame::Busy).await;
                 };
-                admission = Some(admitted);
+                admitted = Some(connection);
                 write_frame(stream, &Frame::Welcome).await
             }
-            Frame::Advance { .. } | Frame::Restart { .. } if admission.is_none() => {
+            Frame::Advance { .. } | Frame::Restart { .. } if admitted.is_none() => {
                 let refusal = Frame::Error(
                     "the probe did not say hello; probe and hub are probably different versions of please"
                         .into(),
