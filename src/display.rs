@@ -77,6 +77,8 @@ impl Display {
         }
     }
 
+    /// Open a line for the model's reasoning; `None` when stderr is not a terminal, where
+    /// reasoning is not shown.
     pub fn thinking_line(&self) -> Option<ThinkingLine> {
         if !self.stderr_is_tty {
             return None;
@@ -84,6 +86,7 @@ impl Display {
         Some(ThinkingLine(()))
     }
 
+    /// End the answer's last line.
     pub fn end_answer(&self) {
         let _ = crossterm::execute!(std::io::stdout(), Print("\n"));
     }

@@ -411,6 +411,7 @@ async fn connection(stream: &mut Option<UnixStream>) -> Result<&mut UnixStream> 
     }
 }
 
+/// Whether the connection dropped, as a new one may mend, rather than the turn itself failing.
 fn is_disconnect(error: &eyre::Report) -> bool {
     let io_error = match error.downcast_ref::<ProtocolError>() {
         Some(ProtocolError::Disconnect) => return true,

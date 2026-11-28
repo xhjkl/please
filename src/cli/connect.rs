@@ -101,6 +101,8 @@ pub async fn connect_to_hub() -> Result<UnixStream> {
     Ok(stream)
 }
 
+/// Connect to the hub listening at `path`, or start one when none does: a process of its
+/// own with `PLEASE_SPAWN_HUB` set, otherwise one embedded in this process.
 async fn connect_to_hub_at(path: &Path) -> Result<UnixStream> {
     let connected = dial(path).await;
     match connected {
