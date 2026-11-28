@@ -13,7 +13,7 @@
 use super::OutputParser;
 use super::piece::{Piece, encode_prompt};
 use super::prompt::{FunctionCall, Grade, Preamble, PromptMessage, Rendered, tool_schemas};
-use super::wording;
+use crate::hub::wording;
 use crate::protocol::Effort;
 use eyre::Result;
 use oco::Tokenizer;

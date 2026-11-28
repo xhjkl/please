@@ -10,7 +10,7 @@
 use super::OutputParser;
 use super::piece::{Piece, encode_pieces, special};
 use super::prompt::{FunctionCall, Grade, Preamble, PromptMessage, Rendered};
-use super::wording;
+use crate::hub::wording;
 use crate::protocol::Effort;
 use eyre::{Result, eyre};
 use oco::Tokenizer;

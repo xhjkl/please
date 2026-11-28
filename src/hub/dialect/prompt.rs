@@ -1,6 +1,6 @@
 //! A prompt before framing: its preamble, and its messages as worded from the protocol's
 //! neutral history, with what every dialect needs to prepare them.
-use super::wording;
+use crate::hub::wording;
 use crate::protocol::{Effort, Message, Note, Setting, ToolCall};
 use crate::tools::{ParamKind, Spec};
 use eyre::{Result, WrapErr};

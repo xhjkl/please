@@ -47,6 +47,8 @@ mod server;
 mod transcript;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod turn;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod wording;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use benchmark::run as benchmark;

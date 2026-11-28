@@ -1,4 +1,5 @@
 use super::*;
+use crate::hub::wording;
 use crate::protocol::{Effort, Frame, Message, Note, Place, Setting, ToolCall, ToolResult};
 use eyre::Result;
 use prompt::{Grade, Preamble, PromptMessage, prepare};

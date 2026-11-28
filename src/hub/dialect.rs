@@ -83,5 +83,4 @@ mod prompt;
 mod qwenish;
 #[cfg(test)]
 mod tests;
-pub(super) mod wording;
 pub(super) use prompt::{Delta, FunctionCall, Rendered};

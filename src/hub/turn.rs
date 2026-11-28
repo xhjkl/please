@@ -1,10 +1,11 @@
 //! The hub's part of a turn, in the place's room: keep what the probe delivers, compact the
 //! conversation when it nears the context's end, generate, run the hub's own tools, and keep
 //! each step. The probe sends only what is new; the conversation so far lives in the room.
-use super::dialect::{Delta, FunctionCall, wording};
+use super::dialect::{Delta, FunctionCall};
 use super::inference::{self, Engine, clipping};
 use super::rooms::{Entry, Room};
 use super::transcript;
+use super::wording;
 use crate::protocol::{Frame, Message, Note, Place, Setting, ToolCall, ToolResult, write_frame};
 use eyre::{Result, bail, eyre};
 use std::hash::{Hash, Hasher};
