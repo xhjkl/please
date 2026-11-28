@@ -2,9 +2,9 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 use super::applying::{apply_all_hunks, apply_hunk};
+use super::filesystem::set_trailing_newline;
 use super::model::{Hunk, PatchOp};
 use super::parsing::{contains_patch_syntax, parse_patch_ops};
-use super::text::set_trailing_newline;
 
 fn execute_patch_ops_in_memory(
     files: &mut BTreeMap<String, String>,

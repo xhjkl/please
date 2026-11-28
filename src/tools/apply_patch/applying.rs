@@ -1,5 +1,4 @@
 use super::model::Hunk;
-use super::text::{find_lines_window, preview};
 
 pub fn apply_all_hunks(before: &str, hunks: &[Hunk]) -> Result<String, Vec<(usize, String)>> {
     let mut text = before.to_string();
@@ -17,6 +16,8 @@ pub fn apply_all_hunks(before: &str, hunks: &[Hunk]) -> Result<String, Vec<(usiz
     }
 }
 
+/// Replace the hunk's old lines with its new ones: where they match whole lines, trailing
+/// whitespace aside, or else where their text occurs. A hunk without old lines appends.
 pub fn apply_hunk(before: &str, h: &Hunk) -> Result<String, String> {
     if h.old_lines.is_empty() {
         let mut out = String::from(before);
@@ -28,8 +29,13 @@ pub fn apply_hunk(before: &str, h: &Hunk) -> Result<String, String> {
     }
 
     let mut lines: Vec<&str> = before.split('\n').collect();
-    let old_lines: Vec<&str> = h.old_lines.iter().map(String::as_str).collect();
-    if let Some((start, end)) = find_lines_window(&lines, &old_lines) {
+    let matches = |window: &[&str]| {
+        let mut pairs = window.iter().zip(&h.old_lines);
+        pairs.all(|(line, old)| line.trim_end() == old.trim_end())
+    };
+    let found = lines.windows(h.old_lines.len()).position(matches);
+    if let Some(start) = found {
+        let end = start + h.old_lines.len();
         lines.splice(start..end, h.new_lines.iter().map(String::as_str));
         let mut out = lines.join("\n");
         if before.ends_with('\n') && !out.ends_with('\n') {
@@ -43,5 +49,11 @@ pub fn apply_hunk(before: &str, h: &Hunk) -> Result<String, String> {
     if before.contains(&old_seg) {
         return Ok(before.replacen(&old_seg, &h.new_lines.join("\n"), 1));
     }
-    Err(format!("hunk old text not found: {}", preview(&old_seg)))
+    // Showing the start of the text, on one line.
+    let mut shown = old_seg.replace('\n', "\\n");
+    if shown.len() > 160 {
+        shown.truncate(shown.floor_char_boundary(160));
+        shown.push('…');
+    }
+    Err(format!("hunk old text not found: {shown}"))
 }

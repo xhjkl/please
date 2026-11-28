@@ -1,5 +1,4 @@
 use super::model::{Hunk, PatchOp};
-use super::text::normalize_eol;
 
 /// The lines that open and close a patch, lowercase and without whitespace, as `find_marker`
 /// compares them.
@@ -68,6 +67,11 @@ fn find_marker(lines: &[&str], from: usize, marker: &str) -> Option<usize> {
         .iter()
         .position(|line| squeezed(line) == marker)?;
     Some(from + found)
+}
+
+/// Read CRLF and lone CR line ends as LF.
+fn normalize_eol(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Lowercase a line and drop its whitespace, to compare it with a marker in any case or spacing.

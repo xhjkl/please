@@ -3,7 +3,6 @@ mod filesystem;
 mod model;
 mod parsing;
 mod preview;
-mod text;
 
 use super::ToolContext;
 use super::common::{Param, ParamKind, Spec};
@@ -38,7 +37,10 @@ pub async fn call(args: Args, _context: ToolContext<'_>) -> serde_json::Value {
     }
     match parsing::parse_patch_ops(&patch) {
         Err(error) => json!({ "error": error }),
-        Ok(ops) => filesystem::execute_patch_ops(ops),
+        Ok(ops) => {
+            let results: Vec<_> = ops.into_iter().map(filesystem::execute).collect();
+            json!({ "ok": true, "mode": "patch", "results": results })
+        }
     }
 }
 

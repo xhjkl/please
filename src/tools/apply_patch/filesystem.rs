@@ -4,7 +4,6 @@ use std::io::{self, ErrorKind};
 
 use super::applying::apply_all_hunks;
 use super::model::PatchOp;
-use super::text::set_trailing_newline;
 use crate::tools::common::resolve_path_within_cwd;
 
 pub fn write_verbatim_within_cwd(path: &str, content: &str) -> io::Result<()> {
@@ -17,11 +16,6 @@ pub fn write_verbatim_within_cwd(path: &str, content: &str) -> io::Result<()> {
     fs::write(rel, content)
 }
 
-fn read_within_cwd(path: &str) -> io::Result<String> {
-    let rel = resolve_path_within_cwd(path)?;
-    fs::read_to_string(rel)
-}
-
 fn remove_file_if_exists(path: &str) -> io::Result<()> {
     let rel = resolve_path_within_cwd(path)?;
     let removed = fs::remove_file(rel);
@@ -31,13 +25,8 @@ fn remove_file_if_exists(path: &str) -> io::Result<()> {
     }
 }
 
-pub fn execute_patch_ops(ops: Vec<PatchOp>) -> Value {
-    let results: Vec<Value> = ops.into_iter().map(execute).collect();
-    json!({ "ok": true, "mode": "patch", "results": results })
-}
-
 /// Apply one operation, reporting its failure in its result rather than stopping the patch.
-fn execute(op: PatchOp) -> Value {
+pub fn execute(op: PatchOp) -> Value {
     match op {
         PatchOp::Add {
             path,
@@ -57,7 +46,7 @@ fn execute(op: PatchOp) -> Value {
             hunks,
             no_newline,
         } => {
-            let before = read_within_cwd(&path);
+            let before = resolve_path_within_cwd(&path).and_then(fs::read_to_string);
             let before = match before {
                 Err(error) if error.kind() != ErrorKind::NotFound => {
                     return result(&path, "update", Err(format!("read: {error}")));
@@ -91,4 +80,13 @@ fn result(path: &str, op: &str, done: Result<(), String>) -> Value {
         Err(error) => json!({ "path": path, "op": op, "ok": false, "error": error }),
         Ok(()) => json!({ "path": path, "op": op, "ok": true }),
     }
+}
+
+/// End `s` with one newline, or with none.
+pub fn set_trailing_newline(s: &str, want_newline: bool) -> String {
+    let mut t = s.trim_end_matches('\n').to_string();
+    if want_newline {
+        t.push('\n');
+    }
+    t
 }
