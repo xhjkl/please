@@ -83,6 +83,28 @@ fn a_restart_sets_entries_aside_and_numbering_goes_on() -> Result<()> {
 }
 
 #[test]
+fn an_epoch_lasts_until_the_conversation_restarts() -> Result<()> {
+    let dir = TempDir::new()?;
+    let room = Room::at(dir.0.join("room"))?;
+    room.append(&some_messages())?;
+    let first = room.epoch()?;
+    room.append(&[Message::User("more".into())])?;
+    assert_eq!(room.epoch()?, first);
+    room.restart(&[])?;
+    let second = room.epoch()?;
+    assert_ne!(second, first);
+    // Erasing what was set aside lets numbering start over, yet the conversation is the new one.
+    std::fs::remove_dir_all(room.dir().join("old"))?;
+    room.append(&[Message::User("again".into())])?;
+    assert_eq!(room.next()?, 2);
+    assert_eq!(room.epoch()?, second);
+    // A room emptied by hand is a conversation no hub has seen.
+    std::fs::remove_file(room.dir().join(".epoch"))?;
+    assert_ne!(room.epoch()?, second);
+    Ok(())
+}
+
+#[test]
 fn foreign_files_and_unreadable_entries_cost_nothing_else() -> Result<()> {
     let dir = TempDir::new()?;
     let room = Room::at(dir.0.join("room"))?;

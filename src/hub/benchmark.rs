@@ -103,7 +103,7 @@ pub async fn run(checkpoint: &str, cases_path: &str) -> Result<()> {
     let setting = crate::setting::current(Destination::Terminal);
     println!("{}", COLUMNS.join("\t"));
     for case in cases {
-        let owner = engine.new_owner();
+        let owner = crate::protocol::fresh_id();
         let limit = case.max_tokens;
         let first = exchange(&engine, owner, &setting, case.messages.clone(), limit).await?;
         println!("{}", first.row(&case.name, "first")?);

@@ -44,14 +44,13 @@ pub struct Engine {
     session: tokio::sync::Mutex<Option<KeptSession>>,
     /// The probe allowed to use the session.
     pub admission: Admission,
-    /// Owners issued by [`Engine::new_owner`].
-    owners: std::sync::atomic::AtomicU64,
 }
 
 /// The session as kept between requests, with whose history it last consumed.
 struct KeptSession {
     session: oco::Session,
-    /// Whose history the session last consumed: a room in one epoch, or a one-off.
+    /// Whose history the session last consumed: a conversation, by its room's epoch, or a
+    /// one-off, by an ID of its own.
     owner: u64,
     /// The owner's history indices clipped from every prompt the session was fed.
     dropped: Vec<Range<usize>>,
@@ -112,7 +111,6 @@ impl Engine {
             capacity,
             session: tokio::sync::Mutex::new(None),
             admission: Admission::default(),
-            owners: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -136,12 +134,6 @@ impl Engine {
     pub fn fill(&self, setting: &Setting, history: &[Message]) -> Result<f64> {
         let tokens = self.render(setting, history, self.capacity)?.tokens.len();
         Ok(tokens as f64 / self.capacity as f64)
-    }
-
-    /// Issue an owner shared with no other, for a history that extends nothing kept.
-    pub fn new_owner(&self) -> u64 {
-        self.owners
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Start a session from the cacheable prefix: restored from the cache, or prefilled and saved.

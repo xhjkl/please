@@ -11,7 +11,6 @@ use crate::protocol::{
     Destination, Frame, Message, Note, Place, Restarted, Setting, ToolCall, ToolResult, write_frame,
 };
 use eyre::{Result, bail, eyre};
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
@@ -102,8 +101,8 @@ pub async fn advance(
                 }
             }
         }
-        let epoch = room.epoch()?;
-        let owner = owner(place, epoch);
+        // The conversation owns its history, so a restart brings another owner.
+        let owner = room.epoch()?;
         let step = generate(Some(&mut *sink), engine, owner, setting, &history, None).await?;
         let mut kept = prose(step.thinking, step.answer);
         // A call's ID is the number of the entry that first keeps it.
@@ -256,14 +255,6 @@ fn cutover(
     Ok((entries, kept))
 }
 
-/// Whose history a prompt renders: the place's room in its current epoch, so a restart brings
-/// another owner. Clipping choices stay with their owner.
-fn owner(place: &Place, epoch: u64) -> u64 {
-    let mut hasher = std::hash::DefaultHasher::new();
-    (place, epoch).hash(&mut hasher);
-    hasher.finish()
-}
-
 /// A step's reasoning and answer; a response of calls alone still opens its own step.
 fn prose(thinking: String, answer: String) -> Vec<Message> {
     let mut kept = Vec::new();
@@ -359,8 +350,8 @@ async fn compact(
             draft: draft.take(),
             chunk,
         };
-        // A fresh owner: summarizing prompts share no clipping with any room.
-        let owner = engine.new_owner();
+        // A fresh owner: summarizing prompts share no clipping with any conversation.
+        let owner = crate::protocol::fresh_id();
         let prompt = [Message::Note(note)];
         let quiet = None::<&mut tokio::io::Sink>;
         // Decoding is greedy, so asking again would write the same message.

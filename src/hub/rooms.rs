@@ -34,6 +34,8 @@ const OLD: &str = "old";
 const WHERE: &str = ".where";
 /// The ID of the last delivery kept, so a retried one is kept once.
 const DELIVERY: &str = ".delivery";
+/// The conversation's ID, which every restart renews.
+const EPOCH: &str = ".epoch";
 
 /// One room's directory.
 #[derive(Debug, Clone)]
@@ -98,11 +100,23 @@ impl Room {
         Ok(entries.into_iter().map(|entry| entry.message).collect())
     }
 
-    /// The number of the conversation's first entry, which changes with every restart; zero
-    /// while the conversation is empty.
+    /// The conversation's ID: random, and new with every restart, so what a hub keeps about
+    /// one conversation is never taken for another's, even once numbering starts over. A room
+    /// that has none yet gets one here.
     pub fn epoch(&self) -> Result<u64> {
-        let current = self.names()?.into_iter().find(|&(_, old)| !old);
-        Ok(current.map_or(0, |(number, _)| number))
+        let kept = std::fs::read_to_string(self.dir.join(EPOCH));
+        let kept = kept.ok().and_then(|text| text.trim().parse().ok());
+        match kept {
+            Some(epoch) => Ok(epoch),
+            None => self.renew_epoch(),
+        }
+    }
+
+    /// Give the conversation a new ID.
+    fn renew_epoch(&self) -> Result<u64> {
+        let epoch = crate::protocol::fresh_id();
+        write(&self.dir, EPOCH, epoch.to_string().as_bytes())?;
+        Ok(epoch)
     }
 
     /// Record messages after the last entry; notes are the harness's and are not kept.
@@ -122,6 +136,7 @@ impl Room {
     /// `old`. The new entries come first, so a failure midway never leaves the conversation
     /// empty.
     pub fn restart(&self, messages: &[Message]) -> Result<()> {
+        self.renew_epoch()?;
         make_dir(&self.dir.join(OLD))?;
         let before = self.names()?;
         self.append(messages)?;

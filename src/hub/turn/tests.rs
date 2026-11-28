@@ -159,13 +159,3 @@ fn a_third_identical_call_with_an_unchanged_result_is_refused() {
     ];
     assert!(!repeats(&running.concat(), &grep));
 }
-
-#[test]
-fn a_room_keeps_its_owner_until_it_restarts() {
-    let place = Place {
-        machine: "ssh-ed25519 AAAA".into(),
-        cwd: "/".into(),
-    };
-    assert_eq!(owner(&place, 3), owner(&place, 3));
-    assert_ne!(owner(&place, 3), owner(&place, 9));
-}
