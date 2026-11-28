@@ -107,16 +107,16 @@ pub fn kind_of(name: &str) -> ToolKind {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const CONTROL_COMMAND_NAME: &str = command::CONTROL_NAME;
 
+/// Every tool the probe runs.
 pub fn all_tools() -> Tools {
-    [
+    Tools::from([
         tool!(list_files::SPEC, list_files::call),
         tool!(read_file::SPEC, read_file::call),
         tool!(find_related::SPEC, find_related::call),
         tool!(apply_patch::SPEC, apply_patch::call),
-    ]
-    .into_iter()
-    .chain(command::tools())
-    .collect()
+        tool!(command::RUN_SPEC, command::run),
+        tool!(command::CONTROL_SPEC, command::control),
+    ])
 }
 
 /// What a tool's result says, without the fields a command's result changes on every call: its

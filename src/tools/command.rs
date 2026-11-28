@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::ToolContext;
 use super::common::{Param, ParamKind, Spec};
-use super::{Tool, ToolContext};
 
 mod job;
 
@@ -21,13 +21,13 @@ const CLEANUP_WAIT: Duration = Duration::from_secs(2);
 static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize)]
-struct Run {
+pub struct Run {
     argv: Vec<String>,
     wait_seconds: Option<f64>,
 }
 
 #[derive(Deserialize)]
-struct Control {
+pub struct Control {
     command_id: u64,
     action: Action,
     wait_seconds: Option<f64>,
@@ -147,7 +147,7 @@ fn wait_duration(wait_seconds: Option<f64>) -> Result<Duration, &'static str> {
     Duration::try_from_secs_f64(wait_seconds).map_err(|_| "wait_seconds is too large to represent")
 }
 
-async fn run(args: Run, context: ToolContext<'_>) -> Value {
+pub async fn run(args: Run, context: ToolContext<'_>) -> Value {
     if args.argv.is_empty() {
         return json!({ "error": "argv must be non-empty" });
     }
@@ -164,7 +164,7 @@ async fn run(args: Run, context: ToolContext<'_>) -> Value {
     context.jobs.observe(id, &job, wait).await
 }
 
-async fn control(args: Control, context: ToolContext<'_>) -> Value {
+pub async fn control(args: Control, context: ToolContext<'_>) -> Value {
     let id = args.command_id;
     let Some(job) = context.jobs.get(id) else {
         return json!({ "error": format!("unknown command_id {id}") });
@@ -185,7 +185,7 @@ async fn control(args: Control, context: ToolContext<'_>) -> Value {
     context.jobs.observe(id, &job, wait).await
 }
 
-const RUN_SPEC: Spec = Spec {
+pub const RUN_SPEC: Spec = Spec {
     name: RUN_NAME,
     description: "Start a command by argv. A command that outlives wait_seconds returns a command_id. Use control_command to get more output or stop it.",
     params: &[
@@ -204,7 +204,7 @@ const RUN_SPEC: Spec = Spec {
     ],
 };
 
-const CONTROL_SPEC: Spec = Spec {
+pub const CONTROL_SPEC: Spec = Spec {
     name: CONTROL_NAME,
     description: "Collect the next stdout/stderr chunk from a command. Use wait to let it keep running or kill to stop it.",
     params: &[
@@ -228,10 +228,6 @@ const CONTROL_SPEC: Spec = Spec {
         },
     ],
 };
-
-pub fn tools() -> [(&'static str, Tool); 2] {
-    [tool!(RUN_SPEC, run), tool!(CONTROL_SPEC, control)]
-}
 
 #[cfg(test)]
 mod tests;
