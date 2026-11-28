@@ -15,7 +15,7 @@ async fn shell(
 ) -> Value {
     let mut argv = vec!["sh".into(), "-c".into(), script.into(), "sh".into()];
     argv.extend(args.iter().map(|path| path.to_str().unwrap().to_string()));
-    start(Start { argv, wait_seconds }, context).await
+    run(Run { argv, wait_seconds }, context).await
 }
 
 async fn control(
@@ -81,7 +81,7 @@ async fn assert_process_exited(pid: i32) {
 #[tokio::test]
 async fn captures_command_output_with_shape_for_history() {
     let result = shell(
-        ToolContext::new(&Commands::default(), None),
+        ToolContext::new(&Jobs::default(), None),
         "printf hello; printf problem >&2",
         &[],
         None,
@@ -99,14 +99,14 @@ async fn captures_command_output_with_shape_for_history() {
 #[tokio::test]
 async fn command_ids_remain_distinct_across_turns() {
     let first = shell(
-        ToolContext::new(&Commands::default(), None),
+        ToolContext::new(&Jobs::default(), None),
         "exit 0",
         &[],
         None,
     )
     .await;
     let second = shell(
-        ToolContext::new(&Commands::default(), None),
+        ToolContext::new(&Jobs::default(), None),
         "exit 0",
         &[],
         None,
@@ -127,13 +127,7 @@ async fn overflowing_output_retains_each_streams_latest_bytes() {
          printf '{old_stderr}' >&2; head -c {MAX_CAPTURE_BYTES} /dev/zero | tr '\\000' y >&2; \
          printf '{latest_stderr}' >&2"
     );
-    let result = shell(
-        ToolContext::new(&Commands::default(), None),
-        &script,
-        &[],
-        None,
-    )
-    .await;
+    let result = shell(ToolContext::new(&Jobs::default(), None), &script, &[], None).await;
 
     assert_eq!(result["status"], "finished");
     assert_eq!(result["exit_code"], 0);
@@ -164,7 +158,7 @@ async fn overflowing_output_retains_each_streams_latest_bytes() {
 #[tokio::test]
 async fn finished_command_cleans_redirected_background_child() {
     let result = shell(
-        ToolContext::new(&Commands::default(), None),
+        ToolContext::new(&Jobs::default(), None),
         "sleep 999 >/dev/null 2>&1 & echo $!",
         &[],
         None,
@@ -181,8 +175,8 @@ async fn dropping_turn_state_stops_process_groups() {
     let directory = TempDir::new().unwrap();
     let pid_path = directory.0.join("child-pid");
     let script = "sleep 999 >/dev/null 2>&1 & echo $! > \"$1\"; wait";
-    let commands = Commands::default();
-    let context = ToolContext::new(&commands, None);
+    let jobs = Jobs::default();
+    let context = ToolContext::new(&jobs, None);
     let started = shell(context, script, &[&pid_path], Some(0.0)).await;
     let descendant = tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
@@ -198,7 +192,7 @@ async fn dropping_turn_state_stops_process_groups() {
     .await
     .unwrap();
 
-    drop(commands);
+    drop(jobs);
 
     assert_process_exited(started["pid"].as_i64().unwrap() as i32).await;
     assert_process_exited(descendant).await;
@@ -206,8 +200,8 @@ async fn dropping_turn_state_stops_process_groups() {
 
 #[tokio::test]
 async fn running_commands_and_waits_deliver_each_chunk_once() {
-    let commands = Commands::default();
-    let context = ToolContext::new(&commands, None);
+    let jobs = Jobs::default();
+    let context = ToolContext::new(&jobs, None);
     let directory = TempDir::new().unwrap();
     let release = directory.0.join("write-two");
     let script =
@@ -233,8 +227,8 @@ async fn running_commands_and_waits_deliver_each_chunk_once() {
 
 #[tokio::test]
 async fn control_stops_one_command_during_a_wait_and_preserves_the_other() {
-    let commands = Commands::default();
-    let context = ToolContext::new(&commands, None);
+    let jobs = Jobs::default();
+    let context = ToolContext::new(&jobs, None);
     let first = shell(context, "printf first; exec sleep 999", &[], Some(0.0)).await;
     let second = shell(context, "printf second; exec sleep 999", &[], Some(0.0)).await;
     let first_id = command_id(&first);
@@ -260,15 +254,15 @@ async fn control_stops_one_command_during_a_wait_and_preserves_the_other() {
 
     let remaining = control(second_id, Action::Wait, Some(0.0), context).await;
     assert_eq!(remaining["status"], "running");
-    assert_eq!(commands.pending_ids(), [second_id]);
+    assert_eq!(jobs.pending_ids(), [second_id]);
     let stopped = control(second_id, Action::Kill, None, context).await;
     assert_eq!(stopped["status"], "killed");
 }
 
 #[tokio::test]
 async fn kill_reports_finished_if_command_was_already_reaped() {
-    let commands = Commands::default();
-    let context = ToolContext::new(&commands, None);
+    let jobs = Jobs::default();
+    let context = ToolContext::new(&jobs, None);
     let started = shell(context, "printf after", &[], Some(0.0)).await;
     let pid = started["pid"].as_i64().unwrap() as i32;
     assert_process_exited(pid).await;
@@ -281,8 +275,8 @@ async fn kill_reports_finished_if_command_was_already_reaped() {
 
 #[tokio::test]
 async fn a_poll_keeps_a_partial_utf8_character_for_the_next_result() {
-    let commands = Commands::default();
-    let context = ToolContext::new(&commands, None);
+    let jobs = Jobs::default();
+    let context = ToolContext::new(&jobs, None);
     let directory = TempDir::new().unwrap();
     let release = directory.0.join("finish-character");
     let script =

@@ -61,7 +61,7 @@ impl Display {
         }
     }
 
-    /// Append a line to the hub's readout, if it is shown.
+    /// Show a line of the hub's log, if those are shown.
     pub fn show_log(&self, line: &str) {
         if !self.shows_hub_logs {
             return;

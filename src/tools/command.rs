@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::common::{Param, ParamType};
+use super::common::{Param, ParamKind, Spec};
 use super::{Tool, ToolContext};
 
 mod job;
@@ -21,7 +21,7 @@ const CLEANUP_WAIT: Duration = Duration::from_secs(2);
 static NEXT_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize)]
-struct Start {
+struct Run {
     argv: Vec<String>,
     wait_seconds: Option<f64>,
 }
@@ -40,11 +40,11 @@ enum Action {
     Kill,
 }
 
-/// Commands owned by an assistant turn, including exits the model has yet to collect.
+/// The commands a turn started, each a job, including exits the model has yet to collect.
 #[derive(Default)]
-pub struct Commands(Mutex<HashMap<u64, Arc<Job>>>);
+pub struct Jobs(Mutex<HashMap<u64, Arc<Job>>>);
 
-impl Commands {
+impl Jobs {
     fn insert(&self, job: Arc<Job>) -> u64 {
         let id = NEXT_COMMAND_ID.fetch_add(1, Ordering::Relaxed);
         let mut pending = self.0.lock().unwrap();
@@ -147,7 +147,7 @@ fn wait_duration(wait_seconds: Option<f64>) -> Result<Duration, &'static str> {
     Duration::try_from_secs_f64(wait_seconds).map_err(|_| "wait_seconds is too large to represent")
 }
 
-async fn start(args: Start, context: ToolContext<'_>) -> Value {
+async fn run(args: Run, context: ToolContext<'_>) -> Value {
     if args.argv.is_empty() {
         return json!({ "error": "argv must be non-empty" });
     }
@@ -160,13 +160,13 @@ async fn start(args: Start, context: ToolContext<'_>) -> Value {
         Err(error) => return json!({ "error": error.to_string() }),
         Ok(job) => Arc::new(job),
     };
-    let id = context.commands.insert(job.clone());
-    context.commands.observe(id, &job, wait).await
+    let id = context.jobs.insert(job.clone());
+    context.jobs.observe(id, &job, wait).await
 }
 
 async fn control(args: Control, context: ToolContext<'_>) -> Value {
     let id = args.command_id;
-    let Some(job) = context.commands.get(id) else {
+    let Some(job) = context.jobs.get(id) else {
         return json!({ "error": format!("unknown command_id {id}") });
     };
     let wait = match args.action {
@@ -182,55 +182,55 @@ async fn control(args: Control, context: ToolContext<'_>) -> Value {
     if let Some(live) = context.live_output {
         job.stream_to(live);
     }
-    context.commands.observe(id, &job, wait).await
+    context.jobs.observe(id, &job, wait).await
 }
 
-const START_SPEC: (&str, &str, &[Param]) = (
-    RUN_NAME,
-    "Start a command by argv. A command that outlives wait_seconds returns a command_id. Use control_command to get more output or stop it.",
-    &[
+const RUN_SPEC: Spec = Spec {
+    name: RUN_NAME,
+    description: "Start a command by argv. A command that outlives wait_seconds returns a command_id. Use control_command to get more output or stop it.",
+    params: &[
         Param {
             name: "argv",
-            desc: "Argument vector for a new command: [program, ...args]",
-            param_type: ParamType::StringArray,
+            description: "Argument vector for a new command: [program, ...args]",
+            kind: ParamKind::StringArray,
             required: true,
         },
         Param {
             name: "wait_seconds",
-            desc: "Seconds to wait before returning control to the model (default 40, use 0 to poll immediately)",
-            param_type: ParamType::Number,
+            description: "Seconds to wait before returning control to the model (default 40, use 0 to poll immediately)",
+            kind: ParamKind::Number,
             required: false,
         },
     ],
-);
+};
 
-const CONTROL_SPEC: (&str, &str, &[Param]) = (
-    CONTROL_NAME,
-    "Collect the next stdout/stderr chunk from a command. Use wait to let it keep running or kill to stop it.",
-    &[
+const CONTROL_SPEC: Spec = Spec {
+    name: CONTROL_NAME,
+    description: "Collect the next stdout/stderr chunk from a command. Use wait to let it keep running or kill to stop it.",
+    params: &[
         Param {
             name: "command_id",
-            desc: "Command handle returned by run_command",
-            param_type: ParamType::Number,
+            description: "Command handle returned by run_command",
+            kind: ParamKind::Number,
             required: true,
         },
         Param {
             name: "action",
-            desc: "Whether to wait longer or stop the command",
-            param_type: ParamType::Choice(&["wait", "kill"]),
+            description: "Whether to wait longer or stop the command",
+            kind: ParamKind::Choice(&["wait", "kill"]),
             required: true,
         },
         Param {
             name: "wait_seconds",
-            desc: "With wait, seconds to wait before returning control to the model (default 40, use 0 to poll immediately); kill ignores it",
-            param_type: ParamType::Number,
+            description: "With wait, seconds to wait before returning control to the model (default 40, use 0 to poll immediately); kill ignores it",
+            kind: ParamKind::Number,
             required: false,
         },
     ],
-);
+};
 
 pub fn tools() -> [(&'static str, Tool); 2] {
-    [tool!(START_SPEC, start), tool!(CONTROL_SPEC, control)]
+    [tool!(RUN_SPEC, run), tool!(CONTROL_SPEC, control)]
 }
 
 #[cfg(test)]

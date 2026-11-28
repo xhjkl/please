@@ -7,11 +7,19 @@ use serde_json::Value;
 
 type Handler =
     for<'turn> fn(Value, ToolContext<'turn>) -> Pin<Box<dyn Future<Output = Value> + Send + 'turn>>;
-type Tool = (&'static str, Handler, &'static [Param]);
+
+/// A tool the probe runs: what the model is told of it, and where its calls go.
+pub struct Tool {
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub spec: Spec,
+    handler: Handler,
+}
 
 macro_rules! tool {
     ($spec:path, $call:path) => {{
-        let (name, description, params) = $spec;
         let handler: $crate::tools::Handler = |arguments, context| {
             Box::pin(async move {
                 match serde_json::from_value(arguments) {
@@ -20,14 +28,20 @@ macro_rules! tool {
                 }
             })
         };
-        (name, (description, handler, params))
+        (
+            $spec.name,
+            $crate::tools::Tool {
+                spec: $spec,
+                handler,
+            },
+        )
     }};
 }
 
 mod common;
-pub use self::common::Param;
+pub use self::common::Spec;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use self::common::ParamType;
+pub use self::common::{Param, ParamKind};
 
 mod apply_patch;
 mod command;
@@ -36,27 +50,21 @@ mod list_files;
 mod read_file;
 
 pub use apply_patch::summarize_patch_for_preview;
-pub use command::Commands;
+pub use command::Jobs;
 
-/// The probe's tools, keyed by function name.
-pub type ExposedTools = HashMap<&'static str, Tool>;
+/// The probe's tools, keyed by name.
+pub type Tools = HashMap<&'static str, Tool>;
 
-/// A tool borrows its turn's command registry and may receive a live output sink for this call.
+/// A tool borrows its turn's jobs and may receive a live output sink for this call.
 #[derive(Clone, Copy)]
 pub struct ToolContext<'turn> {
-    commands: &'turn Commands,
+    jobs: &'turn Jobs,
     live_output: Option<&'turn UnboundedSender<String>>,
 }
 
 impl<'turn> ToolContext<'turn> {
-    pub fn new(
-        commands: &'turn Commands,
-        live_output: Option<&'turn UnboundedSender<String>>,
-    ) -> Self {
-        Self {
-            commands,
-            live_output,
-        }
+    pub fn new(jobs: &'turn Jobs, live_output: Option<&'turn UnboundedSender<String>>) -> Self {
+        Self { jobs, live_output }
     }
 }
 
@@ -94,7 +102,7 @@ pub fn kind_of(name: &str) -> ToolKind {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const CONTROL_COMMAND_NAME: &str = command::CONTROL_NAME;
 
-pub fn all_tools() -> ExposedTools {
+pub fn all_tools() -> Tools {
     [
         tool!(list_files::SPEC, list_files::call),
         tool!(read_file::SPEC, read_file::call),
@@ -125,13 +133,13 @@ pub fn outcome(result: &str) -> Option<Value> {
 
 /// Invoke a tool with services scoped to this tool call.
 pub async fn invoke(
-    tools: &ExposedTools,
+    tools: &Tools,
     context: ToolContext<'_>,
     name: &str,
     args: Value,
 ) -> Result<Value, String> {
-    let Some((_, work, _)) = tools.get(name) else {
+    let Some(tool) = tools.get(name) else {
         return Err("No such function".to_string());
     };
-    Ok(work(args, context).await)
+    Ok((tool.handler)(args, context).await)
 }

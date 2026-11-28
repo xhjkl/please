@@ -70,9 +70,9 @@ fn tool_step_renders_like_the_chat_template() -> Result<()> {
     history.extend(call("a"));
     history.extend(call("b"));
     let prompt = spelled(&render(&prepare(&some_setting(), &history)?)?.pieces);
-    let (_, conversation) = prompt.split_once("<|im_end|>\n").unwrap();
+    let (_, after_system) = prompt.split_once("<|im_end|>\n").unwrap();
     assert_eq!(
-        conversation,
+        after_system,
         "<|im_start|>user\nCompare a and b.<|im_end|>\n\
          <|im_start|>assistant\n<think>\nRead both.\n</think>\n\nChecking.\n\n\
          <tool_call>\n<function=read_file>\n<parameter=path>\na\n</parameter>\n<parameter=max_bytes>\n10\n</parameter>\n</function>\n</tool_call>\n\

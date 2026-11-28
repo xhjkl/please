@@ -89,8 +89,8 @@ fn search_sees_files_changed_since_the_last_search() {
 
 #[tokio::test]
 async fn find_related_refuses_paths_outside_the_workspace() {
-    let commands = crate::tools::Commands::default();
-    let context = crate::tools::ToolContext::new(&commands, None);
+    let jobs = crate::tools::Jobs::default();
+    let context = crate::tools::ToolContext::new(&jobs, None);
     let args = serde_json::json!({ "query": "anything", "path": "/" });
     let args = serde_json::from_value(args).unwrap();
     let result = super::call(args, context).await;

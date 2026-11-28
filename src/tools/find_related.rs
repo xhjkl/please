@@ -1,6 +1,6 @@
 //! Locate code by what it does, its identifiers, or a snippet, without reading whole files.
 use super::ToolContext;
-use super::common::{Param, ParamType, resolve_path_within_cwd};
+use super::common::{Param, ParamKind, Spec, resolve_path_within_cwd};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -32,21 +32,21 @@ pub async fn call(args: Args, _context: ToolContext<'_>) -> serde_json::Value {
     }
 }
 
-pub const SPEC: (&str, &str, &[Param]) = (
-    "find_related",
-    "Find where code related to a query lives: describe the behavior in words, or give an identifier, error message, or code snippet. Read-only and fast. Returns up to 5 files, best first, each as `path:first-last` with its most relevant numbered lines; read a file for more.",
-    &[
+pub const SPEC: Spec = Spec {
+    name: "find_related",
+    description: "Find where code related to a query lives: describe the behavior in words, or give an identifier, error message, or code snippet. Read-only and fast. Returns up to 5 files, best first, each as `path:first-last` with its most relevant numbered lines; read a file for more.",
+    params: &[
         Param {
             name: "query",
-            desc: "What to look for, in words or code",
-            param_type: ParamType::String,
+            description: "What to look for, in words or code",
+            kind: ParamKind::String,
             required: true,
         },
         Param {
             name: "path",
-            desc: "Directory to search; defaults to the current directory",
-            param_type: ParamType::String,
+            description: "Directory to search; defaults to the current directory",
+            kind: ParamKind::String,
             required: false,
         },
     ],
-);
+};

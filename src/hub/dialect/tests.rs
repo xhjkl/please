@@ -55,7 +55,7 @@ fn the_hub_words_the_setting_and_keeps_content_literal() -> Result<()> {
     let prepared = prepare(&setting, &messages)?;
     assert_eq!(prepared[0], PromptMessage::Effort(Effort::High));
     let PromptMessage::Instructions(system) = &prepared[1] else {
-        panic!("instructions open the conversation")
+        panic!("instructions open the prompt")
     };
     assert!(!system.contains('¶'));
     // Everything that varies between invocations follows the standing instructions.

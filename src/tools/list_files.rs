@@ -1,5 +1,5 @@
 use super::ToolContext;
-use super::common::{Param, ParamType, resolve_path_within_cwd};
+use super::common::{Param, ParamKind, Spec, resolve_path_within_cwd};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
@@ -70,21 +70,21 @@ fn walk(
     Ok(())
 }
 
-pub const SPEC: (&str, &str, &[Param]) = (
-    "list_files",
-    "List files under a path recursively with optional depth",
-    &[
+pub const SPEC: Spec = Spec {
+    name: "list_files",
+    description: "List files under a path recursively with optional depth",
+    params: &[
         Param {
             name: "path",
-            desc: "Root path; defaults to current directory",
-            param_type: ParamType::String,
+            description: "Root path; defaults to current directory",
+            kind: ParamKind::String,
             required: false,
         },
         Param {
             name: "max_depth",
-            desc: "Max recursion depth; default 0, just the given directory",
-            param_type: ParamType::Number,
+            description: "Max recursion depth; default 0, just the given directory",
+            kind: ParamKind::Number,
             required: false,
         },
     ],
-);
+};

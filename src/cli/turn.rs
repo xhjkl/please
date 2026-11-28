@@ -12,9 +12,10 @@ use crate::protocol::{
     write_frame,
 };
 use crate::tools::{
-    Commands, ExposedTools, ToolContext, ToolKind, all_tools, kind_of, summarize_patch_for_preview,
+    Jobs, ToolContext, ToolKind, Tools, all_tools, kind_of, summarize_patch_for_preview,
 };
 
+use super::commands::Command;
 use super::connect::connect_to_hub;
 
 /// A turn the user cancelled with Ctrl-C.
@@ -66,7 +67,7 @@ impl Delivery {
 async fn attempt_turn(
     scene: Scene<'_>,
     delivery: &mut Delivery,
-    commands: &Commands,
+    jobs: &Jobs,
     stream: &mut UnixStream,
     reconnect_attempts: &mut usize,
     display: &Display,
@@ -74,7 +75,7 @@ async fn attempt_turn(
     let tools = all_tools();
 
     loop {
-        let command_ids = commands.pending_ids();
+        let command_ids = jobs.pending_ids();
         let mut messages = delivery.messages.clone();
         let set_aside = messages
             .iter()
@@ -83,13 +84,13 @@ async fn attempt_turn(
             messages.push(Message::Note(Note::Pending(command_ids.clone())));
         }
         let mut spinner = Some(display.start_spinning());
-        let req = Frame::Advance {
+        let advance = Frame::Advance {
             place: scene.place.clone(),
             setting: scene.setting.clone(),
             id: delivery.id,
             messages,
         };
-        write_frame(stream, &req).await?;
+        write_frame(stream, &advance).await?;
 
         let mut store = Vec::with_capacity(4096);
         let mut thinking = None;
@@ -182,7 +183,7 @@ async fn attempt_turn(
         }
 
         let mut results = refused;
-        results.extend(execute_calls(&calls, &tools, commands, display).await);
+        results.extend(execute_calls(&calls, &tools, jobs, display).await);
         results.sort_by_key(|result| order.iter().position(|&id| id == result.id));
         *delivery = Delivery::new(results.into_iter().map(Message::Result).collect());
     }
@@ -192,8 +193,8 @@ async fn attempt_turn(
 /// Other tools stay in order with respect to commands and each other.
 async fn execute_calls(
     calls: &[ParsedCall],
-    tools: &ExposedTools,
-    commands: &Commands,
+    tools: &Tools,
+    jobs: &Jobs,
     display: &Display,
 ) -> Vec<ToolResult> {
     let mut answers = Vec::with_capacity(calls.len());
@@ -216,12 +217,12 @@ async fn execute_calls(
         };
         let results = match pane {
             Some((live, pane)) => {
-                let context = ToolContext::new(commands, Some(&live));
+                let context = ToolContext::new(jobs, Some(&live));
                 pane.render(invoke_batch(batch, approvals, tools, context))
                     .await
             }
             None => {
-                let context = ToolContext::new(commands, None);
+                let context = ToolContext::new(jobs, None);
                 let results = invoke_batch(batch, approvals, tools, context).await;
                 for (call, result) in batch.iter().zip(&results) {
                     if kind_of(&call.name).has_command_output() {
@@ -257,7 +258,7 @@ async fn execute_calls(
 async fn invoke_batch(
     calls: &[ParsedCall],
     approvals: Vec<Approval>,
-    tools: &ExposedTools,
+    tools: &Tools,
     context: ToolContext<'_>,
 ) -> Vec<Value> {
     join_all(
@@ -316,18 +317,18 @@ pub async fn run_turn(
     request: Vec<Message>,
 ) -> Result<String> {
     let mut interrupt = signal(SignalKind::interrupt())?;
-    let commands = Commands::default();
+    let jobs = Jobs::default();
     let mut delivery = Delivery::new(request);
     let result = tokio::select! {
         biased;
         _ = interrupt.recv() => Err(TurnCancelled.into()),
-        result = run_with_reconnect(stream, display, scene, &mut delivery, &commands) => result,
+        result = run_with_reconnect(stream, display, scene, &mut delivery, &jobs) => result,
     };
     if result.is_err() {
         // Closing the socket stops the hub's request and leaves the REPL free to reconnect.
         *stream = None;
     }
-    commands.shutdown().await;
+    jobs.shutdown().await;
     result
 }
 
@@ -338,7 +339,7 @@ async fn run_with_reconnect(
     display: &Display,
     scene: Scene<'_>,
     delivery: &mut Delivery,
-    commands: &Commands,
+    jobs: &Jobs,
 ) -> Result<String> {
     let mut reconnect_attempts = 0;
     loop {
@@ -346,7 +347,7 @@ async fn run_with_reconnect(
         let result = attempt_turn(
             scene,
             delivery,
-            commands,
+            jobs,
             connection,
             &mut reconnect_attempts,
             display,
@@ -363,23 +364,23 @@ async fn run_with_reconnect(
     }
 }
 
-/// Restart the scene's room on the hub, from a summary of it or from nothing, showing
-/// what the hub reports.
+/// Carry out a command: restart the scene's room on the hub, from a summary of it or from
+/// nothing, showing what the hub reports.
 pub async fn restart(
     stream: &mut Option<UnixStream>,
     display: &Display,
     scene: Scene<'_>,
-    summarize: bool,
+    command: Command,
 ) -> Result<()> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let restarted = async {
         let connection = connection(stream).await?;
-        let request = Frame::Restart {
+        let restart = Frame::Restart {
             place: scene.place.clone(),
             setting: scene.setting.clone(),
-            summarize,
+            summarize: command == Command::Compact,
         };
-        write_frame(connection, &request).await?;
+        write_frame(connection, &restart).await?;
         let spinner = display.start_spinning();
         let mut store = Vec::new();
         let mut answered = false;

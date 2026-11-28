@@ -2,35 +2,35 @@
 //! recall tool, which the hub runs itself.
 use super::rooms::{Entry, Room};
 use crate::protocol::{Message, ToolCall, ToolResult};
-use crate::tools::{Param, ParamType};
+use crate::tools::{Param, ParamKind, Spec};
 use serde_json::{Value, json};
 
 /// The hub's own tool: the transcript, restarts included, lives with the hub.
 pub const RECALL: &str = "recall";
 
-pub const RECALL_SPEC: (&str, &str, &[Param]) = (
-    RECALL,
-    "List this conversation's transcript, including entries before a restart, or read one entry in full",
-    &[
+pub const RECALL_SPEC: Spec = Spec {
+    name: RECALL,
+    description: "List this conversation's transcript, including entries before a restart, or read one entry in full",
+    params: &[
         Param {
             name: "entry",
-            desc: "Entry number, such as 12; omit to list every entry",
-            param_type: ParamType::String,
+            description: "Entry number, such as 12; omit to list every entry",
+            kind: ParamKind::String,
             required: false,
         },
         Param {
             name: "offset",
-            desc: "Character to start from, for text longer than one reply; default 0",
-            param_type: ParamType::Number,
+            description: "Character to start from, for text longer than one reply; default 0",
+            kind: ParamKind::Number,
             required: false,
         },
     ],
-);
+};
 
 /// Characters one recall returns at most, however roomy the context.
-pub const RECALLED: usize = 8000;
+pub const RECALL_PAGE: usize = 8000;
 
-/// Characters of each kind of body a condensing chunk shows before clipping it.
+/// Characters of each kind of body a chunk to summarize shows before clipping it.
 const SHOWN_TEXT: usize = 6000;
 const SHOWN_REASONING: usize = 800;
 const SHOWN_DATA: usize = 800;
@@ -233,23 +233,23 @@ mod tests {
         let room = Room::at(dir.0.join("room"))?;
         room.append(&some_messages())?;
         room.restart(&[Message::Answer("You asked me to find a GC.".into())])?;
-        let list = recall(&room, &json!({}), RECALLED);
+        let list = recall(&room, &json!({}), RECALL_PAGE);
         let list = list.as_str().unwrap();
         assert!(list.starts_with("1 user, 44 characters (before a restart): find me a gc"));
         assert!(list.ends_with("6 answer, 26 characters: You asked me to find a GC."));
         // A long entry comes back whole, a page at a time.
-        let page = recall(&room, &json!({"entry": 4, "offset": 10}), RECALLED);
+        let page = recall(&room, &json!({"entry": 4, "offset": 10}), RECALL_PAGE);
         let length = "result list_files 3\n\n".len() + "alloc.rs\n".len() * 400;
         assert_eq!(page["from"].as_u64(), Some(10));
         assert_eq!(page["length"].as_u64(), Some(length as u64));
-        let first = recall(&room, &json!({"entry": 1}), RECALLED);
+        let first = recall(&room, &json!({"entry": 1}), RECALL_PAGE);
         assert_eq!(
             first,
             "user\n\nfind me a gc implementation in this codebase"
         );
-        let missing = recall(&room, &json!({"entry": "99"}), RECALLED);
+        let missing = recall(&room, &json!({"entry": "99"}), RECALL_PAGE);
         assert!(missing["error"].as_str().is_some());
-        // The next condensing reads the restart message as such, not as an ordinary answer.
+        // The next compaction reads the summary as such, not as an ordinary answer.
         let next = chunks(&room.entries()?, 1 << 20);
         assert_eq!(
             next,

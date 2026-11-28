@@ -2,7 +2,7 @@
 //! framing, with what every dialect needs to prepare it.
 use super::prompting;
 use crate::protocol::{Effort, Message, Note, Setting};
-use crate::tools::ParamType;
+use crate::tools::{ParamKind, Spec};
 use eyre::{Result, WrapErr};
 use serde_json::{Map, Value, json};
 
@@ -61,33 +61,30 @@ pub enum Delta {
     Thinking(String),
 }
 
-/// A tool's name, description, and parameters, as the model is told them.
-pub type ToolSpec = (&'static str, &'static str, &'static [crate::tools::Param]);
-
 /// Every tool the model may call, the probe's and the hub's own, by name.
-pub fn tool_specs() -> Vec<ToolSpec> {
-    let probe = crate::tools::all_tools().into_iter();
-    let probe = probe.map(|(name, (description, _, parameters))| (name, description, parameters));
-    let mut tools: Vec<_> = probe.chain([crate::hub::transcript::RECALL_SPEC]).collect();
-    tools.sort_by_key(|(name, ..)| *name);
-    tools
+pub fn tool_specs() -> Vec<Spec> {
+    let probe = crate::tools::all_tools().into_values();
+    let probe = probe.map(|tool| tool.spec);
+    let mut specs: Vec<_> = probe.chain([crate::hub::transcript::RECALL_SPEC]).collect();
+    specs.sort_by_key(|spec| spec.name);
+    specs
 }
 
 /// Declare every tool as an OpenAI-style function schema for the chat templates.
 pub fn tool_schemas() -> Vec<Value> {
     tool_specs()
         .into_iter()
-        .map(|(name, description, parameters)| {
+        .map(|spec| {
             let mut properties = Map::new();
             let mut required = Vec::new();
-            for parameter in parameters {
-                let mut schema = match &parameter.param_type {
-                    ParamType::String => json!({"type": "string"}),
-                    ParamType::StringArray => json!({"type": "array", "items": {"type": "string"}}),
-                    ParamType::Number => json!({"type": "number"}),
-                    ParamType::Choice(choices) => json!({"type": "string", "enum": choices}),
+            for parameter in spec.params {
+                let mut schema = match &parameter.kind {
+                    ParamKind::String => json!({"type": "string"}),
+                    ParamKind::StringArray => json!({"type": "array", "items": {"type": "string"}}),
+                    ParamKind::Number => json!({"type": "number"}),
+                    ParamKind::Choice(choices) => json!({"type": "string", "enum": choices}),
                 };
-                schema["description"] = parameter.desc.into();
+                schema["description"] = parameter.description.into();
                 if parameter.required {
                     required.push(parameter.name);
                 }
@@ -96,8 +93,8 @@ pub fn tool_schemas() -> Vec<Value> {
             json!({
                 "type": "function",
                 "function": {
-                    "name": name,
-                    "description": description,
+                    "name": spec.name,
+                    "description": spec.description,
                     "parameters": {"type": "object", "properties": properties, "required": required},
                 },
             })

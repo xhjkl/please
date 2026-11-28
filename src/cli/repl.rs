@@ -5,7 +5,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::display::{Display, read_terminal_line};
 use crate::protocol::{HubBusy, Message};
 
-use super::commands::{self, Command};
+use super::commands;
 use super::turn::{Scene, is_cancelled, restart, run_turn};
 
 /// Read requests and commands until an empty line or end of input; the room carries what was
@@ -61,7 +61,7 @@ pub async fn interact(
 
         let outcome = match commands::parse(line) {
             Some(Err(error)) => Err(eyre!(error)),
-            Some(Ok(command)) => restart(stream, display, scene, command == Command::Compact).await,
+            Some(Ok(command)) => restart(stream, display, scene, command).await,
             None => {
                 let request = vec![Message::User(line.to_string())];
                 run_turn(stream, display, scene, request).await.map(drop)

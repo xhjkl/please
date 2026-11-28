@@ -1,5 +1,5 @@
 use super::ToolContext;
-use super::common::{Param, ParamType, resolve_path_within_cwd};
+use super::common::{Param, ParamKind, Spec, resolve_path_within_cwd};
 use serde::Deserialize;
 use serde_json::json;
 use std::fs::File;
@@ -32,21 +32,21 @@ fn read(path: &str, max_bytes: usize) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-pub const SPEC: (&str, &str, &[Param]) = (
-    "read_file",
-    "Read a file's content with a byte limit",
-    &[
+pub const SPEC: Spec = Spec {
+    name: "read_file",
+    description: "Read a file's content with a byte limit",
+    params: &[
         Param {
             name: "path",
-            desc: "Absolute or relative path to file",
-            param_type: ParamType::String,
+            description: "Absolute or relative path to file",
+            kind: ParamKind::String,
             required: true,
         },
         Param {
             name: "max_bytes",
-            desc: "Maximum number of bytes to read; default 524288",
-            param_type: ParamType::Number,
+            description: "Maximum number of bytes to read; default 524288",
+            kind: ParamKind::Number,
             required: false,
         },
     ],
-);
+};

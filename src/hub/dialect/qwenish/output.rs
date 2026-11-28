@@ -6,7 +6,7 @@
 use super::super::OutputParser;
 use super::super::piece::special;
 use super::super::prompt::{Delta, FunctionCall};
-use crate::tools::{Param, ParamType};
+use crate::tools::{Param, ParamKind};
 use eyre::{Result, eyre};
 use oco::Tokenizer;
 use serde_json::{Map, Value};
@@ -200,11 +200,9 @@ pub(super) fn parse_call(source: &str) -> Result<FunctionCall> {
     let (name, body) = source
         .split_once('>')
         .ok_or_else(|| eyre!("unterminated function name"))?;
-    let tools = crate::hub::dialect::prompt::tool_specs();
-    let (_, _, parameters) = tools
-        .into_iter()
-        .find(|(known, ..)| *known == name)
-        .ok_or_else(|| eyre!("unknown tool {name}"))?;
+    let specs = crate::hub::dialect::prompt::tool_specs();
+    let spec = specs.into_iter().find(|spec| spec.name == name);
+    let parameters = spec.ok_or_else(|| eyre!("unknown tool {name}"))?.params;
     let mut body = body
         .trim()
         .strip_suffix("</function>")
@@ -222,8 +220,8 @@ pub(super) fn parse_call(source: &str) -> Result<FunctionCall> {
             .iter()
             .find(|parameter| parameter.name == key)
             .ok_or_else(|| eyre!("unknown {name} parameter {key}"))?;
-        let (value, remaining) = match &parameter.param_type {
-            ParamType::StringArray => {
+        let (value, remaining) = match &parameter.kind {
+            ParamKind::StringArray => {
                 // Reading the JSON first; quoted strings can contain parameter delimiters.
                 let mut values =
                     serde_json::Deserializer::from_str(rest).into_iter::<Vec<String>>();
@@ -245,19 +243,19 @@ pub(super) fn parse_call(source: &str) -> Result<FunctionCall> {
                 let value = value.strip_prefix('\n').unwrap_or(value);
                 let value = value.strip_suffix('\n').unwrap_or(value);
                 let value = match kind {
-                    ParamType::Choice(choices) => {
+                    ParamKind::Choice(choices) => {
                         let value = value.trim();
                         if !choices.contains(&value) {
                             eyre::bail!("invalid {key} choice");
                         }
                         Value::String(value.to_owned())
                     }
-                    ParamType::Number => Value::Number(
+                    ParamKind::Number => Value::Number(
                         serde_json::from_str(value)
                             .map_err(|error| eyre!("invalid {key} number: {error}"))?,
                     ),
-                    ParamType::String => Value::String(value.to_owned()),
-                    ParamType::StringArray => unreachable!(),
+                    ParamKind::String => Value::String(value.to_owned()),
+                    ParamKind::StringArray => unreachable!(),
                 };
                 (value, &rest[next..])
             }

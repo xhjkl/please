@@ -17,8 +17,8 @@ fn some_setting() -> Setting {
     }
 }
 
-/// The messages of the next request the probe sends.
-async fn next_request(server: &mut UnixStream, store: &mut Vec<u8>) -> Result<Vec<Message>> {
+/// The messages the probe delivers next.
+async fn next_delivery(server: &mut UnixStream, store: &mut Vec<u8>) -> Result<Vec<Message>> {
     match read_frame(server, store, None, None).await? {
         Frame::Advance { messages, .. } => Ok(messages),
         frame => Err(eyre!("expected a request, got {frame:?}")),
@@ -40,7 +40,7 @@ async fn completed_step_resets_budget_before_later_disconnect() {
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let hub = tokio::spawn(async move {
         let mut store = Vec::new();
-        let first = next_request(&mut server, &mut store).await.unwrap();
+        let first = next_delivery(&mut server, &mut store).await.unwrap();
         assert_eq!(first, [Message::User("hello".into())]);
         write_frame(
             &mut server,
@@ -55,7 +55,7 @@ async fn completed_step_resets_budget_before_later_disconnect() {
         write_frame(&mut server, &Frame::Stop).await.unwrap();
 
         // The hub keeps the conversation, so the probe sends only the new result.
-        let messages = next_request(&mut server, &mut store).await.unwrap();
+        let messages = next_delivery(&mut server, &mut store).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert!(result_of(&messages, "list_files").unwrap().is_array());
     });
@@ -66,11 +66,11 @@ async fn completed_step_resets_budget_before_later_disconnect() {
     };
     let mut delivery = Delivery::new(vec![Message::User("hello".into())]);
     let mut reconnect_attempts = 6;
-    let commands = Commands::default();
+    let jobs = Jobs::default();
     let attempt = attempt_turn(
         scene,
         &mut delivery,
-        &commands,
+        &jobs,
         &mut client,
         &mut reconnect_attempts,
         &display,
@@ -95,7 +95,7 @@ async fn results_answer_their_calls_by_id_in_call_order() {
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let hub = tokio::spawn(async move {
         let mut store = Vec::new();
-        next_request(&mut server, &mut store).await.unwrap();
+        next_delivery(&mut server, &mut store).await.unwrap();
         let listing = json!({ "path": ".", "max_depth": 0 }).to_string();
         let calls = [(5, "list_files", listing), (6, "read_file", "[]".into())];
         for (id, name, arguments) in calls {
@@ -109,7 +109,7 @@ async fn results_answer_their_calls_by_id_in_call_order() {
         }
         write_frame(&mut server, &Frame::Stop).await.unwrap();
         // The refused call's result still follows the one before it.
-        let messages = next_request(&mut server, &mut store).await.unwrap();
+        let messages = next_delivery(&mut server, &mut store).await.unwrap();
         let answered: Vec<_> = messages
             .iter()
             .map(|message| match message {
@@ -127,11 +127,11 @@ async fn results_answer_their_calls_by_id_in_call_order() {
     };
     let mut delivery = Delivery::new(vec![Message::User("hello".into())]);
     let mut reconnect_attempts = 0;
-    let commands = Commands::default();
+    let jobs = Jobs::default();
     let attempt = attempt_turn(
         scene,
         &mut delivery,
-        &commands,
+        &jobs,
         &mut client,
         &mut reconnect_attempts,
         &display,
@@ -147,7 +147,7 @@ async fn incomplete_step_preserves_reconnect_budget_and_request() {
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let hub = tokio::spawn(async move {
         let mut store = Vec::new();
-        next_request(&mut server, &mut store).await.unwrap();
+        next_delivery(&mut server, &mut store).await.unwrap();
         write_frame(&mut server, &Frame::Thinking("partial response".into()))
             .await
             .unwrap();
@@ -159,11 +159,11 @@ async fn incomplete_step_preserves_reconnect_budget_and_request() {
     };
     let mut delivery = Delivery::new(vec![Message::User("hello".into())]);
     let mut reconnect_attempts = 6;
-    let commands = Commands::default();
+    let jobs = Jobs::default();
     let attempt = attempt_turn(
         scene,
         &mut delivery,
-        &commands,
+        &jobs,
         &mut client,
         &mut reconnect_attempts,
         &display,
@@ -183,10 +183,10 @@ async fn incomplete_step_preserves_reconnect_budget_and_request() {
 
 #[tokio::test]
 async fn pending_command_allows_other_tools_and_requires_collection_before_answer() -> Result<()> {
-    let commands = Commands::default();
+    let jobs = Jobs::default();
     let start = crate::tools::invoke(
         &all_tools(),
-        ToolContext::new(&commands, None),
+        ToolContext::new(&jobs, None),
         "run_command",
         json!({ "argv": ["sleep", "999"], "wait_seconds": 0 }),
     )
@@ -198,7 +198,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
     let (mut client, mut server) = UnixStream::pair()?;
     let hub = tokio::spawn(async move {
         let mut store = Vec::new();
-        let first = next_request(&mut server, &mut store).await?;
+        let first = next_delivery(&mut server, &mut store).await?;
         assert!(first.contains(&Message::Note(Note::Pending(vec![id]))));
         write_frame(
             &mut server,
@@ -221,7 +221,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
         .await?;
         write_frame(&mut server, &Frame::Stop).await?;
 
-        let messages = next_request(&mut server, &mut store).await?;
+        let messages = next_delivery(&mut server, &mut store).await?;
         assert!(result_of(&messages, "list_files").unwrap().is_array());
         assert_eq!(
             messages.last(),
@@ -231,7 +231,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
         write_frame(&mut server, &Frame::Stop).await?;
 
         // An answer while the command runs is set aside, and the hub hears why.
-        let messages = next_request(&mut server, &mut store).await?;
+        let messages = next_delivery(&mut server, &mut store).await?;
         assert_eq!(messages, [Message::Note(Note::AnswerSetAside(vec![id]))]);
         write_frame(
             &mut server,
@@ -244,7 +244,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
         .await?;
         write_frame(&mut server, &Frame::Stop).await?;
 
-        let messages = next_request(&mut server, &mut store).await?;
+        let messages = next_delivery(&mut server, &mut store).await?;
         let killed = result_of(&messages, "control_command").unwrap();
         assert_eq!(killed["status"], "killed");
         assert!(
@@ -267,7 +267,7 @@ async fn pending_command_allows_other_tools_and_requires_collection_before_answe
     let attempt = attempt_turn(
         scene,
         &mut delivery,
-        &commands,
+        &jobs,
         &mut client,
         &mut reconnect_attempts,
         &display,

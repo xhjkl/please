@@ -131,7 +131,7 @@ pub fn note(note: &Note) -> String {
         Note::Pending(ids) => pending(ids),
         Note::AnswerSetAside(ids) => format!("Previous answer ignored. {}", pending(ids)),
         Note::Resume => "The conversation restarted from your message above. Carry on with the task: take the next step it names now.".into(),
-        Note::Summarize { .. } => RESTART.into(),
+        Note::Summarize { .. } => SUMMARIZE.into(),
     }
 }
 
@@ -162,8 +162,8 @@ fn pending(ids: &[u64]) -> String {
     )
 }
 
-/// How to write the message a conversation restarts from, one transcript chunk at a time.
-const RESTART: &str = r#"The context is nearly full, so this conversation will restart from a single message that you write, as yourself, to the user. You write it by reading the transcript one chunk at a time, oldest first: your message so far, if there is one, comes next, then the transcript's next chunk as a message of its own, and you answer with your message updated to cover that chunk.
+/// How to write the summary a room restarts from, one transcript chunk at a time.
+const SUMMARIZE: &str = r#"The context is nearly full, so this conversation will restart from a single message that you write, as yourself, to the user. You write it by reading the transcript one chunk at a time, oldest first: your message so far, if there is one, comes next, then the transcript's next chunk as a message of its own, and you answer with your message updated to cover that chunk.
 
 The message states:
 - what the user asked, in their own words where they matter; keep this even when a chunk does not show it, since it may survive only in your message so far or in the message the conversation last restarted from;

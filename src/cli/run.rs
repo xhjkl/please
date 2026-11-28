@@ -142,9 +142,7 @@ async fn converse(display: &Display, scene: Scene<'_>, conversation: Conversatio
 
     match conversation {
         Conversation::Interactive => interact(&mut stream, display, scene).await?,
-        Conversation::Command(command) => {
-            restart(&mut stream, display, scene, command == Command::Compact).await?
-        }
+        Conversation::Command(command) => restart(&mut stream, display, scene, command).await?,
         Conversation::Request(request) => {
             run_turn(&mut stream, display, scene, request).await?;
         }

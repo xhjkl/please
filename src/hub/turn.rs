@@ -67,7 +67,7 @@ pub async fn advance(
     keep_delivery(&room, id, incoming)?;
     // A recalled page may take a tenth of the context, so recalling cannot crowd it out.
     let page =
-        transcript::RECALLED.min((engine.capacity() as f64 * 0.1 * BYTES_PER_TOKEN) as usize);
+        transcript::RECALL_PAGE.min((engine.capacity() as f64 * 0.1 * BYTES_PER_TOKEN) as usize);
     let mut compacted = false;
     for _ in 0..HUB_STEPS {
         let mut history = room.messages()?;

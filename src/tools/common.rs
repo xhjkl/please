@@ -2,12 +2,25 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::{env, io};
 
+/// What the model is told about a tool: its name, what it does, and its parameters.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+#[derive(Clone, Copy)]
+pub struct Spec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub params: &'static [Param],
+}
+
+/// The JSON type a parameter's value has.
 #[cfg_attr(
     not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
 )]
 #[derive(Debug, Clone)]
-pub enum ParamType {
+pub enum ParamKind {
     String,
     StringArray,
     Choice(&'static [&'static str]),
@@ -21,8 +34,8 @@ pub enum ParamType {
 #[derive(Clone)]
 pub struct Param {
     pub name: &'static str,
-    pub desc: &'static str,
-    pub param_type: ParamType,
+    pub description: &'static str,
+    pub kind: ParamKind,
     pub required: bool,
 }
 

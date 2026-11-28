@@ -17,7 +17,7 @@ fn setting(today: &str, effort: Effort) -> Setting {
     }
 }
 
-/// A conversation exercising every message shape after the header.
+/// A history exercising every message shape after the header.
 fn some_tool_loop() -> Vec<PromptMessage> {
     let tool = |name: &str, arguments: serde_json::Value, result: serde_json::Value| {
         [
@@ -57,7 +57,7 @@ fn some_tool_loop() -> Vec<PromptMessage> {
 }
 
 #[test]
-fn conversation_renders_as_the_reference_encoder_does() -> Result<()> {
+fn history_renders_as_the_reference_encoder_does() -> Result<()> {
     let (prompt, _) = render(&some_tool_loop());
     let text = spelled(&prompt.pieces);
     // The reference encoder's output for the same history, from the facts message on.
