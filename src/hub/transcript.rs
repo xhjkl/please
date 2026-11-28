@@ -93,17 +93,8 @@ pub fn chunks(entries: &[Entry], budget: usize) -> Vec<String> {
     for (index, entry) in entries.iter().filter(|entry| !entry.old).enumerate() {
         // A conversation that restarted opens with the summary it restarted from.
         // Numbering goes on across restarts, so its number tells even once `old` is erased.
-        let previous =
-            index == 0 && entry.number > 1 && matches!(entry.message, Message::Answer(_));
-        let block = block(entry, longest);
-        let block = match previous {
-            true => block.replacen(
-                "] answer",
-                "] the message the conversation last restarted from",
-                1,
-            ),
-            false => block,
-        };
+        let summary = index == 0 && entry.number > 1 && matches!(entry.message, Message::Answer(_));
+        let block = block(entry, summary, longest);
         match chunks.last_mut() {
             Some(chunk) if chunk.len() + block.len() <= budget => {
                 chunk.push_str("\n\n");
@@ -116,10 +107,15 @@ pub fn chunks(entries: &[Entry], budget: usize) -> Vec<String> {
 }
 
 /// An entry headed by its number and kind: requests and answers nearly whole, reasoning and
-/// data clipped, a call on one line.
-fn block(entry: &Entry, longest: usize) -> String {
+/// data clipped, a call on one line. A `summary` is headed as the message its conversation
+/// restarted from rather than as an answer.
+fn block(entry: &Entry, summary: bool, longest: usize) -> String {
     let number = entry.number;
     let (kind, body) = kind_and_body(&entry.message);
+    let kind = match summary {
+        true => "the message the conversation last restarted from".into(),
+        false => kind,
+    };
     let shown = match &entry.message {
         Message::Call(ToolCall { arguments, .. }) => {
             let more = match arguments.chars().count() > SHOWN_ARGUMENTS {
