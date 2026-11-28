@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::display::Display;
 
@@ -18,16 +18,14 @@ impl std::io::Write for DisplayWriter {
     }
 }
 
-async fn pump(mut lines: UnboundedReceiver<String>, display: Arc<Display>) {
-    while let Some(line) = lines.recv().await {
-        display.show_log(&line);
-    }
-}
-
 /// Route tracing logs into the display.
 pub fn route_to_display(display: Arc<Display>) {
-    let (sender, receiver) = unbounded_channel();
-    tokio::spawn(pump(receiver, display));
+    let (sender, mut lines) = unbounded_channel::<String>();
+    tokio::spawn(async move {
+        while let Some(line) = lines.recv().await {
+            display.show_log(&line);
+        }
+    });
 
     // Showing info by default; RUST_LOG can raise it, e.g. `please=debug` for session reuse.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
