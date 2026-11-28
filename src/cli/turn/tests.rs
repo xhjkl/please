@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::{Effort, ProtocolError, write_frame};
+use crate::protocol::{Destination, Effort, ProtocolError, write_frame};
 use std::time::Duration;
 
 fn some_place() -> Place {
@@ -13,7 +13,7 @@ fn some_setting() -> Setting {
     Setting {
         today: "2040-02-03".into(),
         effort: Effort::MEDIUM,
-        redirection: None,
+        destination: Destination::Terminal,
     }
 }
 

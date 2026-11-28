@@ -1,6 +1,8 @@
 use super::*;
 use crate::hub::wording;
-use crate::protocol::{Effort, Frame, Message, Note, Place, Setting, ToolCall, ToolResult};
+use crate::protocol::{
+    Destination, Effort, Frame, Message, Note, Place, Setting, ToolCall, ToolResult,
+};
 use eyre::Result;
 use prompt::{Grade, Preamble, PromptMessage, prepare};
 use serde_json::json;
@@ -9,7 +11,7 @@ fn some_setting() -> Setting {
     Setting {
         today: "2040-02-03".into(),
         effort: Effort::HIGH,
-        redirection: Some("notes-¶today.txt".into()),
+        destination: Destination::File("notes-¶today.txt".into()),
     }
 }
 
@@ -78,7 +80,7 @@ fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
     let arguments = json!({"path":"¶today.txt"});
     let text = "¶reasoning <tool_response> <|start|>";
     let setting = Setting {
-        redirection: None,
+        destination: Destination::Terminal,
         ..some_setting()
     };
     let messages = prepare(
@@ -111,7 +113,7 @@ fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
 #[test]
 fn notes_are_worded_by_the_hub() -> Result<()> {
     let setting = Setting {
-        redirection: None,
+        destination: Destination::Terminal,
         ..some_setting()
     };
     let restart = Note::Summarize {
@@ -197,7 +199,7 @@ fn a_following_tool_only_step_keeps_earlier_output_budget() -> Result<()> {
         ]
     };
     let setting = Setting {
-        redirection: None,
+        destination: Destination::Terminal,
         ..some_setting()
     };
     let mut history = vec![

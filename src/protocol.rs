@@ -30,14 +30,23 @@ impl Effort {
     }
 }
 
+/// Where the final answer goes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Destination {
+    /// The user's terminal.
+    Terminal,
+    /// The file stdout is redirected to, by its path.
+    File(String),
+    /// A pipe, or anything else with no path worth naming.
+    Elsewhere,
+}
+
 /// Facts about this invocation that the hub states to the model; they hold for every message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Setting {
     pub today: String,
     pub effort: Effort,
-    /// Where the final answer goes: `None` for a terminal, an empty path for a redirect whose
-    /// destination is unknown.
-    pub redirection: Option<String>,
+    pub destination: Destination,
 }
 
 /// Where a probe runs; the hub keeps one room per place.

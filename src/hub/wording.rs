@@ -1,7 +1,7 @@
 //! What we tell the model, in every dialect: standing instructions, the date, notes, and the
 //! framing of piped data. Dialects decide where each piece goes in their chat format, and
 //! state the effort themselves, each family of checkpoints having its own words for it.
-use crate::protocol::Note;
+use crate::protocol::{Destination, Note};
 
 /// The message that primes the assistant with its identity and capabilities.
 pub const ROLE: &str = r#"You are a terminal coding assistant.
@@ -107,16 +107,17 @@ pub fn date(today: &str) -> String {
 /// framing, which no text inside it can forge, is what delimits it.
 pub const INPUT: &str = "The next message is the user's standard input, piped in verbatim as data.";
 
-/// Where the final answer goes when it is not a terminal: a file's path, or empty for a pipe
-/// or anything else. A format the user asks for still wins.
-pub fn redirection(target: &str) -> String {
-    let target = match target {
-        "" => "another program".to_string(),
-        path => format!("the file `{path}`"),
+/// Where the final answer goes, unless that is a terminal, which needs no telling. A format
+/// the user asks for still wins.
+pub fn redirection(destination: &Destination) -> Option<String> {
+    let target = match destination {
+        Destination::Terminal => return None,
+        Destination::File(path) => format!("the file `{path}`"),
+        Destination::Elsewhere => "another program".to_string(),
     };
-    format!(
+    Some(format!(
         "Your final answer goes to {target} rather than a terminal, so give the content alone, with no remarks around it and no code fences, unless the user asks for a particular format."
-    )
+    ))
 }
 
 /// The harness's word for each note.

@@ -7,7 +7,9 @@ use super::inference::{self, Engine};
 use super::rooms::{Entry, Room};
 use super::transcript;
 use super::wording;
-use crate::protocol::{Frame, Message, Note, Place, Setting, ToolCall, ToolResult, write_frame};
+use crate::protocol::{
+    Destination, Frame, Message, Note, Place, Setting, ToolCall, ToolResult, write_frame,
+};
 use eyre::{Result, bail, eyre};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -335,7 +337,7 @@ async fn compact(
 ) -> Result<String> {
     // The answer's destination does not apply to the summary.
     let setting = Setting {
-        redirection: None,
+        destination: Destination::Terminal,
         ..setting.clone()
     };
     let base = engine.fill(&setting, &[])?;

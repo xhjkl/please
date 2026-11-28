@@ -1,7 +1,7 @@
 use super::super::piece::spelled;
 use super::super::prompt::prepare;
 use super::*;
-use crate::protocol::{Effort, Message, Note, Setting, ToolCall, ToolResult};
+use crate::protocol::{Destination, Effort, Message, Note, Setting, ToolCall, ToolResult};
 use serde_json::json;
 
 /// `<|start|>` in the gpt-oss vocabulary, which error messages name.
@@ -11,7 +11,7 @@ fn setting(today: &str, effort: Effort) -> Setting {
     Setting {
         today: today.into(),
         effort,
-        redirection: None,
+        destination: Destination::Terminal,
     }
 }
 

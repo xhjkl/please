@@ -256,8 +256,7 @@ pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<PromptMessa
         };
         out.push(worded);
     }
-    if let Some(target) = &setting.redirection {
-        out.push(PromptMessage::Note(wording::redirection(target)));
-    }
+    let redirection = wording::redirection(&setting.destination);
+    out.extend(redirection.map(PromptMessage::Note));
     Ok(out)
 }

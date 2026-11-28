@@ -8,7 +8,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::cli::io;
 use crate::cli::specials::{self, Special};
 use crate::display::Display;
-use crate::protocol::{HubBusy, Message};
+use crate::protocol::{Destination, HubBusy, Message};
 
 use super::commands::{self, Command};
 use super::connect::connect_to_hub;
@@ -95,9 +95,13 @@ pub async fn run() -> Result<ExitCode> {
         Invocation::Ordinary(mode) => mode,
     };
     // Redirected stdout is worth telling the model about even when its path is unknown.
-    let redirection = io::stdout_redirection_path();
-    let redirection = (!stdout_is_tty).then(|| redirection.unwrap_or_default());
-    let setting = crate::setting::current(redirection);
+    let path = io::stdout_redirection_path();
+    let destination = match (stdout_is_tty, path) {
+        (true, _) => Destination::Terminal,
+        (false, Some(path)) => Destination::File(path),
+        (false, None) => Destination::Elsewhere,
+    };
+    let setting = crate::setting::current(destination);
     let place = crate::place::here()?;
     let scene = Scene {
         place: &place,

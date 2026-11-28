@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::{Effort, Message, Place, Setting};
+use crate::protocol::{Destination, Effort, Message, Place, Setting};
 
 /// A frame advancing the turn by `messages`, from nowhere in particular.
 fn some_advance(messages: Vec<Message>) -> Frame {
@@ -11,7 +11,7 @@ fn some_advance(messages: Vec<Message>) -> Frame {
         setting: Setting {
             today: "2040-02-03".into(),
             effort: Effort::MEDIUM,
-            redirection: None,
+            destination: Destination::Terminal,
         },
         id: 1,
         messages,

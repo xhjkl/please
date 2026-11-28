@@ -4,7 +4,7 @@
 //! tab-separated row for every exchange it measures, which `column -t` lines up.
 use super::dialect::{Delta, FunctionCall};
 use super::inference::{self, Engine};
-use crate::protocol::{Message, Setting, ToolResult};
+use crate::protocol::{Destination, Message, Setting, ToolResult};
 use eyre::{Result, WrapErr, bail, eyre};
 use std::path::Path;
 use std::sync::Arc;
@@ -100,7 +100,7 @@ pub async fn run(checkpoint: &str, cases_path: &str) -> Result<()> {
         engine.path.display()
     );
     // The date and the effort are this invocation's, as any request's would be.
-    let setting = crate::setting::current(None);
+    let setting = crate::setting::current(Destination::Terminal);
     println!("{}", COLUMNS.join("\t"));
     for case in cases {
         let owner = engine.new_owner();

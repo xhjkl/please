@@ -1,14 +1,14 @@
 use super::*;
 use crate::hub::dialect::piece::spelled;
 use crate::hub::dialect::prompt::prepare;
-use crate::protocol::{Effort, Message, Setting, ToolCall, ToolResult};
+use crate::protocol::{Destination, Effort, Message, Setting, ToolCall, ToolResult};
 use serde_json::json;
 
 fn some_setting() -> Setting {
     Setting {
         today: "2040-02-03".into(),
         effort: Effort::MEDIUM,
-        redirection: None,
+        destination: Destination::Terminal,
     }
 }
 
