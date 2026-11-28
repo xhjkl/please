@@ -161,7 +161,7 @@ mod tests {
                 Ok(()) => assert!(admitted),
                 Err(error) => {
                     assert!(!admitted);
-                    assert!(error.downcast_ref::<crate::protocol::HubBusy>().is_some());
+                    assert!(error.is::<crate::protocol::HubBusy>());
                 }
             }
         }

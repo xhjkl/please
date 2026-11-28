@@ -13,7 +13,7 @@ use crate::protocol::{HubBusy, Message};
 use super::commands::{self, Command};
 use super::connect::connect_to_hub;
 use super::repl::interact;
-use super::turn::{Scene, TurnCancelled, is_cancelled, restart, run_turn};
+use super::turn::{Scene, TurnCancelled, restart, run_turn};
 
 /// sysexits' temporary failure: the user is invited to retry later.
 const EX_TEMPFAIL: u8 = 75;
@@ -105,11 +105,11 @@ pub async fn run() -> Result<ExitCode> {
     };
     let outcome = run_ordinary(&display, scene, mode).await;
     match outcome {
-        Err(error) if error.downcast_ref::<HubBusy>().is_some() => {
+        Err(error) if error.is::<HubBusy>() => {
             eprintln!("please: {error}");
             Ok(ExitCode::from(EX_TEMPFAIL))
         }
-        Err(error) if is_cancelled(&error) => {
+        Err(error) if error.is::<TurnCancelled>() => {
             eprintln!("\nplease: turn cancelled");
             Ok(ExitCode::from(INTERRUPTED))
         }
@@ -132,7 +132,7 @@ async fn run_ordinary(display: &Display, scene: Scene<'_>, mode: Mode) -> Result
     drop(interrupt);
 
     let stream = match stream {
-        Err(error) if error.downcast_ref::<crate::hub::NoWeights>().is_some() => {
+        Err(error) if error.is::<crate::hub::NoWeights>() => {
             display.show_onboarding();
             return Err(error);
         }

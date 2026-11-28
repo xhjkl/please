@@ -23,10 +23,6 @@ use super::connect::connect_to_hub;
 #[error("turn cancelled")]
 pub struct TurnCancelled;
 
-pub fn is_cancelled(error: &eyre::Report) -> bool {
-    error.downcast_ref::<TurnCancelled>().is_some()
-}
-
 /// A call the model made, with its arguments parsed into an object.
 struct ParsedCall {
     id: u64,
