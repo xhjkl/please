@@ -11,8 +11,8 @@ use crate::display::Display;
 use crate::protocol::{HubBusy, Message};
 
 use super::commands::{self, Command};
-use super::connect::obtain_control_stream;
-use super::repl::interact_forever;
+use super::connect::connect_to_hub;
+use super::repl::interact;
 use super::turn::{Scene, TurnCancelled, is_cancelled, restart, run_turn};
 
 /// sysexits' temporary failure: the user is invited to retry later.
@@ -26,11 +26,13 @@ const SPECIAL_PATIENCE: Duration = Duration::from_millis(100);
 enum Invocation<'a> {
     /// A command to `please` itself.
     Special(Special<'a>),
+    /// Talk with the model, as nearly every run does.
     Conversation(Conversation),
 }
 
-/// What the hub is asked for.
+/// How a run of `please` talks with the model, in the room of the place it runs in.
 enum Conversation {
+    /// At the prompt, a request or a command per line, until the user leaves.
     Interactive,
     /// A command given as the whole one-shot request.
     Command(Command),
@@ -58,7 +60,7 @@ fn invocation<'a>(
     let conversation = if terminal && prompt.is_empty() {
         Conversation::Interactive
     } else {
-        match commands::parse_request(&prompt) {
+        match commands::parse_one_shot(&prompt) {
             Some(Err(error)) => eyre::bail!(error),
             Some(Ok(command)) => Conversation::Command(command),
             None => Conversation::Request(vec![Message::User(prompt)]),
@@ -67,7 +69,7 @@ fn invocation<'a>(
     Ok(Invocation::Conversation(conversation))
 }
 
-/// Run a special command, the REPL, or a one-shot request.
+/// Run a special, or hold a conversation: at the prompt, or one-shot.
 pub async fn run() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let special = specials::parse(&args);
@@ -83,7 +85,7 @@ pub async fn run() -> Result<ExitCode> {
     let hub_in_foreground = matches!(invocation, Invocation::Special(Special::Hub));
     // All user-visible output, logs included, goes through the display.
     let display = Arc::new(Display::new(hub_in_foreground));
-    crate::logging::setup_tracing_display_logger(display.clone());
+    crate::logging::route_to_display(display.clone());
 
     let conversation = match invocation {
         Invocation::Special(special) => {
@@ -123,7 +125,7 @@ async fn converse(display: &Display, scene: Scene<'_>, conversation: Conversatio
     let stream = tokio::select! {
         biased;
         _ = interrupt.recv() => Err(TurnCancelled.into()),
-        stream = obtain_control_stream() => stream,
+        stream = connect_to_hub() => stream,
     };
     little_snake.stop().await;
     drop(interrupt);
@@ -139,7 +141,7 @@ async fn converse(display: &Display, scene: Scene<'_>, conversation: Conversatio
     let mut stream = Some(stream);
 
     match conversation {
-        Conversation::Interactive => interact_forever(&mut stream, display, scene).await?,
+        Conversation::Interactive => interact(&mut stream, display, scene).await?,
         Conversation::Command(command) => {
             restart(&mut stream, display, scene, command == Command::Compact).await?
         }

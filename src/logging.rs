@@ -25,7 +25,7 @@ async fn pump(mut lines: UnboundedReceiver<String>, display: Arc<Display>) {
 }
 
 /// Route tracing logs into the display.
-pub fn setup_tracing_display_logger(display: Arc<Display>) {
+pub fn route_to_display(display: Arc<Display>) {
     let (sender, receiver) = unbounded_channel();
     tokio::spawn(pump(receiver, display));
 

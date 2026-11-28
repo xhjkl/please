@@ -6,7 +6,7 @@
 //! Only invalid UTF-8 is treated differently, by the checkpoint's decoder: it is replaced in
 //! headers instead of failing them, bytes after a replacement show at once instead of one
 //! token later, and an unfinished character before a marker stays unshown in its message.
-use super::super::conversation::{Delta, ToolCall};
+use super::super::conversation::{Delta, FunctionCall};
 use super::super::piece::special;
 use super::{CALL, CHANNEL, CONSTRAIN, END, MESSAGE, RETURN, START};
 use eyre::{Result, bail, eyre};
@@ -56,7 +56,7 @@ impl super::DialectOutputParser for OutputParser<'_> {
         self.stream.push(token, Event::Text(&text))
     }
 
-    fn finish(&mut self) -> Result<Vec<ToolCall>> {
+    fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         self.flush();
         self.stream.finish()
     }
@@ -234,7 +234,7 @@ impl OutputStream {
     }
 
     /// End the response, closing a message the output limit cut off, and return its calls.
-    pub(super) fn finish(&mut self) -> Result<Vec<ToolCall>> {
+    pub(super) fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         match self.state {
             State::Header { .. } => {
                 bail!("Unexpected EOS while waiting for message header to complete");
@@ -247,7 +247,7 @@ impl OutputStream {
             let name = recipient.strip_prefix("functions.").unwrap_or(recipient);
             let arguments = serde_json::from_str(text)
                 .map_err(|error| eyre!("error parsing tool call: raw='{text}', err={error}"))?;
-            calls.push(ToolCall {
+            calls.push(FunctionCall {
                 name: name.to_string(),
                 arguments,
             });

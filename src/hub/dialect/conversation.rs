@@ -19,7 +19,7 @@ pub enum ConversationMessage {
     User(String),
     Answer(String),
     Thinking(String),
-    ToolCall(ToolCall),
+    ToolCall(FunctionCall),
     ToolResult {
         name: String,
         content: String,
@@ -28,7 +28,7 @@ pub enum ConversationMessage {
 
 /// A dialect-neutral call, shared by decoded output and replayed tool history.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolCall {
+pub struct FunctionCall {
     pub name: String,
     pub arguments: Value,
 }
@@ -198,7 +198,7 @@ pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<Conversatio
                 ConversationMessage::User(data.clone())
             }
             // The draft is the model's own message, and the chunk is material, not instructions.
-            Message::Note(note @ Note::Restart { draft, chunk }) => {
+            Message::Note(note @ Note::Summarize { draft, chunk }) => {
                 out.push(ConversationMessage::Note(prompting::note(note)));
                 if let Some(draft) = draft {
                     out.push(ConversationMessage::Answer(draft.clone()));
@@ -208,7 +208,7 @@ pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<Conversatio
             Message::Note(note) => ConversationMessage::Note(prompting::note(note)),
             Message::Thinking(text) => ConversationMessage::Thinking(text.clone()),
             Message::Answer(text) => ConversationMessage::Answer(text.clone()),
-            Message::Call(call) => ConversationMessage::ToolCall(ToolCall {
+            Message::Call(call) => ConversationMessage::ToolCall(FunctionCall {
                 name: call.name.clone(),
                 arguments: serde_json::from_str(&call.arguments)
                     .wrap_err_with(|| format!("tool call {} has invalid arguments", call.name))?,

@@ -3,7 +3,7 @@
 //! Structure comes only from the checkpoint's added tokens, which is how the model emits it
 //! under the template's own instructions; marker spellings the model writes out as ordinary
 //! text, for example when quoting documentation, stay content.
-use super::super::conversation::{Delta, ToolCall};
+use super::super::conversation::{Delta, FunctionCall};
 use super::super::piece::special;
 use super::super::{Adapter as _, OutputParser as DialectOutputParser};
 use super::Adapter;
@@ -57,7 +57,7 @@ impl DialectOutputParser for OutputParser<'_> {
         Ok(self.stream.push(Event::Text(&text)))
     }
 
-    fn finish(&mut self) -> Result<Vec<ToolCall>> {
+    fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         self.stream.finish()
     }
 }
@@ -82,7 +82,7 @@ pub(super) struct OutputStream {
     /// Trailing whitespace not yet known to be content.
     held: String,
     current_call: Option<String>,
-    calls: Vec<Result<ToolCall>>,
+    calls: Vec<Result<FunctionCall>>,
 }
 
 impl OutputStream {
@@ -166,7 +166,7 @@ impl OutputStream {
         });
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<ToolCall>> {
+    pub(super) fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         if self.current_call.is_some() {
             eyre::bail!("incomplete Qwen tool call");
         }
@@ -193,7 +193,7 @@ fn value_end(rest: &str, parameters: &[Param]) -> Option<(usize, usize)> {
 }
 
 /// Parse Qwen's native function/parameter blocks using the declared parameter types.
-pub(super) fn parse_call(source: &str) -> Result<ToolCall> {
+pub(super) fn parse_call(source: &str) -> Result<FunctionCall> {
     let source = source.trim();
     let source = source
         .strip_prefix("<function=")
@@ -274,7 +274,7 @@ pub(super) fn parse_call(source: &str) -> Result<ToolCall> {
             eyre::bail!("missing parameter {}", parameter.name);
         }
     }
-    Ok(ToolCall {
+    Ok(FunctionCall {
         name: name.to_string(),
         arguments: Value::Object(arguments),
     })

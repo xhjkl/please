@@ -2,12 +2,10 @@
 //! conversation when it nears the context's end, generate, run the hub's own tools, and keep
 //! each step. The probe sends only what is new; the conversation itself lives with the hub.
 use super::chats::{Chat, Entry};
-use super::dialect::{Delta, ToolCall, prompting};
+use super::dialect::{Delta, FunctionCall, prompting};
 use super::inference::{self, Engine, clipping};
 use super::transcript;
-use crate::protocol::{
-    Call, Frame, Message, Note, Place, Setting, ToolResult, write_frame_to_stream,
-};
+use crate::protocol::{Frame, Message, Note, Place, Setting, ToolCall, ToolResult, write_frame};
 use eyre::{Result, bail, eyre};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -32,7 +30,7 @@ const HUB_STEPS: usize = 16;
 struct Step {
     thinking: String,
     answer: String,
-    calls: Result<Vec<ToolCall>>,
+    calls: Result<Vec<FunctionCall>>,
     /// The response ended by itself rather than at its token limit.
     complete: bool,
 }
@@ -53,7 +51,7 @@ pub async fn serve(
     let (mut notes, incoming): (Vec<_>, Vec<_>) = messages
         .into_iter()
         .partition(|message| matches!(message, Message::Note(_)));
-    let own = |note: &Message| matches!(note, Message::Note(Note::Restart { .. } | Note::Resume));
+    let own = |note: &Message| matches!(note, Message::Note(Note::Summarize { .. } | Note::Resume));
     if notes.iter().any(own) {
         bail!("restart notes are the hub's own");
     }
@@ -85,10 +83,10 @@ pub async fn serve(
                 // Clipping old messages still lets the conversation go on.
                 Err(error) => {
                     let line = format!("cannot condense the conversation: {error:#}");
-                    write_frame_to_stream(sink, &Frame::Log(line)).await?;
+                    write_frame(sink, &Frame::Log(line)).await?;
                 }
                 Ok(summary) => {
-                    write_frame_to_stream(sink, &Frame::Restarted(summary)).await?;
+                    write_frame(sink, &Frame::Restarted(summary)).await?;
                     if resume {
                         notes.push(Message::Note(Note::Resume));
                     }
@@ -115,10 +113,10 @@ pub async fn serve(
             Ok(calls) => calls,
         };
         if calls.is_empty() && pending {
-            return write_frame_to_stream(sink, &Frame::Stop).await;
+            return write_frame(sink, &Frame::Stop).await;
         }
         // The hub answers its own calls, and refuses one that would only feed a loop.
-        let refused = |call: &ToolCall| repeats(&history, call);
+        let refused = |call: &FunctionCall| repeats(&history, call);
         let (own, probe): (Vec<_>, Vec<_>) = calls
             .into_iter()
             .partition(|call| call.name == transcript::RECALL || refused(call));
@@ -134,7 +132,7 @@ pub async fn serve(
                     transcript::recall(&chat, &call.arguments, page).to_string(),
                 ),
             };
-            write_frame_to_stream(sink, &Frame::Log(line)).await?;
+            write_frame(sink, &Frame::Log(line)).await?;
             let id = entry(&kept);
             kept.push(stored(call, id));
             kept.push(result(id, &call.name, content));
@@ -148,14 +146,14 @@ pub async fn serve(
         chat.append(&kept)?;
         if !sent.is_empty() || own.is_empty() {
             for (id, call) in sent {
-                let frame = Frame::ToolCall {
+                let frame = Frame::Call(ToolCall {
                     id,
                     name: call.name,
-                    arguments_json: call.arguments.to_string(),
-                };
-                write_frame_to_stream(sink, &frame).await?;
+                    arguments: call.arguments.to_string(),
+                });
+                write_frame(sink, &frame).await?;
             }
-            return write_frame_to_stream(sink, &Frame::Stop).await;
+            return write_frame(sink, &Frame::Stop).await;
         }
     }
     Err(eyre!(
@@ -175,16 +173,16 @@ pub async fn restart(
     let _lock = lock(&chat).await?;
     let messages = chat.messages()?;
     if messages.is_empty() {
-        write_frame_to_stream(sink, &Frame::Log("the conversation is empty".into())).await?;
+        write_frame(sink, &Frame::Log("the conversation is empty".into())).await?;
     } else if summarize {
         let entries = chat.entries()?;
         let summary = condense(sink, engine, setting, &chat, entries, vec![]).await?;
-        write_frame_to_stream(sink, &Frame::Restarted(summary)).await?;
+        write_frame(sink, &Frame::Restarted(summary)).await?;
     } else {
         chat.restart(&[])?;
-        write_frame_to_stream(sink, &Frame::Log("started a new conversation".into())).await?;
+        write_frame(sink, &Frame::Log("started a new conversation".into())).await?;
     }
-    write_frame_to_stream(sink, &Frame::Stop).await
+    write_frame(sink, &Frame::Stop).await
 }
 
 /// Hold the conversation for this hub, waiting for another hub to finish with it.
@@ -278,8 +276,8 @@ fn opening(thinking: String, answer: String) -> Vec<Message> {
     kept
 }
 
-fn stored(call: &ToolCall, id: u64) -> Message {
-    Message::Call(Call {
+fn stored(call: &FunctionCall, id: u64) -> Message {
+    Message::Call(ToolCall {
         id,
         name: call.name.clone(),
         arguments: call.arguments.to_string(),
@@ -296,7 +294,7 @@ fn result(id: u64, name: &str, content: String) -> Message {
 
 /// Whether `call` would be the third in a row of the same call, the two before it having
 /// come to the same outcome: greedy decoding can repeat such a step forever.
-fn repeats(history: &[Message], call: &ToolCall) -> bool {
+fn repeats(history: &[Message], call: &FunctionCall) -> bool {
     let arguments = call.arguments.to_string();
     let mut made = std::collections::HashMap::new();
     let mut answered = Vec::new();
@@ -314,7 +312,7 @@ fn repeats(history: &[Message], call: &ToolCall) -> bool {
     let [.., (first, earlier), (second, latest)] = answered.as_slice() else {
         return false;
     };
-    let same = |made: &&Call| made.name == call.name && made.arguments == arguments;
+    let same = |made: &&ToolCall| made.name == call.name && made.arguments == arguments;
     let outcome = |result: &ToolResult| crate::tools::outcome(&result.content);
     same(first) && same(second) && outcome(earlier).is_some_and(|it| Some(it) == outcome(latest))
 }
@@ -364,8 +362,8 @@ async fn condense(
     for (index, chunk) in chunks.into_iter().enumerate() {
         let part = index + 1;
         let progress = format!("condensing the conversation ({part}/{parts})");
-        write_frame_to_stream(sink, &Frame::Log(progress)).await?;
-        let note = Note::Restart {
+        write_frame(sink, &Frame::Log(progress)).await?;
+        let note = Note::Summarize {
             draft: draft.take(),
             chunk,
         };
@@ -424,7 +422,7 @@ async fn generate(
                 }
             };
             if let Some(sink) = sink.as_mut() {
-                write_frame_to_stream(sink, &frame).await?;
+                write_frame(sink, &frame).await?;
             }
         }
     }
@@ -445,7 +443,7 @@ mod tests {
     use crate::test_support::TempDir;
 
     fn some_call(id: u64, name: &str) -> Message {
-        Message::Call(Call {
+        Message::Call(ToolCall {
             id,
             name: name.into(),
             arguments: "{}".into(),
@@ -550,7 +548,7 @@ mod tests {
 
     #[test]
     fn a_third_identical_call_with_an_unchanged_result_is_refused() {
-        let call = |name: &str, arguments| ToolCall {
+        let call = |name: &str, arguments| FunctionCall {
             name: name.into(),
             arguments,
         };
@@ -559,7 +557,7 @@ mod tests {
             serde_json::json!({"argv": ["grep", "x", "f"]}),
         );
         let ids = std::cell::Cell::new(0);
-        let step = |made: &ToolCall, content: &str| {
+        let step = |made: &FunctionCall, content: &str| {
             let thinking = Message::Thinking(String::new());
             ids.set(ids.get() + 1);
             let id = ids.get();

@@ -1,8 +1,8 @@
 use eyre::Result;
 use std::path::{Path, PathBuf};
 
-use super::connect::try_connect_to_hub;
-use crate::protocol::{Frame, read_frame_from_stream, write_frame_to_stream};
+use super::connect::dial;
+use crate::protocol::{Frame, read_frame, write_frame};
 
 const HELP: &str = "\
 please: a polite LLM for CLI
@@ -78,22 +78,22 @@ pub async fn run(special: Special<'_>) -> Result<()> {
 /// Ask a running hub, local or forwarded, which checkpoint it has loaded.
 async fn running_model() -> Result<Option<PathBuf>> {
     let socket = crate::hub::socket_path();
-    let connected = try_connect_to_hub(&socket).await;
+    let connected = dial(&socket).await;
     let mut stream = match connected {
         Err(error) if error.is_absent() => return Ok(None),
         Err(error) => return Err(error.into()),
         Ok(stream) => stream,
     };
-    write_frame_to_stream(&mut stream, &Frame::ModelInfoRequest).await?;
+    write_frame(&mut stream, &Frame::CheckpointRequest).await?;
     let mut buffer = Vec::new();
-    let response = read_frame_from_stream::<Frame>(
+    let response = read_frame::<Frame>(
         &mut stream,
         &mut buffer,
         Some(std::time::Duration::from_millis(250)),
         Some(std::time::Duration::from_secs(2)),
     )
     .await;
-    let Ok(Frame::ModelInfo { path, .. }) = response else {
+    let Ok(Frame::Checkpoint { path }) = response else {
         return Ok(None);
     };
     Ok(Some(path.into()))

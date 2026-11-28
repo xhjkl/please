@@ -1,6 +1,6 @@
 //! Decode Inkling messages incrementally, recognizing framing only by token ID.
 use super::{CALL, END, MODEL, SYSTEM, TEXT, THINKING, TOOL, USER};
-use crate::hub::dialect::{Delta, OutputParser, ToolCall, piece::special};
+use crate::hub::dialect::{Delta, FunctionCall, OutputParser, piece::special};
 use eyre::{Result, WrapErr, bail, eyre};
 use oco::Tokenizer;
 use serde_json::Value;
@@ -60,7 +60,7 @@ impl OutputParser for Parser<'_> {
         Ok(self.stream.text(&text).into_iter().collect())
     }
 
-    fn finish(&mut self) -> Result<Vec<ToolCall>> {
+    fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         self.stream.finish()
     }
 }
@@ -81,7 +81,7 @@ enum Part {
 #[derive(Default)]
 struct Stream {
     part: Part,
-    calls: Vec<Result<ToolCall>>,
+    calls: Vec<Result<FunctionCall>>,
 }
 
 impl Stream {
@@ -129,14 +129,14 @@ impl Stream {
         };
     }
 
-    fn finish(&mut self) -> Result<Vec<ToolCall>> {
+    fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         self.marker(Marker::Reset);
         let calls = std::mem::take(&mut self.calls);
         calls.into_iter().collect()
     }
 }
 
-fn parse_call(name: &str, payload: &str) -> Result<ToolCall> {
+fn parse_call(name: &str, payload: &str) -> Result<FunctionCall> {
     let mut payload: Value = serde_json::from_str(payload).wrap_err("invalid Inkling tool JSON")?;
     if payload["name"].as_str() != Some(name) {
         bail!("Inkling tool call name differs from its message header {name}");
@@ -145,7 +145,7 @@ fn parse_call(name: &str, payload: &str) -> Result<ToolCall> {
     if !arguments.is_object() {
         bail!("Inkling tool call {name} requires a JSON argument object");
     }
-    Ok(ToolCall {
+    Ok(FunctionCall {
         name: name.to_owned(),
         arguments,
     })

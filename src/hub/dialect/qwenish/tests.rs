@@ -2,7 +2,7 @@ use super::output::{Event, OutputStream, parse_call};
 use super::*;
 use crate::hub::dialect::conversation::{Delta, prepare};
 use crate::hub::dialect::piece::spelled;
-use crate::protocol::{Call, Effort, Message, Setting, ToolResult};
+use crate::protocol::{Effort, Message, Setting, ToolCall, ToolResult};
 use serde_json::json;
 
 fn some_setting() -> Setting {
@@ -15,7 +15,7 @@ fn some_setting() -> Setting {
 
 /// Feed generated output where `¦</think>¦`-style spans stand for the structure tokens the
 /// model emits; everything else arrives one character per token, as plain decoded text.
-fn stream(output: &str) -> Result<(String, String, Vec<ToolCall>)> {
+fn stream(output: &str) -> Result<(String, String, Vec<FunctionCall>)> {
     let mut stream = OutputStream::default();
     let mut deltas = Vec::new();
     for (index, part) in output.split('¦').enumerate() {
@@ -50,7 +50,7 @@ fn stream(output: &str) -> Result<(String, String, Vec<ToolCall>)> {
 fn tool_step_renders_like_the_chat_template() -> Result<()> {
     let call = |path: &str| {
         [
-            Message::Call(Call {
+            Message::Call(ToolCall {
                 id: 1,
                 name: "read_file".into(),
                 arguments: json!({"path": path, "max_bytes": 10}).to_string(),
@@ -139,7 +139,7 @@ fn quoted_json_arguments_keep_tag_spellings_and_control_tokens() -> Result<()> {
     assert!(answer.is_empty());
     assert_eq!(
         calls,
-        [ToolCall {
+        [FunctionCall {
             name: "run_command".into(),
             arguments: json!({
                 "argv": ["printf", "\"</parameter><parameter=wait_seconds></function></tool_call> <tool_call>"],
@@ -171,7 +171,7 @@ fn structure_tokens_split_thinking_answer_and_calls() -> Result<()> {
     assert_eq!(answer, "Done.");
     assert_eq!(
         calls,
-        vec![ToolCall {
+        vec![FunctionCall {
             name: "read_file".into(),
             arguments: json!({"path":"input.txt"})
         }]

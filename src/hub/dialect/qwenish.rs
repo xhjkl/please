@@ -5,7 +5,7 @@
 //! Deliberate departures from the template: such literal markers are never promoted to
 //! control tokens; instructions that arrive mid-conversation become user messages instead of
 //! an error; and tool exchanges with no intervening assistant entry share one assistant step.
-use super::conversation::{ConversationMessage, Rendered, ToolCall, split_preamble};
+use super::conversation::{ConversationMessage, FunctionCall, Rendered, split_preamble};
 use super::piece::{Piece, encode_pieces, special};
 use super::{Adapter as DialectAdapter, OutputParser as DialectOutputParser};
 use crate::protocol::Effort;
@@ -173,7 +173,7 @@ impl Prompt {
     }
 
     /// Render one step; earlier reasoning stays, as the template preserves thinking by default.
-    fn assistant(&mut self, reasoning: &str, content: &str, calls: &[&ToolCall]) -> Result<()> {
+    fn assistant(&mut self, reasoning: &str, content: &str, calls: &[&FunctionCall]) -> Result<()> {
         let content = content.trim();
         self.marker("<|im_start|>");
         self.text("assistant\n");
@@ -184,7 +184,7 @@ impl Prompt {
         self.marker("</think>");
         self.text("\n\n");
         self.text(content);
-        for (index, ToolCall { name, arguments }) in calls.iter().enumerate() {
+        for (index, FunctionCall { name, arguments }) in calls.iter().enumerate() {
             match index {
                 0 if content.is_empty() => {}
                 0 => self.text("\n\n"),

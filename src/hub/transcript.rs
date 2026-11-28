@@ -1,7 +1,7 @@
 //! Reading a conversation's transcript back: abbreviated for condensing, listed and quoted for
 //! the recall tool, which the hub runs itself.
 use super::chats::{Chat, Entry};
-use crate::protocol::{Call, Message, ToolResult};
+use crate::protocol::{Message, ToolCall, ToolResult};
 use crate::tools::{Param, ParamType};
 use serde_json::{Value, json};
 
@@ -125,7 +125,7 @@ fn block(entry: &Entry, longest: usize) -> String {
     let number = entry.number;
     let (kind, body) = kind_and_body(&entry.message);
     let shown = match &entry.message {
-        Message::Call(Call { arguments, .. }) => {
+        Message::Call(ToolCall { arguments, .. }) => {
             let more = match arguments.chars().count() > SHOWN_ARGUMENTS {
                 true => " ...",
                 false => "",
@@ -157,7 +157,7 @@ fn kind_and_body(message: &Message) -> (String, &str) {
         Message::Input(data) => ("piped input".into(), data),
         Message::Thinking(text) => ("reasoning".into(), text),
         Message::Answer(text) => ("answer".into(), text),
-        Message::Call(Call {
+        Message::Call(ToolCall {
             name, arguments, ..
         }) => (format!("call {name}"), arguments),
         Message::Result(ToolResult { name, content, .. }) => (format!("result of {name}"), content),
@@ -181,7 +181,7 @@ mod tests {
         vec![
             Message::User("find me a gc implementation in this codebase".into()),
             Message::Thinking("x".repeat(2000)),
-            Message::Call(Call {
+            Message::Call(ToolCall {
                 id: 3,
                 name: "list_files".into(),
                 arguments: r#"{"path":"./core"}"#.into(),

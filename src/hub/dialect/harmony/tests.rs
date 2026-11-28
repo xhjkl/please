@@ -3,7 +3,7 @@ use super::super::conversation::prepare;
 use super::super::piece::spelled;
 use super::output::{Event, Marker, OutputStream};
 use super::*;
-use crate::protocol::{Call, Effort, Message, Note, Setting, ToolResult};
+use crate::protocol::{Effort, Message, Note, Setting, ToolCall, ToolResult};
 use serde_json::json;
 
 /// `<|start|>` in the gpt-oss vocabulary, which error messages name.
@@ -21,7 +21,7 @@ fn setting(today: &str, effort: Effort) -> Setting {
 fn some_tool_loop() -> Vec<ConversationMessage> {
     let tool = |name: &str, arguments: serde_json::Value, result: serde_json::Value| {
         [
-            Message::Call(Call {
+            Message::Call(ToolCall {
                 id: 1,
                 name: name.into(),
                 arguments: arguments.to_string(),
@@ -202,7 +202,7 @@ fn tool_calls_parse_with_the_recipient_before_or_after_the_channel() -> Result<(
         // Arguments are never shown as an answer.
         assert!(joined(&deltas).1.is_empty(), "{spelled}");
         let calls = output.finish()?;
-        let expected = ToolCall {
+        let expected = FunctionCall {
             name: "read_file".into(),
             arguments: json!({"path": "¶"}),
         };
@@ -222,7 +222,7 @@ fn json_arguments_keep_literal_control_token_spellings() -> Result<()> {
     assert!(output.push(0, Event::Marker(Marker::Call))?.is_empty());
     assert_eq!(
         output.finish()?,
-        [ToolCall {
+        [FunctionCall {
             name: "read_file".into(),
             arguments
         }]
@@ -294,7 +294,7 @@ fn vendored_codec_round_trips_on_the_checkpoint_tokenizer() -> Result<()> {
     }
     let literal = tokenizer.encode("<|start|>")?;
     assert!(!literal.contains(&200006));
-    let expected = ToolCall {
+    let expected = FunctionCall {
         name: "read_file".into(),
         arguments: json!({"path": "¶<|start|><|end|><|call|><|return|>.txt"}),
     };

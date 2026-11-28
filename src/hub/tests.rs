@@ -3,7 +3,7 @@ use crate::protocol::{Effort, Message, Place, Setting};
 
 /// A request carrying `messages`, from nowhere in particular.
 fn some_request(messages: Vec<Message>) -> Frame {
-    Frame::Request {
+    Frame::Advance {
         place: Place {
             machine: "ssh-ed25519 AAAA".into(),
             cwd: "/".into(),
@@ -68,31 +68,27 @@ async fn established_connection_survives_long_tool_waits() {
     let reader = tokio::spawn(async move {
         let mut store = Vec::new();
         let request = read_request(&mut server, &mut store).await.unwrap();
-        assert!(matches!(request, Frame::Request { .. }));
-        write_frame_to_stream(&mut server, &Frame::Stop)
-            .await
-            .unwrap();
+        assert!(matches!(request, Frame::Advance { .. }));
+        write_frame(&mut server, &Frame::Stop).await.unwrap();
 
         for _ in 0..8 {
             let request = wait_for_request(&mut server, &mut store).await.unwrap();
-            assert!(matches!(request, Frame::Request { .. }));
-            write_frame_to_stream(&mut server, &Frame::Stop)
-                .await
-                .unwrap();
+            assert!(matches!(request, Frame::Advance { .. }));
+            write_frame(&mut server, &Frame::Stop).await.unwrap();
         }
     });
 
     let request = some_request(vec![]);
     let mut store = Vec::new();
-    write_frame_to_stream(&mut client, &request).await.unwrap();
-    let reply: Frame = read_frame_from_stream(&mut client, &mut store, None, None)
+    write_frame(&mut client, &request).await.unwrap();
+    let reply: Frame = read_frame(&mut client, &mut store, None, None)
         .await
         .unwrap();
     assert!(matches!(reply, Frame::Stop));
     for _ in 0..8 {
         tokio::time::sleep(Duration::from_secs(40)).await;
-        write_frame_to_stream(&mut client, &request).await.unwrap();
-        let reply: Frame = read_frame_from_stream(&mut client, &mut store, None, None)
+        write_frame(&mut client, &request).await.unwrap();
+        let reply: Frame = read_frame(&mut client, &mut store, None, None)
             .await
             .unwrap();
         assert!(matches!(reply, Frame::Stop));
@@ -141,7 +137,7 @@ async fn buffered_request_is_delivered_before_disconnect() {
     drop(client);
 
     let request = wait_for_request(&mut server, &mut store).await.unwrap();
-    let Frame::Request { messages, .. } = request else {
+    let Frame::Advance { messages, .. } = request else {
         panic!("buffered request is delivered even after the peer closes");
     };
     assert!(matches!(messages.as_slice(), [Message::User(text)] if text == "already received"));

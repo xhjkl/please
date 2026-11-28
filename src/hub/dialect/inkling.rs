@@ -1,5 +1,5 @@
 //! Inkling 2 chat framing from the checkpoint's `tokenizer.chat_template`.
-use super::conversation::{ConversationMessage, Rendered, ToolCall, split_preamble};
+use super::conversation::{ConversationMessage, FunctionCall, Rendered, split_preamble};
 use super::piece::{Piece, encode_prompt};
 use super::{Adapter as DialectAdapter, OutputParser};
 use crate::protocol::Effort;
@@ -88,8 +88,8 @@ fn step(prompt: &mut Vec<Piece>, messages: &[ConversationMessage]) -> Result<usi
     Ok(end)
 }
 
-fn emit_call(prompt: &mut Vec<Piece>, call: &ToolCall) -> Result<()> {
-    let ToolCall { name, arguments } = call;
+fn emit_call(prompt: &mut Vec<Piece>, call: &FunctionCall) -> Result<()> {
+    let FunctionCall { name, arguments } = call;
     let arguments = arguments
         .as_object()
         .ok_or_else(|| eyre!("Inkling tool arguments must be an object"))?;

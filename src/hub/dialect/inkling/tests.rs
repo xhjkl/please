@@ -5,7 +5,7 @@ use ConversationMessage::*;
 #[test]
 fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Result<()> {
     let call = |name: &str, arguments| {
-        ToolCall(super::ToolCall {
+        ToolCall(super::FunctionCall {
             name: name.to_owned(),
             arguments,
         })
@@ -88,7 +88,7 @@ const SPELLED: [&str; 9] = [SYSTEM, USER, MODEL, TOOL, TEXT, THINKING, CALL, END
 fn carrying(text: &str) -> Vec<ConversationMessage> {
     vec![
         User(text.into()),
-        ToolCall(super::ToolCall {
+        ToolCall(super::FunctionCall {
             name: "read_file".into(),
             arguments: json!({ "path": text }),
         }),

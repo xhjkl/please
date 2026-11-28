@@ -3,9 +3,7 @@ use super::{
     dialect::Delta,
     inference::{self, Engine},
 };
-use crate::protocol::{
-    Call, Frame, Message, Setting, ToolResult, read_frame_from_stream, write_frame_to_stream,
-};
+use crate::protocol::{Frame, Message, Setting, ToolCall, ToolResult, read_frame, write_frame};
 use eyre::{Result, eyre};
 use serde::Deserialize;
 use std::{sync::Arc, time::Instant};
@@ -32,8 +30,8 @@ pub async fn run(model_path: &str, cases_path: &str) -> Result<()> {
             messages: case.messages,
             max_tokens: case.max_tokens,
         };
-        write_frame_to_stream(&mut stream, &request).await?;
-        let response: Frame = read_frame_from_stream(&mut stream, &mut store, None, None).await?;
+        write_frame(&mut stream, &request).await?;
+        let response: Frame = read_frame(&mut stream, &mut store, None, None).await?;
         let report = match response {
             Frame::Error(error) => return Err(eyre!(error)),
             Frame::BenchmarkResult(report) => report,
@@ -78,7 +76,7 @@ struct Exchange {
     first_visible: Option<f64>,
     answer: String,
     thinking: String,
-    calls: Result<Vec<super::dialect::ToolCall>>,
+    calls: Result<Vec<super::dialect::FunctionCall>>,
 }
 
 /// Send one request on the case's connection and record each token's arrival, as the probe
@@ -151,7 +149,7 @@ impl Exchange {
         let calls = self.calls.as_deref().unwrap_or_default();
         for call in calls {
             let id = next + messages.len() as u64;
-            messages.push(Message::Call(Call {
+            messages.push(Message::Call(ToolCall {
                 id,
                 name: call.name.clone(),
                 arguments: call.arguments.to_string(),

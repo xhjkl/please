@@ -5,7 +5,7 @@ use eyre::Result;
 use oco::Tokenizer;
 
 use conversation::ConversationMessage;
-pub use conversation::{Delta, Rendered, ToolCall};
+pub use conversation::{Delta, FunctionCall, Rendered};
 
 /// Stateful codec selected once when the hub loads its checkpoint.
 pub trait Adapter: Send + Sync {
@@ -38,7 +38,7 @@ pub trait OutputParser: Send {
     /// Consume one generated token and return newly visible text.
     fn push_token(&mut self, token: u32) -> Result<Vec<Delta>>;
     /// Return the tool calls of the finished response.
-    fn finish(&mut self) -> Result<Vec<ToolCall>>;
+    fn finish(&mut self) -> Result<Vec<FunctionCall>>;
 }
 
 impl Dialect {

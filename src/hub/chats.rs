@@ -15,7 +15,7 @@
 //! `.where` file spells out. `/new` starts the place over. Everything besides the entries and
 //! `old` is a dotfile, so the directory lists as the conversation alone.
 //! Everything is private to its owner, and one hub at a time works on a conversation.
-use crate::protocol::{Call, Message, Place, ToolResult};
+use crate::protocol::{Message, Place, ToolCall, ToolResult};
 use eyre::{Result, WrapErr, bail, eyre};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -217,7 +217,7 @@ fn encode(message: &Message) -> Result<Option<String>> {
         Message::Input(data) => ("input".into(), data),
         Message::Thinking(text) => ("thinking".into(), text),
         Message::Answer(text) => ("answer".into(), text),
-        Message::Call(Call {
+        Message::Call(ToolCall {
             id,
             name,
             arguments,
@@ -253,7 +253,7 @@ fn decode(text: &str) -> Result<Message> {
         "answer" => Message::Answer(body),
         "call" => {
             let (id, name) = tool()?;
-            Message::Call(Call {
+            Message::Call(ToolCall {
                 id,
                 name,
                 arguments: body,
@@ -318,7 +318,7 @@ mod tests {
             Message::User("find me a gc implementation".into()),
             Message::Note(Note::Pending(vec![3])),
             Message::Thinking("I'll list the files.\n\nThen read.".into()),
-            Message::Call(Call {
+            Message::Call(ToolCall {
                 id: 4,
                 name: "list_files".into(),
                 arguments: r#"{"path":"."}"#.into(),
@@ -416,7 +416,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new()?;
         let chat = Chat::at(dir.0.join("chat"))?;
-        let spaced = Message::Call(Call {
+        let spaced = Message::Call(ToolCall {
             id: 1,
             name: "list files 2".into(),
             arguments: "{}".into(),

@@ -31,7 +31,7 @@ pub fn parse(line: &str) -> Option<Result<Command, String>> {
 /// The command a whole one-shot request spells, as `parse` reads it, except that a command's
 /// own bare name counts too: `please compact` can only mean the command. Synonyms still need
 /// the slash, since `please clear` or `please summarize` are everyday requests.
-pub fn parse_request(prompt: &str) -> Option<Result<Command, String>> {
+pub fn parse_one_shot(prompt: &str) -> Option<Result<Command, String>> {
     match prompt.trim().to_lowercase().as_str() {
         "compact" => Some(Ok(Command::Compact)),
         "new" => Some(Ok(Command::New)),
@@ -51,11 +51,11 @@ mod tests {
         assert_eq!(parse("/clear"), Some(Ok(Command::New)));
         assert_eq!(parse("/new"), Some(Ok(Command::New)));
         assert_eq!(parse("new"), None);
-        assert_eq!(parse_request("compact"), Some(Ok(Command::Compact)));
-        assert_eq!(parse_request(" New\n"), Some(Ok(Command::New)));
-        assert_eq!(parse_request("/clear"), Some(Ok(Command::New)));
-        assert_eq!(parse_request("summarize"), None);
-        assert_eq!(parse_request("clear"), None);
+        assert_eq!(parse_one_shot("compact"), Some(Ok(Command::Compact)));
+        assert_eq!(parse_one_shot(" New\n"), Some(Ok(Command::New)));
+        assert_eq!(parse_one_shot("/clear"), Some(Ok(Command::New)));
+        assert_eq!(parse_one_shot("summarize"), None);
+        assert_eq!(parse_one_shot("clear"), None);
         assert!(matches!(parse("/frobnicate"), Some(Err(_))));
         assert_eq!(parse("compact the logs"), None);
         assert_eq!(parse("summarize ./a/b"), None);

@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::{Call, Effort, Frame, Message, Note, Place, Setting, ToolResult};
+use crate::protocol::{Effort, Frame, Message, Note, Place, Setting, ToolCall, ToolResult};
 use conversation::{ConversationMessage, prepare};
 use eyre::Result;
 use serde_json::json;
@@ -16,7 +16,7 @@ fn some_setting() -> Setting {
 const HEAD: usize = 4;
 
 fn call(name: &str, arguments: serde_json::Value) -> Message {
-    Message::Call(Call {
+    Message::Call(ToolCall {
         id: 1,
         name: name.into(),
         arguments: arguments.to_string(),
@@ -33,7 +33,7 @@ fn result(name: &str, content: serde_json::Value) -> Message {
 
 #[test]
 fn the_hub_words_the_setting_and_keeps_content_literal() -> Result<()> {
-    let frame = Frame::Request {
+    let frame = Frame::Advance {
         place: Place {
             machine: "ssh-ed25519 AAAA".into(),
             cwd: "/srv".into(),
@@ -46,7 +46,7 @@ fn the_hub_words_the_setting_and_keeps_content_literal() -> Result<()> {
         ],
     };
     let bytes = postcard::to_allocvec(&frame)?;
-    let Frame::Request {
+    let Frame::Advance {
         setting, messages, ..
     } = postcard::from_bytes(&bytes)?
     else {
@@ -113,7 +113,7 @@ fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
     assert_eq!(
         messages[HEAD..],
         [
-            ConversationMessage::ToolCall(ToolCall {
+            ConversationMessage::ToolCall(FunctionCall {
                 name: "read_file".into(),
                 arguments
             }),
@@ -132,7 +132,7 @@ fn notes_are_worded_by_the_hub() -> Result<()> {
         redirection: None,
         ..some_setting()
     };
-    let restart = Note::Restart {
+    let restart = Note::Summarize {
         draft: Some("You asked me to find a GC.".into()),
         chunk: "[7] user\nfind it".into(),
     };
@@ -166,7 +166,7 @@ fn notes_are_worded_by_the_hub() -> Result<()> {
 
 #[test]
 fn stored_calls_need_json_arguments() {
-    let broken = Message::Call(Call {
+    let broken = Message::Call(ToolCall {
         id: 1,
         name: "read_file".into(),
         arguments: "{path:".into(),

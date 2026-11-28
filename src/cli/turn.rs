@@ -8,14 +8,14 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::display::{Approval, Display};
 use crate::protocol::{
-    Frame, Message, Note, Place, ProtocolError, Setting, ToolResult, read_frame_from_stream,
-    write_frame_to_stream,
+    Frame, Message, Note, Place, ProtocolError, Setting, ToolCall, ToolResult, read_frame,
+    write_frame,
 };
 use crate::tools::{
     Commands, ExposedTools, ToolContext, ToolKind, all_tools, kind_of, summarize_patch_for_preview,
 };
 
-use super::connect::obtain_control_stream;
+use super::connect::connect_to_hub;
 
 /// A turn the user cancelled with Ctrl-C.
 #[derive(Debug, thiserror::Error)]
@@ -27,27 +27,28 @@ pub fn is_cancelled(error: &eyre::Report) -> bool {
 }
 
 /// A call the model made, with its arguments parsed into an object.
-struct PendingToolCall {
+struct ParsedCall {
     id: u64,
     name: String,
     arguments: Value,
 }
 
-/// Where and how a turn happens: the hub keeps the conversation of `place`.
+/// Where and how a turn happens: `place` names the room the hub keeps it in.
 #[derive(Clone, Copy)]
 pub struct Scene<'a> {
     pub place: &'a Place,
     pub setting: &'a Setting,
 }
 
-/// What the next request carries, under an ID that stays the same when a reconnect retries it.
+/// What the probe has for the room next: a request, or a step's tool results, under an ID that
+/// stays the same when a reconnect delivers them again.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pending {
+pub struct Delivery {
     pub id: u64,
     pub messages: Vec<Message>,
 }
 
-impl Pending {
+impl Delivery {
     /// Carry `messages` under a fresh ID.
     pub fn new(messages: Vec<Message>) -> Self {
         use std::hash::BuildHasher;
@@ -58,13 +59,13 @@ impl Pending {
     }
 }
 
-/// Run model and tool subturns on a connection, sending the hub only what is new: first the
-/// turn's request, then each step's tool results. `pending` stays what the next request carries
+/// Take the turn's steps on a connection, sending the hub only what is new: first the turn's
+/// request, then each step's tool results. `delivery` stays what the hub has yet to answer
 /// until a response completes, so a retry after a reconnect resends it, under the same ID.
 /// A complete model response resets the reconnect budget; a partial response does not.
-async fn attempt_turn_on_stream(
+async fn attempt_turn(
     scene: Scene<'_>,
-    pending: &mut Pending,
+    delivery: &mut Delivery,
     commands: &Commands,
     stream: &mut UnixStream,
     reconnect_attempts: &mut usize,
@@ -74,7 +75,7 @@ async fn attempt_turn_on_stream(
 
     loop {
         let command_ids = commands.pending_ids();
-        let mut messages = pending.messages.clone();
+        let mut messages = delivery.messages.clone();
         let set_aside = messages
             .iter()
             .any(|message| matches!(message, Message::Note(Note::AnswerSetAside(_))));
@@ -82,13 +83,13 @@ async fn attempt_turn_on_stream(
             messages.push(Message::Note(Note::Pending(command_ids.clone())));
         }
         let mut spinner = Some(display.start_spinning());
-        let req = Frame::Request {
+        let req = Frame::Advance {
             place: scene.place.clone(),
             setting: scene.setting.clone(),
-            id: pending.id,
+            id: delivery.id,
             messages,
         };
-        write_frame_to_stream(stream, &req).await?;
+        write_frame(stream, &req).await?;
 
         let mut store = Vec::with_capacity(4096);
         let mut thinking = None;
@@ -99,7 +100,7 @@ async fn attempt_turn_on_stream(
         let mut order = Vec::new();
 
         loop {
-            let frame = read_frame_from_stream(stream, &mut store, None, None).await?;
+            let frame = read_frame(stream, &mut store, None, None).await?;
             // Stop the spinner before its line clear can erase streamed output.
             if let Some(spinner) = spinner.take() {
                 spinner.stop().await;
@@ -126,15 +127,15 @@ async fn attempt_turn_on_stream(
                         line.show(&delta);
                     }
                 }
-                Frame::ToolCall {
+                Frame::Call(ToolCall {
                     id,
                     name,
-                    arguments_json,
-                } => {
+                    arguments,
+                }) => {
                     order.push(id);
                     // Only an object reaches a tool: approval reads the same fields the tool does.
-                    match serde_json::from_str::<Value>(&arguments_json) {
-                        Ok(arguments) if arguments.is_object() => calls.push(PendingToolCall {
+                    match serde_json::from_str::<Value>(&arguments) {
+                        Ok(arguments) if arguments.is_object() => calls.push(ParsedCall {
                             id,
                             name,
                             arguments,
@@ -168,7 +169,7 @@ async fn attempt_turn_on_stream(
             })
             .collect();
         if calls.is_empty() && refused.is_empty() && !command_ids.is_empty() {
-            *pending = Pending::new(vec![Message::Note(Note::AnswerSetAside(command_ids))]);
+            *delivery = Delivery::new(vec![Message::Note(Note::AnswerSetAside(command_ids))]);
             continue;
         }
 
@@ -183,14 +184,14 @@ async fn attempt_turn_on_stream(
         let mut results = refused;
         results.extend(execute_calls(&calls, &tools, commands, display).await);
         results.sort_by_key(|result| order.iter().position(|&id| id == result.id));
-        *pending = Pending::new(results.into_iter().map(Message::Result).collect());
+        *delivery = Delivery::new(results.into_iter().map(Message::Result).collect());
     }
 }
 
 /// Collect approvals in call order, then run adjacent command calls together.
 /// Other tools stay in order with respect to commands and each other.
 async fn execute_calls(
-    calls: &[PendingToolCall],
+    calls: &[ParsedCall],
     tools: &ExposedTools,
     commands: &Commands,
     display: &Display,
@@ -254,7 +255,7 @@ async fn execute_calls(
 }
 
 async fn invoke_batch(
-    calls: &[PendingToolCall],
+    calls: &[ParsedCall],
     approvals: Vec<Approval>,
     tools: &ExposedTools,
     context: ToolContext<'_>,
@@ -287,7 +288,7 @@ async fn invoke_batch(
     .await
 }
 
-async fn approve_call(display: &Display, call: &PendingToolCall) -> Approval {
+async fn approve_call(display: &Display, call: &ParsedCall) -> Approval {
     let kind = kind_of(&call.name);
     match kind {
         ToolKind::RunCommand if kind.starts_command(&call.arguments) => {
@@ -306,7 +307,8 @@ async fn approve_call(display: &Display, call: &PendingToolCall) -> Approval {
     }
 }
 
-/// Cancel the whole conversation turn on SIGINT, including approval, reconnects, and tool waits.
+/// Run one turn, from a request to its answer. SIGINT cancels all of it: approval, reconnects,
+/// and tool waits.
 pub async fn run_turn(
     stream: &mut Option<UnixStream>,
     display: &Display,
@@ -315,11 +317,11 @@ pub async fn run_turn(
 ) -> Result<String> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let commands = Commands::default();
-    let mut pending = Pending::new(request);
+    let mut delivery = Delivery::new(request);
     let result = tokio::select! {
         biased;
         _ = interrupt.recv() => Err(TurnCancelled.into()),
-        result = run_with_reconnect(stream, display, scene, &mut pending, &commands) => result,
+        result = run_with_reconnect(stream, display, scene, &mut delivery, &commands) => result,
     };
     if result.is_err() {
         // Closing the socket stops the hub's request and leaves the REPL free to reconnect.
@@ -335,15 +337,15 @@ async fn run_with_reconnect(
     stream: &mut Option<UnixStream>,
     display: &Display,
     scene: Scene<'_>,
-    pending: &mut Pending,
+    delivery: &mut Delivery,
     commands: &Commands,
 ) -> Result<String> {
     let mut reconnect_attempts = 0;
     loop {
         let connection = connection(stream).await?;
-        let result = attempt_turn_on_stream(
+        let result = attempt_turn(
             scene,
-            pending,
+            delivery,
             commands,
             connection,
             &mut reconnect_attempts,
@@ -361,7 +363,7 @@ async fn run_with_reconnect(
     }
 }
 
-/// Restart the scene's conversation on the hub, from a summary of it or from nothing, showing
+/// Restart the scene's room on the hub, from a summary of it or from nothing, showing
 /// what the hub reports.
 pub async fn restart(
     stream: &mut Option<UnixStream>,
@@ -377,12 +379,12 @@ pub async fn restart(
             setting: scene.setting.clone(),
             summarize,
         };
-        write_frame_to_stream(connection, &request).await?;
+        write_frame(connection, &request).await?;
         let spinner = display.start_spinning();
         let mut store = Vec::new();
         let mut answered = false;
         loop {
-            let frame = read_frame_from_stream(connection, &mut store, None, None).await?;
+            let frame = read_frame(connection, &mut store, None, None).await?;
             match frame {
                 Frame::Log(line) => display.show_log(&line),
                 // Asked for, the summary is the answer.
@@ -417,7 +419,7 @@ async fn connection(stream: &mut Option<UnixStream>) -> Result<&mut UnixStream> 
     match stream {
         Some(connection) => Ok(connection),
         None => {
-            let connection = obtain_control_stream().await?;
+            let connection = connect_to_hub().await?;
             Ok(stream.insert(connection))
         }
     }

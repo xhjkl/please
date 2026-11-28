@@ -6,7 +6,7 @@ use tokio::net::UnixStream;
 
 /// Why there is no hub to talk to at a socket path.
 #[derive(Debug, thiserror::Error)]
-pub enum ConnectError {
+pub enum DialError {
     #[error("missing socket: {}", .0.display())]
     Missing(PathBuf),
     #[error("permission denied: {}", .0.display())]
@@ -17,7 +17,7 @@ pub enum ConnectError {
     NoListener(PathBuf),
 }
 
-impl ConnectError {
+impl DialError {
     /// Whether no hub is there yet, as opposed to something in the way of one.
     pub fn is_absent(&self) -> bool {
         matches!(self, Self::Missing(_) | Self::NoListener(_))
@@ -25,32 +25,32 @@ impl ConnectError {
 }
 
 /// Connect to a hub already listening at `path`.
-pub async fn try_connect_to_hub(path: &Path) -> std::result::Result<UnixStream, ConnectError> {
+pub async fn dial(path: &Path) -> std::result::Result<UnixStream, DialError> {
     use std::io::ErrorKind;
     use std::os::unix::fs::FileTypeExt;
     let metadata = std::fs::metadata(path);
     if metadata.is_ok_and(|metadata| !metadata.file_type().is_socket()) {
-        return Err(ConnectError::NotSocket(path.to_path_buf()));
+        return Err(DialError::NotSocket(path.to_path_buf()));
     }
     let connect = UnixStream::connect(path);
     let connected = tokio::time::timeout(Duration::from_millis(64), connect).await;
-    let error: fn(PathBuf) -> ConnectError = match connected {
-        Err(_elapsed) => ConnectError::NoListener,
+    let error: fn(PathBuf) -> DialError = match connected {
+        Err(_elapsed) => DialError::NoListener,
         Ok(Err(error)) => match error.kind() {
-            ErrorKind::NotFound => ConnectError::Missing,
-            ErrorKind::PermissionDenied => ConnectError::PermissionDenied,
+            ErrorKind::NotFound => DialError::Missing,
+            ErrorKind::PermissionDenied => DialError::PermissionDenied,
             ErrorKind::ConnectionRefused | ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-                ConnectError::NoListener
+                DialError::NoListener
             }
-            _ => ConnectError::NotSocket,
+            _ => DialError::NotSocket,
         },
         Ok(Ok(stream)) => return Ok(stream),
     };
     Err(error(path.to_path_buf()))
 }
 
-/// Start a detached hub and connect once it has bound its socket.
-async fn start_hub(path: &Path) -> Result<UnixStream> {
+/// Start a hub process of its own and connect once it has bound its socket.
+async fn start_detached_hub(path: &Path) -> Result<UnixStream> {
     let exe = std::env::current_exe()?;
     let mut hub = tokio::process::Command::new(exe);
     hub.arg("run")
@@ -61,7 +61,7 @@ async fn start_hub(path: &Path) -> Result<UnixStream> {
     let mut child = hub.spawn()?;
     let connected = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let connected = try_connect_to_hub(path).await;
+            let connected = dial(path).await;
             match connected {
                 Err(error) if !error.is_absent() => return Err(eyre!(error)),
                 Err(_absent) => {}
@@ -91,17 +91,18 @@ async fn start_hub(path: &Path) -> Result<UnixStream> {
     connected
 }
 
-/// Connect to an existing or forwarded hub before considering a local embedded hub, and be
-/// admitted by it; a hub serving another probe fails this with [`crate::protocol::HubBusy`].
-pub async fn obtain_control_stream() -> Result<UnixStream> {
+/// Connect to a hub and be admitted by it: one already listening, local or forwarded, before a
+/// new one, detached or embedded. A hub serving another probe fails this with
+/// [`crate::protocol::HubBusy`].
+pub async fn connect_to_hub() -> Result<UnixStream> {
     let path = crate::hub::socket_path();
-    let mut stream = obtain_control_stream_at(&path).await?;
+    let mut stream = connect_to_hub_at(&path).await?;
     crate::protocol::greet(&mut stream).await?;
     Ok(stream)
 }
 
-async fn obtain_control_stream_at(path: &Path) -> Result<UnixStream> {
-    let connected = try_connect_to_hub(path).await;
+async fn connect_to_hub_at(path: &Path) -> Result<UnixStream> {
+    let connected = dial(path).await;
     match connected {
         Err(error) if !error.is_absent() => return Err(eyre!(error)),
         Ok(stream) => {
@@ -116,7 +117,7 @@ async fn obtain_control_stream_at(path: &Path) -> Result<UnixStream> {
     }
     let prefers_daemon = std::env::var_os("PLEASE_SPAWN_HUB").is_some();
     if prefers_daemon {
-        return start_hub(path).await;
+        return start_detached_hub(path).await;
     }
 
     let stream = crate::hub::spawn(None).await?;
@@ -127,7 +128,7 @@ async fn obtain_control_stream_at(path: &Path) -> Result<UnixStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Frame, read_frame_from_stream, write_frame_to_stream};
+    use crate::protocol::{Frame, read_frame, write_frame};
     use crate::test_support::TempDir;
 
     #[tokio::test]
@@ -135,11 +136,11 @@ mod tests {
         let directory = TempDir::new()?;
         let path = directory.0.join("socket");
         let listener = tokio::net::UnixListener::bind(&path)?;
-        let mut probe = obtain_control_stream_at(&path).await?;
+        let mut probe = connect_to_hub_at(&path).await?;
         let (mut hub, _) = listener.accept().await?;
-        write_frame_to_stream(&mut hub, &Frame::Answer("forwarded hub".into())).await?;
+        write_frame(&mut hub, &Frame::Answer("forwarded hub".into())).await?;
         let mut store = Vec::new();
-        let response: Frame = read_frame_from_stream(&mut probe, &mut store, None, None).await?;
+        let response: Frame = read_frame(&mut probe, &mut store, None, None).await?;
         assert!(matches!(response, Frame::Answer(text) if text == "forwarded hub"));
         Ok(())
     }
@@ -150,9 +151,9 @@ mod tests {
             let (mut probe, mut hub) = UnixStream::pair()?;
             let serving = tokio::spawn(async move {
                 let mut store = Vec::new();
-                let hello: Frame = read_frame_from_stream(&mut hub, &mut store, None, None).await?;
+                let hello: Frame = read_frame(&mut hub, &mut store, None, None).await?;
                 assert!(matches!(hello, Frame::Hello { .. }));
-                write_frame_to_stream(&mut hub, &reply).await
+                write_frame(&mut hub, &reply).await
             });
             let greeted = crate::protocol::greet(&mut probe).await;
             serving.await??;
@@ -172,7 +173,7 @@ mod tests {
         let directory = TempDir::new()?;
         let path = directory.0.join("socket");
         std::fs::write(&path, "keep this file")?;
-        let connected = obtain_control_stream_at(&path).await;
+        let connected = connect_to_hub_at(&path).await;
         assert!(connected.is_err());
         let content = std::fs::read_to_string(path)?;
         assert_eq!(content, "keep this file");

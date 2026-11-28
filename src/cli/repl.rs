@@ -8,9 +8,9 @@ use crate::protocol::{HubBusy, Message};
 use super::commands::{self, Command};
 use super::turn::{Scene, is_cancelled, restart, run_turn};
 
-/// Read requests and commands until an empty line or end of input; the hub carries the
+/// Read requests and commands until an empty line or end of input; the room carries what was
 /// conversation from one to the next.
-pub async fn interact_forever(
+pub async fn interact(
     stream: &mut Option<UnixStream>,
     display: &Display,
     scene: Scene<'_>,
@@ -70,7 +70,7 @@ pub async fn interact_forever(
         match outcome {
             // Another probe took the hub while this one reconnected; the caller steps aside.
             Err(error) if error.downcast_ref::<HubBusy>().is_some() => return Err(error),
-            // A cancelled or failed turn ends here, and the conversation goes on.
+            // A cancelled or failed turn ends here, and the prompt comes back.
             Err(error) if is_cancelled(&error) => eprintln!("\nplease: turn cancelled"),
             Err(error) => eprintln!("please: {error:#}"),
             Ok(()) => {}

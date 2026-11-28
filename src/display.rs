@@ -15,7 +15,7 @@ pub struct Display {
     stderr_is_tty: bool,
     stdin_is_tty: bool,
     /// Whether hub logs are shown, as they are when the hub runs in the foreground.
-    should_show_readout: bool,
+    shows_hub_logs: bool,
 }
 
 /// A visible reasoning line that ends when the subturn moves on or is interrupted.
@@ -48,7 +48,7 @@ impl Display {
         Display {
             stderr_is_tty,
             stdin_is_tty,
-            should_show_readout: hub_in_foreground || log_everything,
+            shows_hub_logs: hub_in_foreground || log_everything,
         }
     }
 
@@ -63,7 +63,7 @@ impl Display {
 
     /// Append a line to the hub's readout, if it is shown.
     pub fn show_log(&self, line: &str) {
-        if !self.should_show_readout {
+        if !self.shows_hub_logs {
             return;
         }
         let line = line.trim_end();

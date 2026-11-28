@@ -1,4 +1,4 @@
-//! Minimal postcard-framed protocol between CLI and hub.
+//! Minimal postcard-framed protocol between probe and hub.
 use eyre::{Result, eyre};
 use serde::{Deserialize, Serialize};
 
@@ -20,7 +20,7 @@ pub struct Setting {
     pub redirection: Option<String>,
 }
 
-/// Where a probe runs; the hub keeps one conversation per place.
+/// Where a probe runs; the hub keeps one room per place.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Place {
     /// The machine's SSH host key, or empty on a machine without one.
@@ -29,7 +29,7 @@ pub struct Place {
     pub cwd: String,
 }
 
-/// One entry of a conversation, in terms no model's chat format dictates; the hub words and
+/// One thing said in a room, in terms no model's chat format dictates; the hub words and
 /// frames them for the loaded checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
@@ -37,14 +37,14 @@ pub enum Message {
     User(String),
     /// Data the person piped in alongside a request: material, never instructions.
     Input(String),
-    /// The harness's word in the middle of a conversation.
+    /// The harness's word in the middle of a turn.
     Note(Note),
     /// The model's reasoning before it answers or calls tools.
     Thinking(String),
     /// The model's visible answer.
     Answer(String),
     /// A tool call the model made.
-    Call(Call),
+    Call(ToolCall),
     /// What a tool returned to the model.
     Result(ToolResult),
 }
@@ -56,20 +56,20 @@ pub enum Note {
     Pending(Vec<u64>),
     /// An answer arrived while these commands still ran, so it was set aside.
     AnswerSetAside(Vec<u64>),
-    /// The context is nearly full: fold the next chunk of the transcript into the message the
+    /// The context is nearly full: fold the next chunk of the transcript into the summary the
     /// conversation restarts from, as drafted so far (none before the first chunk).
-    Restart {
+    Summarize {
         draft: Option<String>,
         chunk: String,
     },
-    /// The conversation just restarted in the middle of a task: carry on from its message.
+    /// The room just restarted in the middle of a task: carry on from its summary.
     Resume,
 }
 
 /// A named tool invocation with its arguments as a JSON object's text (postcard cannot carry
-/// `serde_json::Value`), under an ID unique within its conversation.
+/// `serde_json::Value`), under an ID unique within its room.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Call {
+pub struct ToolCall {
     pub id: u64,
     pub name: String,
     pub arguments: String,
@@ -85,37 +85,32 @@ pub struct ToolResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Frame {
-    /// Continue the place's conversation with what is new since the hub's last reply: a
-    /// request, or tool results; notes hold for this request only. A retry after a dropped
+    /// Advance the turn in the place's room by what is new since the hub's last reply: a
+    /// request, or tool results; notes hold for this frame only. A retry after a dropped
     /// connection carries the same `id`, so the hub keeps its messages once.
-    Request {
+    Advance {
         place: Place,
         setting: Setting,
         id: u64,
         messages: Vec<Message>,
     },
-    /// Restart the place's conversation: from a message summing it up, or from nothing.
+    /// Restart the place's room: from a message summing it up, or from nothing.
     Restart {
         place: Place,
         setting: Setting,
         summarize: bool,
     },
     Log(String),
-    /// The message the conversation restarted from; the probe shows it apart from the answer.
+    /// The summary the room restarted from; the probe shows it apart from the answer.
     Restarted(String),
     Answer(String),
     Thinking(String),
-    /// A call for the probe to answer with a result under the same `id`.
-    ToolCall {
-        id: u64,
-        name: String,
-        /// Tool arguments encoded as JSON text because postcard cannot deserialize `serde_json::Value`.
-        arguments_json: String,
-    },
+    /// A call for the probe to answer with a result under the same ID.
+    Call(ToolCall),
     Stop,
-    ModelInfoRequest,
-    ModelInfo {
-        engine: String,
+    CheckpointRequest,
+    /// The checkpoint the hub has loaded.
+    Checkpoint {
         path: String,
     },
     Error(String),
@@ -139,9 +134,9 @@ pub enum Frame {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
-    #[error("connection dropped while the request was being read")]
+    #[error("connection dropped while a frame was being read")]
     Disconnect,
-    #[error("timed out while reading request")]
+    #[error("timed out while reading a frame")]
     Timeout,
     #[error("io error: {0}")]
     Io(std::io::Error),
@@ -165,9 +160,9 @@ fn probe_id() -> u64 {
 /// Introduce this probe on a fresh connection and wait until the hub takes it.
 pub async fn greet(stream: &mut tokio::net::UnixStream) -> Result<()> {
     let hello = Frame::Hello { probe: probe_id() };
-    write_frame_to_stream(stream, &hello).await?;
+    write_frame(stream, &hello).await?;
     let mut store = Vec::new();
-    let greeting = read_frame_from_stream(stream, &mut store, None, None).await?;
+    let greeting = read_frame(stream, &mut store, None, None).await?;
     match greeting {
         Frame::Welcome => Ok(()),
         Frame::Busy => Err(HubBusy.into()),
@@ -176,7 +171,7 @@ pub async fn greet(stream: &mut tokio::net::UnixStream) -> Result<()> {
 }
 
 /// Serialize any frame-like value and write it to the sink.
-pub async fn write_frame_to_stream<W: tokio::io::AsyncWriteExt + Unpin, T: serde::Serialize>(
+pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin, T: serde::Serialize>(
     sink: &mut W,
     frame: &T,
 ) -> Result<()> {
@@ -186,7 +181,7 @@ pub async fn write_frame_to_stream<W: tokio::io::AsyncWriteExt + Unpin, T: serde
 }
 
 /// Read a single postcard frame from the stream, buffering as needed.
-pub async fn read_frame_from_stream<T: serde::de::DeserializeOwned>(
+pub async fn read_frame<T: serde::de::DeserializeOwned>(
     stream: &mut tokio::net::UnixStream,
     store: &mut Vec<u8>,
     per_read_timeout: Option<std::time::Duration>,

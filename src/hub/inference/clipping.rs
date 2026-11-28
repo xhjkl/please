@@ -101,7 +101,7 @@ fn merged(ranges: impl Iterator<Item = Range<usize>>) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Call, ToolResult};
+    use crate::protocol::{ToolCall, ToolResult};
 
     /// Every message weighs ten tokens.
     fn size(history: &[Message]) -> Result<usize> {
@@ -113,7 +113,7 @@ mod tests {
         history.push(Message::User(request.into()));
         for step in 0..steps {
             history.push(Message::Thinking(format!("{request} {step}")));
-            history.push(Message::Call(Call {
+            history.push(Message::Call(ToolCall {
                 id: step as u64,
                 name: "read_file".into(),
                 arguments: "{}".into(),
@@ -200,7 +200,7 @@ mod tests {
         let mut history = vec![Message::Answer("You asked me to read three files.".into())];
         for step in 0..8 {
             history.push(Message::Thinking(format!("step {step}")));
-            history.push(Message::Call(Call {
+            history.push(Message::Call(ToolCall {
                 id: step as u64,
                 name: "read_file".into(),
                 arguments: "{}".into(),

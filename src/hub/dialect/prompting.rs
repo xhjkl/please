@@ -131,7 +131,7 @@ pub fn note(note: &Note) -> String {
         Note::Pending(ids) => pending(ids),
         Note::AnswerSetAside(ids) => format!("Previous answer ignored. {}", pending(ids)),
         Note::Resume => "The conversation restarted from your message above. Carry on with the task: take the next step it names now.".into(),
-        Note::Restart { .. } => RESTART.into(),
+        Note::Summarize { .. } => RESTART.into(),
     }
 }
 

@@ -31,4 +31,4 @@ pub(super) mod prompting;
 mod qwenish;
 #[cfg(test)]
 mod tests;
-pub(super) use adapter::{Adapter, Delta, OutputParser, Rendered, ToolCall};
+pub(super) use adapter::{Adapter, Delta, FunctionCall, OutputParser, Rendered};

@@ -9,7 +9,9 @@
 //! form the developer message, as gpt-oss's chat template places them. Unlike that template,
 //! the preamble's own "Current date" line stays in the instructions rather than moving into
 //! the system message.
-use super::conversation::{ConversationMessage, Rendered, ToolCall, split_preamble, tool_schemas};
+use super::conversation::{
+    ConversationMessage, FunctionCall, Rendered, split_preamble, tool_schemas,
+};
 use super::piece::{Piece, encode_prompt};
 use super::{Adapter as DialectAdapter, OutputParser as DialectOutputParser};
 use crate::protocol::Effort;
@@ -237,7 +239,7 @@ fn conversation_message(prompt: &mut Prompt, message: &ConversationMessage) {
         ConversationMessage::Answer(content) => prompt.message(assistant("final"), content),
         ConversationMessage::Thinking(content) if content.is_empty() => {}
         ConversationMessage::Thinking(content) => prompt.message(assistant("analysis"), content),
-        ConversationMessage::ToolCall(ToolCall { name, arguments }) => {
+        ConversationMessage::ToolCall(FunctionCall { name, arguments }) => {
             let recipient = format!("functions.{name}");
             let header = Header {
                 recipient: Some(&recipient),

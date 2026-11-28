@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::inference::{self, Engine};
-use crate::protocol::{Frame, ProtocolError, read_frame_from_stream, write_frame_to_stream};
+use crate::protocol::{Frame, ProtocolError, read_frame, write_frame};
 
 /// Load the hub's explicit checkpoint or discover the best installed model on this machine.
 async fn load(model_path: Option<&str>) -> Result<Arc<Engine>> {
@@ -84,7 +84,7 @@ async fn read_request(
 ) -> std::result::Result<Frame, ProtocolError> {
     let per_read_timeout = Some(Duration::from_millis(250));
     let total_timeout = Some(Duration::from_secs(30));
-    read_frame_from_stream(stream, store, per_read_timeout, total_timeout).await
+    read_frame(stream, store, per_read_timeout, total_timeout).await
 }
 
 /// Wait for another request, allowing the client to run tools before sending it.
@@ -144,31 +144,30 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
         };
 
         let served = match frame {
-            Frame::ModelInfoRequest => {
-                let response = Frame::ModelInfo {
-                    engine: "Oco".into(),
+            Frame::CheckpointRequest => {
+                let response = Frame::Checkpoint {
                     path: hub.path.display().to_string(),
                 };
-                write_frame_to_stream(stream, &response).await
+                write_frame(stream, &response).await
             }
             Frame::Hello { probe } => {
                 let Some(admitted) = hub.occupancy.admit(probe) else {
                     tracing::info!("hub: turned away probe {probe:016x} while serving another");
-                    return write_frame_to_stream(stream, &Frame::Busy).await;
+                    return write_frame(stream, &Frame::Busy).await;
                 };
                 admission = Some(admitted);
-                write_frame_to_stream(stream, &Frame::Welcome).await
+                write_frame(stream, &Frame::Welcome).await
             }
-            Frame::Request { .. } | Frame::Restart { .. } | Frame::BenchmarkRequest { .. }
+            Frame::Advance { .. } | Frame::Restart { .. } | Frame::BenchmarkRequest { .. }
                 if admission.is_none() =>
             {
                 let refusal = Frame::Error(
                     "the probe did not say hello; probe and hub are probably different versions of please"
                         .into(),
                 );
-                return write_frame_to_stream(stream, &refusal).await;
+                return write_frame(stream, &refusal).await;
             }
-            Frame::Request {
+            Frame::Advance {
                 place,
                 setting,
                 id,
@@ -207,16 +206,14 @@ async fn accept_and_serve_request(stream: &mut UnixStream, hub: Arc<Engine>) -> 
                     super::benchmark::measure(hub.clone(), setting, messages, max_tokens).await;
                 match report {
                     Err(error) => Err(error),
-                    Ok(report) => {
-                        write_frame_to_stream(stream, &Frame::BenchmarkResult(report)).await
-                    }
+                    Ok(report) => write_frame(stream, &Frame::BenchmarkResult(report)).await,
                 }
             }
             _ => bail!("bad request: {frame:?}"),
         };
 
         if let Err(error) = served {
-            write_frame_to_stream(
+            write_frame(
                 stream,
                 &Frame::Error(format!("inference failed: {error:#}")),
             )
