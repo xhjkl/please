@@ -5,7 +5,7 @@ mod parsing;
 mod preview;
 
 use super::ToolContext;
-use super::common::{Param, ParamKind, Spec};
+use super::spec::{Param, ParamKind, Spec};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;

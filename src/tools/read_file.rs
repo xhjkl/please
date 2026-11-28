@@ -1,5 +1,6 @@
 use super::ToolContext;
-use super::common::{Param, ParamKind, Spec, resolve_path_within_cwd};
+use super::spec::{Param, ParamKind, Spec};
+use super::workspace::resolve_path_within_cwd;
 use serde::Deserialize;
 use serde_json::json;
 use std::fs::File;

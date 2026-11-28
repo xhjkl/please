@@ -5,7 +5,7 @@
 //! text, for example when quoting documentation, stay content.
 use super::super::piece::special;
 use super::super::prompt::{Delta, FunctionCall};
-use crate::tools::{Param, ParamKind};
+use crate::tools::spec::{Param, ParamKind};
 use eyre::{Result, eyre};
 use oco::Tokenizer;
 use serde_json::{Map, Value};

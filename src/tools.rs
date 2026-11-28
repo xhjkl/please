@@ -4,6 +4,7 @@ use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
 use serde_json::Value;
+use spec::Spec;
 
 type Handler =
     for<'turn> fn(Value, ToolContext<'turn>) -> Pin<Box<dyn Future<Output = Value> + Send + 'turn>>;
@@ -38,16 +39,13 @@ macro_rules! tool {
     }};
 }
 
-mod common;
-pub use self::common::Spec;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use self::common::{Param, ParamKind};
-
 mod apply_patch;
 mod command;
 mod find_related;
 mod list_files;
 mod read_file;
+pub mod spec;
+mod workspace;
 
 pub use apply_patch::preview_patch;
 pub use command::Jobs;

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::applying::apply_all_hunks;
 use super::model::PatchOp;
-use crate::tools::common::resolve_path_within;
+use crate::tools::workspace::resolve_path_within;
 
 /// Find where `path` lies in `workspace`, refusing one that leaves it.
 fn locate(workspace: &Path, path: &str) -> io::Result<PathBuf> {

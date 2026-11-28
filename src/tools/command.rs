@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::ToolContext;
-use super::common::{Param, ParamKind, Spec};
+use super::spec::{Param, ParamKind, Spec};
 
 mod job;
 

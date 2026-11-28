@@ -2,7 +2,7 @@
 //! neutral history, with what every dialect needs to prepare them.
 use crate::hub::wording;
 use crate::protocol::{Effort, Message, Note, Setting, ToolCall};
-use crate::tools::{ParamKind, Spec};
+use crate::tools::spec::{ParamKind, Spec};
 use eyre::{Result, WrapErr};
 use serde_json::{Map, Value, json};
 

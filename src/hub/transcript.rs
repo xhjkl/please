@@ -2,7 +2,7 @@
 //! recall tool, which the hub runs itself.
 use super::rooms::{Entry, Room};
 use crate::protocol::{Message, ToolCall, ToolResult};
-use crate::tools::{Param, ParamKind, Spec};
+use crate::tools::spec::{Param, ParamKind, Spec};
 use serde_json::{Value, json};
 
 /// The hub's own tool: the transcript, restarts included, lives with the hub.
