@@ -26,6 +26,8 @@ pub fn socket_path() -> std::path::PathBuf {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod benchmark;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod clipping;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod dialect;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod digest;

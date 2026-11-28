@@ -5,6 +5,7 @@
 //! session's history and the newly rendered prompt stays, the session rewinds to it, and the
 //! rest is prefilled. Another owner's history keeps at least the static head, whose end is a
 //! session checkpoint; a different head is read from `~/.please/caches`, or prefilled and saved once.
+use super::clipping;
 use super::dialect::{Dialect, OutputParser, Rendered};
 use super::heads;
 use super::occupancy::Occupancy;
@@ -15,7 +16,6 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::spawn_blocking;
 
-pub(super) mod clipping;
 mod reuse;
 
 const MAX_GENERATED_TOKENS: usize = 8_192;
