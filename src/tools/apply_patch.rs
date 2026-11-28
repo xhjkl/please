@@ -7,7 +7,8 @@ mod preview;
 use super::ToolContext;
 use super::common::{Param, ParamKind, Spec};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
+use std::path::Path;
 
 pub use preview::preview_patch;
 
@@ -21,7 +22,17 @@ pub struct Args {
     patch: Option<String>,
 }
 
-pub async fn call(args: Args, _context: ToolContext<'_>) -> serde_json::Value {
+pub async fn call(args: Args, _context: ToolContext<'_>) -> Value {
+    let workspace = std::env::current_dir();
+    match workspace {
+        Err(error) => json!({ "error": error.to_string() }),
+        Ok(workspace) => apply(&workspace, args),
+    }
+}
+
+/// Carry out a call in `workspace`: overwrite one file verbatim, or run a patch's operations,
+/// each reporting for itself.
+fn apply(workspace: &Path, args: Args) -> Value {
     let Some(patch) = args.patch else {
         return json!({ "error": "apply_patch requires parameter `patch`" });
     };
@@ -29,19 +40,21 @@ pub async fn call(args: Args, _context: ToolContext<'_>) -> serde_json::Value {
         let Some(path) = args.path.as_deref() else {
             return json!({ "error": "overwrite mode requires `path`" });
         };
-        let written = filesystem::write_verbatim_within_cwd(path, &patch);
+        let written = filesystem::write_verbatim(workspace, path, &patch);
         return match written {
             Err(error) => json!({ "error": error.to_string() }),
             Ok(()) => json!({ "ok": true, "mode": "overwrite", "path": path }),
         };
     }
-    match parsing::parse_patch_ops(&patch) {
-        Err(error) => json!({ "error": error }),
-        Ok(ops) => {
-            let results: Vec<_> = ops.into_iter().map(filesystem::execute).collect();
-            json!({ "ok": true, "mode": "patch", "results": results })
-        }
-    }
+    let ops = match parsing::parse_patch_ops(&patch) {
+        Err(error) => return json!({ "error": error }),
+        Ok(ops) => ops,
+    };
+    let results: Vec<_> = ops
+        .into_iter()
+        .map(|op| filesystem::execute(workspace, op))
+        .collect();
+    json!({ "ok": true, "mode": "patch", "results": results })
 }
 
 pub const SPEC: Spec = Spec {

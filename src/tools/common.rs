@@ -39,12 +39,16 @@ pub struct Param {
     pub required: bool,
 }
 
-/// Resolve a user-supplied path to a relative path under the current directory, the
-/// workspace. Symlinks in its existing prefix are followed and the leaf need not exist; a path
-/// that leaves the workspace, whether absolute, by `..`, or by a symlink, fails with
-/// `PermissionDenied`.
+/// Resolve a user-supplied path within the current directory, which is the workspace.
 pub fn resolve_path_within_cwd(path: &str) -> io::Result<PathBuf> {
     let root = env::current_dir()?;
+    resolve_path_within(&root, path)
+}
+
+/// Resolve a user-supplied path to a relative path under the workspace at `root`. Symlinks in
+/// its existing prefix are followed and the leaf need not exist; a path that leaves the
+/// workspace, whether absolute, by `..`, or by a symlink, fails with `PermissionDenied`.
+pub fn resolve_path_within(root: &Path, path: &str) -> io::Result<PathBuf> {
     let root = root.canonicalize()?;
     let input = Path::new(path);
     if path.is_empty() || input == Path::new(".") {
