@@ -37,7 +37,7 @@ pub struct Engine {
     /// What this checkpoint's saved heads are named after besides their IDs.
     origin: heads::Origin,
     /// Tokens the session holds, fixed at load.
-    capacity: usize,
+    pub capacity: usize,
     /// The only session, `None` until the first request or after a failed one. Holding the
     /// lock serializes the served probe's requests, which may overlap across a reconnection.
     session: tokio::sync::Mutex<Option<KeptSession>>,
@@ -129,11 +129,6 @@ impl Engine {
     ) -> Result<Rendered> {
         self.dialect
             .render(self.weights.tokenizer(), setting, history, tail_budget)
-    }
-
-    /// Tokens the session holds.
-    pub fn capacity(&self) -> usize {
-        self.capacity
     }
 
     /// What share of the context a prompt of this history fills.

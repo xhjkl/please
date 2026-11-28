@@ -67,7 +67,7 @@ pub async fn advance(
     keep_delivery(&room, id, incoming)?;
     // A recalled page may take a tenth of the context, so recalling cannot crowd it out.
     let page =
-        transcript::RECALL_PAGE.min((engine.capacity() as f64 * 0.1 * BYTES_PER_TOKEN) as usize);
+        transcript::RECALL_PAGE.min((engine.capacity as f64 * 0.1 * BYTES_PER_TOKEN) as usize);
     let mut compacted = false;
     for _ in 0..HUB_STEPS {
         let mut history = room.conversation()?;
@@ -350,7 +350,7 @@ async fn compact(
         ..setting.clone()
     };
     let head = engine.fill(&setting, &[])?;
-    let free = engine.capacity() as f64 * (1.0 - head) - COMPACT_RESERVE as f64;
+    let free = engine.capacity as f64 * (1.0 - head) - COMPACT_RESERVE as f64;
     let budget = (free * CHUNK_SHARE * BYTES_PER_TOKEN).max(1024.0) as usize;
     let chunks = transcript::chunks(&folded, budget);
     if chunks.is_empty() {
