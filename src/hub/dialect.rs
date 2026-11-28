@@ -6,14 +6,14 @@ use oco::Tokenizer;
 
 /// Prompt format a checkpoint was trained on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Dialect {
+pub enum Dialect {
     Inkling,
     Qwenish,
     Harmony,
 }
 
 /// Incremental conversion from model tokens to dialect-neutral content and tool calls.
-pub(super) trait OutputParser: Send {
+pub trait OutputParser: Send {
     /// Consume one generated token and return newly visible text.
     fn push_token(&mut self, token: u32) -> Result<Vec<Delta>>;
     /// Return the tool calls of the finished response.
@@ -22,7 +22,7 @@ pub(super) trait OutputParser: Send {
 
 impl Dialect {
     /// Select the dialect from the checkpoint architecture, never its filename.
-    pub(super) fn from_architecture(architecture: &str) -> Result<Self> {
+    pub fn from_architecture(architecture: &str) -> Result<Self> {
         match architecture {
             "inkling2_loop" => Ok(Self::Inkling),
             "qwen35" => Ok(Self::Qwenish),
@@ -35,7 +35,7 @@ impl Dialect {
 
     /// Word the setting and history, fit command results to `tail_budget`, then encode them
     /// in this dialect.
-    pub(super) fn render(
+    pub fn render(
         self,
         tokenizer: &Tokenizer,
         setting: &Setting,
@@ -55,10 +55,7 @@ impl Dialect {
     }
 
     /// Start decoding one response that continues the rendered prompt.
-    pub(super) fn output_parser<'a>(
-        self,
-        tokenizer: &'a Tokenizer,
-    ) -> Result<Box<dyn OutputParser + 'a>> {
+    pub fn output_parser<'a>(self, tokenizer: &'a Tokenizer) -> Result<Box<dyn OutputParser + 'a>> {
         match self {
             Self::Inkling => inkling::output_parser(tokenizer),
             Self::Qwenish => qwenish::output_parser(tokenizer),
@@ -67,7 +64,7 @@ impl Dialect {
     }
 
     /// Whether generation ends at this token.
-    pub(super) fn is_stop_token(self, tokenizer: &Tokenizer, token: u32) -> bool {
+    pub fn is_stop_token(self, tokenizer: &Tokenizer, token: u32) -> bool {
         match self {
             Self::Inkling => inkling::is_stop_token(tokenizer, token),
             Self::Qwenish => qwenish::is_stop_token(tokenizer, token),
@@ -83,4 +80,4 @@ mod prompt;
 mod qwenish;
 #[cfg(test)]
 mod tests;
-pub(super) use prompt::{Delta, FunctionCall, Rendered};
+pub use prompt::{Delta, FunctionCall, Rendered};

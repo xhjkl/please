@@ -49,7 +49,7 @@ pub async fn run(checkpoint: &str, cases_path: &str) -> Result<()> {
 /// static head, which the hub's session still holds from an earlier case or restores from the
 /// cache or prefills (`start` says which), and `follow_up` continues it with the reply and
 /// stub tool results, as the probe's next request would.
-pub(super) async fn measure(
+pub async fn measure(
     engine: Arc<Engine>,
     setting: Setting,
     messages: Vec<Message>,
