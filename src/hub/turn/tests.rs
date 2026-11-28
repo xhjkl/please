@@ -46,14 +46,14 @@ fn a_delivery_is_kept_once_however_often_it_is_retried() -> Result<()> {
     let results = vec![result(3, "read_file", "x".into())];
     keep_delivery(&room, 7, results.clone())?;
     keep_delivery(&room, 7, results)?;
-    assert_eq!(room.conversation()?.len(), 4);
+    assert_eq!(room.history()?.len(), 4);
     // A new request after a step whose calls never got results answers them first.
     room.append(&[
         Message::Thinking(String::new()),
         some_call(6, "run_command"),
     ])?;
     keep_delivery(&room, 8, vec![Message::User("next".into())])?;
-    let conversation = room.conversation()?;
+    let conversation = room.history()?;
     let answer = Message::Result(ToolResult {
         id: 6,
         name: "run_command".into(),
@@ -83,7 +83,7 @@ fn a_restart_keeps_as_much_of_the_turn_in_progress_as_fits() -> Result<()> {
     // Entries 1 and 2 are set aside, 3 is the restart message, and the turn is 4 to 14.
     let split = |most: usize| {
         let fits = |kept: &[Message]| Ok(kept.len() <= most);
-        let (folded, kept) = cutover(room.entries()?, fits)?;
+        let (folded, kept) = cutover(room.conversation()?, fits)?;
         let last = folded.last().map(|entry| entry.number);
         Ok::<_, eyre::Report>((last, kept))
     };

@@ -47,7 +47,7 @@ pub fn recall(room: &Room, arguments: &Value, page: usize) -> Value {
     };
     let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let read = match entry {
-        None => room.entries().map(|entries| index(&entries)),
+        None => room.transcript().map(|entries| index(&entries)),
         Some(name) => room.read(&name),
     };
     let text = match read {
@@ -85,12 +85,12 @@ fn index(entries: &[Entry]) -> String {
     lines.join("\n")
 }
 
-/// Entries since the last restart, each abbreviated the same way every time, grouped into
-/// chunks of about `budget` bytes, oldest first; no entry is shown longer than half a chunk.
-pub fn chunks(entries: &[Entry], budget: usize) -> Vec<String> {
+/// A conversation's entries, each abbreviated the same way every time, grouped into chunks
+/// of about `budget` bytes, oldest first; no entry is shown longer than half a chunk.
+pub fn chunks(conversation: &[Entry], budget: usize) -> Vec<String> {
     let longest = budget / 2;
     let mut chunks: Vec<String> = Vec::new();
-    for (index, entry) in entries.iter().filter(|entry| !entry.old).enumerate() {
+    for (index, entry) in conversation.iter().enumerate() {
         // A conversation that restarted opens with the summary it restarted from.
         // Numbering goes on across restarts, so its number tells even once `old` is erased.
         let summary = index == 0 && entry.number > 1 && matches!(entry.message, Message::Answer(_));

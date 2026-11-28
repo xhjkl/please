@@ -31,7 +31,7 @@ fn messages_round_trip_through_plain_files() -> Result<()> {
         .into_iter()
         .filter(|message| !matches!(message, Message::Note(_)))
         .collect();
-    assert_eq!(room.conversation()?, kept);
+    assert_eq!(room.history()?, kept);
     let user = std::fs::read_to_string(room.dir().join("00000002"))?;
     assert_eq!(user, "user\n\nfind me a gc implementation");
     let call = std::fs::read_to_string(room.dir().join("00000004"))?;
@@ -66,18 +66,18 @@ fn a_restart_sets_entries_aside_and_numbering_goes_on() -> Result<()> {
     room.append(&some_messages())?;
     let summary = Message::Answer("You asked me to find a GC; next I'll read ./gc.".into());
     room.restart(std::slice::from_ref(&summary))?;
-    assert_eq!(room.conversation()?, std::slice::from_ref(&summary));
+    assert_eq!(room.history()?, std::slice::from_ref(&summary));
     assert!(room.dir().join("old/00000002").exists());
     assert!(room.dir().join("00000007").exists());
     assert_eq!(room.read("2")?, "user\n\nfind me a gc implementation");
     room.append(&[Message::User("thanks".into())])?;
-    let entries = room.entries()?;
+    let entries = room.transcript()?;
     assert_eq!(entries.len(), 8);
     assert_eq!(entries.iter().filter(|entry| entry.old).count(), 6);
     assert_eq!(entries.last().map(|entry| entry.number), Some(8));
     // Erasing what was set aside leaves the conversation and its numbering be.
     std::fs::remove_dir_all(room.dir().join("old"))?;
-    assert_eq!(room.entries()?.len(), 2);
+    assert_eq!(room.transcript()?.len(), 2);
     assert_eq!(room.next()?, 9);
     Ok(())
 }
@@ -116,7 +116,7 @@ fn foreign_files_and_unreadable_entries_cost_nothing_else() -> Result<()> {
     std::fs::write(room.dir().join("old/00000002"), "")?;
     std::fs::write(room.dir().join("00000003"), "call list_files\n\n{}")?;
     room.append(&[Message::User("still here".into())])?;
-    assert_eq!(room.conversation()?, [Message::User("still here".into())]);
+    assert_eq!(room.history()?, [Message::User("still here".into())]);
     // A restart sets entries aside without reading them.
     room.restart(&[])?;
     assert!(room.conversation()?.is_empty() && room.dir().join("old/00000001").exists());
@@ -135,7 +135,7 @@ fn odd_names_and_privacy_survive() -> Result<()> {
     });
     room.append(std::slice::from_ref(&spaced))?;
     room.append(&[Message::Answer("x".into())])?;
-    assert_eq!(room.conversation()?[0], spaced);
+    assert_eq!(room.history()?[0], spaced);
     let nameless = Message::Result(ToolResult {
         id: 1,
         name: String::new(),

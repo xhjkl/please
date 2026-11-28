@@ -73,14 +73,14 @@ pub async fn advance(
         transcript::RECALL_PAGE.min((engine.capacity as f64 * 0.1 * BYTES_PER_TOKEN) as usize);
     let mut compacted = false;
     for _ in 0..HUB_STEPS {
-        let mut history = room.conversation()?;
+        let mut history = room.history()?;
         history.extend(notes.iter().cloned());
         if !compacted && engine.fill(setting, &history)? >= COMPACT_AT {
             compacted = true;
             let base = engine.fill(setting, &[])?;
             let fits = |kept: &[Message]| Ok(engine.fill(setting, kept)? - base <= KEEP_SHARE);
-            let entries = room.entries()?;
-            let (folded, kept) = cutover(entries, fits)?;
+            let conversation = room.conversation()?;
+            let (folded, kept) = cutover(conversation, fits)?;
             // Models tend to end their turn after a message of their own.
             let resume = kept.is_empty();
             let restarted = compact(sink, engine, setting, &room, folded, kept).await;
@@ -96,7 +96,7 @@ pub async fn advance(
                     if resume {
                         notes.push(Message::Note(Note::Resume));
                     }
-                    history = room.conversation()?;
+                    history = room.history()?;
                     history.extend(notes.iter().cloned());
                 }
             }
@@ -176,8 +176,7 @@ pub async fn restart(
     let restarted = if conversation.is_empty() {
         Restarted::Empty
     } else if summarize {
-        let entries = room.entries()?;
-        let summary = compact(sink, engine, setting, &room, entries, vec![]).await?;
+        let summary = compact(sink, engine, setting, &room, conversation, vec![]).await?;
         Restarted::Summarized(summary)
     } else {
         room.restart(&[])?;
@@ -201,8 +200,8 @@ fn keep_delivery(room: &Room, id: u64, incoming: Vec<Message>) -> Result<()> {
     let mut arriving = match answers {
         true => vec![],
         false => {
-            let conversation = room.conversation()?;
-            unanswered(&conversation)
+            let history = room.history()?;
+            unanswered(&history)
         }
     };
     if !retried {
@@ -212,7 +211,7 @@ fn keep_delivery(room: &Room, id: u64, incoming: Vec<Message>) -> Result<()> {
     room.set_last_delivery(id)
 }
 
-/// Split a room's entries for its restart into those its summary is folded from and the
+/// Split a conversation for its restart into the entries its summary is folded from and the
 /// messages that follow the summary verbatim. The turn in progress follows whole if it `fits`;
 /// otherwise its request and as many of its newest steps as fit, then its request alone, then
 /// nothing, with the rest of the turn folded in.
@@ -220,11 +219,7 @@ fn cutover(
     mut entries: Vec<Entry>,
     fits: impl Fn(&[Message]) -> Result<bool>,
 ) -> Result<(Vec<Entry>, Vec<Message>)> {
-    let since = entries.iter().take_while(|entry| entry.old).count();
-    let current: Vec<_> = entries[since..]
-        .iter()
-        .map(|entry| entry.message.clone())
-        .collect();
+    let current: Vec<_> = entries.iter().map(|entry| entry.message.clone()).collect();
     let user = current
         .iter()
         .rposition(|message| matches!(message, Message::User(_)));
@@ -251,7 +246,7 @@ fn cutover(
         }
         kept
     };
-    entries.truncate(since + fold);
+    entries.truncate(fold);
     Ok((entries, kept))
 }
 
@@ -317,8 +312,8 @@ fn unanswered(kept: &[Message]) -> Vec<Message> {
         .collect()
 }
 
-/// Compact the room's conversation: fold `folded`'s entries since the last restart into one
-/// summary, a chunk at a time, and restart from it, followed by `kept`. Progress goes to the
+/// Compact the room's conversation: fold the entries in `folded` into one summary, a chunk
+/// at a time, and restart from it, followed by `kept`. Progress goes to the
 /// probe as log lines.
 async fn compact(
     sink: &mut (impl AsyncWriteExt + Unpin),

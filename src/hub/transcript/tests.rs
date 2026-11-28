@@ -24,7 +24,7 @@ fn chunks_abbreviate_bulk_and_keep_requests_whole() -> Result<(), eyre::Report> 
     let dir = TempDir::new()?;
     let room = Room::at(dir.0.join("room"))?;
     room.append(&some_messages())?;
-    let all = chunks(&room.entries()?, 1 << 20);
+    let all = chunks(&room.conversation()?, 1 << 20);
     assert_eq!(all.len(), 1);
     let text = &all[0];
     assert!(text.starts_with("[1] user\nfind me a gc implementation in this codebase"));
@@ -34,7 +34,7 @@ fn chunks_abbreviate_bulk_and_keep_requests_whole() -> Result<(), eyre::Report> 
     assert!(text.contains("[4] result of list_files, abbreviated"));
     assert!(text.ends_with("[5] answer\nNothing in ./core."));
     // A small budget splits between entries, never inside one.
-    let small = chunks(&room.entries()?, 900);
+    let small = chunks(&room.conversation()?, 900);
     assert!(small.len() > 1 && small.iter().all(|chunk| chunk.starts_with('[')));
     Ok(())
 }
@@ -46,11 +46,11 @@ fn the_message_restarted_from_is_named_even_once_old_is_erased() -> Result<(), e
     room.append(&some_messages())?;
     room.restart(&[Message::Answer("You asked me to find a GC.".into())])?;
     room.append(&[Message::User("look in ./gc".into())])?;
-    let kept = chunks(&room.entries()?, 1 << 20);
+    let kept = chunks(&room.conversation()?, 1 << 20);
     assert!(kept[0].starts_with("[6] ") && !kept[0].starts_with("[6] answer"));
     assert!(kept[0].contains("restarted from"));
     std::fs::remove_dir_all(room.dir().join("old"))?;
-    let erased = chunks(&room.entries()?, 1 << 20);
+    let erased = chunks(&room.conversation()?, 1 << 20);
     assert_eq!(erased, kept);
     Ok(())
 }
@@ -78,7 +78,7 @@ fn recall_lists_entries_and_reads_them_across_restarts() -> Result<(), eyre::Rep
     let missing = recall(&room, &json!({"entry": "99"}), RECALL_PAGE);
     assert!(missing["error"].as_str().is_some());
     // The next compaction reads the summary as such, not as an ordinary answer.
-    let next = chunks(&room.entries()?, 1 << 20);
+    let next = chunks(&room.conversation()?, 1 << 20);
     assert_eq!(next.len(), 1);
     assert!(next[0].contains("restarted from") && !next[0].contains("answer"));
     assert!(next[0].ends_with("\nYou asked me to find a GC."));

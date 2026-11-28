@@ -88,16 +88,21 @@ impl Room {
         Ok(lock)
     }
 
-    /// The transcript: every readable entry, old ones included, oldest first. Unreadable ones
-    /// are left out with a warning rather than costing the rest.
-    pub fn entries(&self) -> Result<Vec<Entry>> {
-        self.read_entries(|_| true)
+    /// The transcript: every entry, those set aside in `old` included, oldest first.
+    pub fn transcript(&self) -> Result<Vec<Entry>> {
+        self.entries(true)
     }
 
-    /// The conversation: what was said since the last restart.
-    pub fn conversation(&self) -> Result<Vec<Message>> {
-        let entries = self.read_entries(|old| !old)?;
-        Ok(entries.into_iter().map(|entry| entry.message).collect())
+    /// The conversation: the entries since the last restart, oldest first.
+    pub fn conversation(&self) -> Result<Vec<Entry>> {
+        self.entries(false)
+    }
+
+    /// The conversation as a prompt's history: its messages alone.
+    pub fn history(&self) -> Result<Vec<Message>> {
+        let conversation = self.conversation()?;
+        let messages = conversation.into_iter().map(|entry| entry.message);
+        Ok(messages.collect())
     }
 
     /// The conversation's ID: random, and new with every restart, so what a hub keeps about
@@ -204,10 +209,12 @@ impl Room {
         Ok(names)
     }
 
-    fn read_entries(&self, wanted: impl Fn(bool) -> bool) -> Result<Vec<Entry>> {
+    /// Read the entries in order, those set aside in `old` only if `old_too`. Unreadable
+    /// ones are left out with a warning rather than costing the rest.
+    fn entries(&self, old_too: bool) -> Result<Vec<Entry>> {
         let mut entries = Vec::new();
         for (number, old) in self.names()? {
-            if !wanted(old) {
+            if old && !old_too {
                 continue;
             }
             let path = self.path(number, old);
