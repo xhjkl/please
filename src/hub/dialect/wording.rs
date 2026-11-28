@@ -1,7 +1,7 @@
-//! What we tell the model, in every dialect: standing instructions, facts, notes, and the
-//! framing of piped data. Dialects only decide where each piece goes in their chat format.
-use super::prompt::PromptMessage;
-use crate::protocol::{Note, Setting};
+//! What we tell the model, in every dialect: standing instructions, the date, notes, and the
+//! framing of piped data. Dialects decide where each piece goes in their chat format, and
+//! state the effort themselves, each family of checkpoints having its own words for it.
+use crate::protocol::Note;
 
 /// The message that primes the assistant with its identity and capabilities.
 pub const ROLE: &str = r#"You are a terminal coding assistant.
@@ -98,15 +98,9 @@ This is the exact patch text to pass as the `patch` string:
     *** End Patch
 "#;
 
-/// Standing instructions first, then this invocation's facts; the instructions are the same
-/// for every invocation with this effort, so a hub can prefill them once and cache them.
-pub fn preamble(setting: &Setting) -> Vec<PromptMessage> {
-    vec![
-        PromptMessage::Effort(setting.effort),
-        PromptMessage::Instructions(ROLE.to_string()),
-        PromptMessage::Instructions(TOOL_GUIDANCE.trim().to_string()),
-        PromptMessage::Fact(format!("Current date: {}", setting.today)),
-    ]
+/// Today's date, in the same words for every family.
+pub fn date(today: &str) -> String {
+    format!("Current date: {today}")
 }
 
 /// What precedes piped data, which follows verbatim as a message of its own: the message's
@@ -162,7 +156,7 @@ fn pending(ids: &[u64]) -> String {
     )
 }
 
-/// How to write the summary a room restarts from, one transcript chunk at a time.
+/// How to write the summary a conversation restarts from, one transcript chunk at a time.
 const SUMMARIZE: &str = r#"The context is nearly full, so this conversation will restart from a single message that you write, as yourself, to the user. You write it by reading the transcript one chunk at a time, oldest first: your message so far, if there is one, comes next, then the transcript's next chunk as a message of its own, and you answer with your message updated to cover that chunk.
 
 The message states:

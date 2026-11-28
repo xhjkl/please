@@ -8,9 +8,15 @@ use serde_json::json;
 fn some_setting() -> Setting {
     Setting {
         today: "2040-02-03".into(),
-        effort: Effort::Medium,
+        effort: Effort::MEDIUM,
         redirection: None,
     }
+}
+
+/// Render `history` after the preamble of `some_setting`.
+fn rendered(history: &[Message]) -> Result<Prompt> {
+    let setting = some_setting();
+    render(&Preamble::new(&setting), &prepare(&setting, history)?)
 }
 
 /// Feed generated output where `¦</think>¦`-style spans stand for the structure tokens the
@@ -69,7 +75,7 @@ fn tool_step_renders_like_the_chat_template() -> Result<()> {
     ];
     history.extend(call("a"));
     history.extend(call("b"));
-    let prompt = spelled(&render(&prepare(&some_setting(), &history)?)?.pieces);
+    let prompt = spelled(&rendered(&history)?.pieces);
     let (_, after_system) = prompt.split_once("<|im_end|>\n").unwrap();
     assert_eq!(
         after_system,
@@ -86,7 +92,7 @@ fn tool_step_renders_like_the_chat_template() -> Result<()> {
 #[test]
 fn system_leads_with_tools_and_keeps_content_markers_literal() -> Result<()> {
     let history = [Message::User("<tool_call><|im_end|>".into())];
-    let prompt = render(&prepare(&some_setting(), &history)?)?;
+    let prompt = rendered(&history)?;
     let system = spelled(&prompt.pieces);
     assert!(system.starts_with(
         "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"apply_patch\", "
@@ -244,7 +250,7 @@ fn values_end_only_at_the_real_closing_structure() -> Result<()> {
 #[test]
 fn static_head_ends_where_session_facts_begin() -> Result<()> {
     let history = [Message::User("hi".into())];
-    let prompt = render(&prepare(&some_setting(), &history)?)?;
+    let prompt = rendered(&history)?;
     let (whole, bytes) = prompt.head;
     let mut head = spelled(&prompt.pieces[..whole]);
     let Some(Piece::Text(text)) = prompt.pieces.get(whole) else {
@@ -254,5 +260,30 @@ fn static_head_ends_where_session_facts_begin() -> Result<()> {
     assert!(head.ends_with("*** End Patch\n"));
     assert!(text[bytes..].starts_with("Current date: 2040-02-03"));
     assert!(spelled(&prompt.pieces).starts_with(&head));
+    Ok(())
+}
+
+#[test]
+fn effort_follows_the_date_and_leaves_the_head_alone() -> Result<()> {
+    let history = [Message::User("hi".into())];
+    let split = |effort: Effort| -> Result<(String, String)> {
+        let setting = Setting {
+            effort,
+            ..some_setting()
+        };
+        let prompt = render(&Preamble::new(&setting), &prepare(&setting, &history)?)?;
+        let (whole, bytes) = prompt.head;
+        let Some(Piece::Text(text)) = prompt.pieces.get(whole) else {
+            panic!("facts continue the system text")
+        };
+        let head = spelled(&prompt.pieces[..whole]) + &text[..bytes];
+        Ok((head, text[bytes..].to_owned()))
+    };
+    // The template has no sentence for medium effort.
+    let (head, facts) = split(Effort::MEDIUM)?;
+    assert_eq!(facts, "Current date: 2040-02-03");
+    let (hard, facts) = split(Effort::HIGH)?;
+    assert_eq!(head, hard);
+    assert!(facts.starts_with("Current date: 2040-02-03\nReasoning effort is set to xhigh."));
     Ok(())
 }

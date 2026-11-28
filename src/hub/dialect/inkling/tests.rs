@@ -2,6 +2,15 @@ use super::*;
 use crate::hub::dialect::piece::{special, spelled};
 use PromptMessage::*;
 
+/// A preamble of one instruction, a date, and low effort.
+fn some_preamble() -> Preamble {
+    Preamble {
+        instructions: vec!["Static instructions."],
+        today: "2040-02-03".into(),
+        effort: Effort::LOW,
+    }
+}
+
 #[test]
 fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Result<()> {
     let call = |name: &str, arguments| {
@@ -15,9 +24,6 @@ fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Resul
         content: content.to_owned(),
     };
     let messages = [
-        Effort(crate::protocol::Effort::Low),
-        Instructions("Static instructions.".into()),
-        Fact("Current date: 2040-02-03".into()),
         User("  Run both.  ".into()),
         Thinking(" plan ".into()),
         call(
@@ -34,7 +40,7 @@ fn replays_parallel_calls_and_a_tool_only_step_as_the_checkpoint_does() -> Resul
         ),
         result("control_command", r#"{"status":"finished"}"#),
     ];
-    let (pieces, head) = render(&messages)?;
+    let (pieces, head) = render(&some_preamble(), &messages)?;
     assert_eq!(
         &pieces[..3],
         &[
@@ -103,14 +109,14 @@ fn carrying(text: &str) -> Vec<PromptMessage> {
 fn literal_markers_in_content_stay_text() -> Result<()> {
     let literal = format!(r#"{{"stdin":"{}"}}"#, SPELLED.concat());
     let markers = |text: &str| -> Result<usize> {
-        let (pieces, _) = render(&carrying(text))?;
+        let (pieces, _) = render(&some_preamble(), &carrying(text))?;
         let markers = pieces
             .iter()
             .filter(|piece| matches!(piece, Piece::Marker(_)));
         Ok(markers.count())
     };
     assert_eq!(markers(&literal)?, markers("x")?);
-    let (pieces, _) = render(&carrying(&literal))?;
+    let (pieces, _) = render(&some_preamble(), &carrying(&literal))?;
     assert!(pieces.contains(&Piece::Text(literal.clone())));
     Ok(())
 }
@@ -131,7 +137,7 @@ fn literal_markers_stay_text_on_the_checkpoint_tokenizer() -> Result<()> {
     let controls = |tokens: &[u32]| tokens.iter().filter(|token| ids.contains(token)).count();
     let spelled = SPELLED.concat();
     assert_eq!(controls(&tokenizer.encode(&spelled)?), 0);
-    let prompt = |text: &str| encode(tokenizer, &carrying(text));
+    let prompt = |text: &str| encode(tokenizer, &some_preamble(), &carrying(text));
     let literal = format!(r#"{{"stdin":"{spelled}"}}"#);
     assert_eq!(
         controls(&prompt(&literal)?.tokens),

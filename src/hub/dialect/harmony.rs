@@ -7,11 +7,13 @@
 //! tokenizer encodes the text; its vocabulary is the encoding's, so nothing is downloaded.
 //! The system message is the encoder's canonical one; please's instructions and tool schemas
 //! form the developer message, as gpt-oss's chat template places them. Unlike that template,
-//! the preamble's own "Current date" line stays in the instructions rather than moving into
-//! the system message.
+//! the "Current date" line comes in a second developer message rather than in the system
+//! message, so the head outlasts the day. The reasoning line stays in the system message, the
+//! one place gpt-oss heeds it, so its head differs by effort.
 use super::OutputParser;
 use super::piece::{Piece, encode_prompt};
-use super::prompt::{FunctionCall, PromptMessage, Rendered, split_preamble, tool_schemas};
+use super::prompt::{FunctionCall, Grade, Preamble, PromptMessage, Rendered, tool_schemas};
+use super::wording;
 use crate::protocol::Effort;
 use eyre::Result;
 use oco::Tokenizer;
@@ -104,17 +106,14 @@ impl Prompt {
     }
 }
 
-/// Render a whole history, opening with the canonical system and developer messages and
-/// ending in the assistant's open turn; also return how many pieces form the static head.
-fn render(messages: &[PromptMessage]) -> (Prompt, usize) {
+/// Render the preamble and worded history, opening with the canonical system and developer
+/// messages and ending in the assistant's open turn; also return how many pieces form the
+/// static head.
+fn render(preamble: &Preamble, messages: &[PromptMessage]) -> (Prompt, usize) {
     let mut prompt = Prompt::default();
-    let mut head = 0;
-    if !messages.is_empty() {
-        let (preamble, rest) = split_preamble(messages);
-        head = header(&mut prompt, preamble);
-        for message in rest {
-            frame(&mut prompt, message);
-        }
+    let head = header(&mut prompt, preamble);
+    for message in messages {
+        frame(&mut prompt, message);
     }
     prompt.marker(START);
     prompt.text("assistant");
@@ -122,29 +121,17 @@ fn render(messages: &[PromptMessage]) -> (Prompt, usize) {
 }
 
 /// Append the canonical system message with the requested effort, then please's instructions
-/// and tools, then a second developer message with this invocation's facts. Keeping the facts
-/// out of the first developer message leaves the tool declarations in the static, cacheable
-/// head while the facts keep developer authority. Returns how many pieces the first two
-/// messages took.
-fn header(prompt: &mut Prompt, preamble: &[PromptMessage]) -> usize {
-    let mut effort = "medium";
-    let mut instructions = Vec::new();
-    let mut facts = Vec::new();
-    for message in preamble {
-        match message {
-            PromptMessage::Effort(level) => {
-                effort = match level {
-                    Effort::High => "high",
-                    Effort::Low => "low",
-                    Effort::Medium => "medium",
-                }
-            }
-            PromptMessage::Instructions(text) => instructions.push(text.trim()),
-            PromptMessage::Fact(text) => facts.push(text.trim()),
-            _ => {}
-        }
-    }
-    let system = format!("{IDENTITY}\n\nReasoning: {effort}\n\n{CHANNELS}");
+/// and tools, then a second developer message with the date. Keeping the date out of the
+/// first two leaves the tool declarations in the cacheable head while the date keeps
+/// developer authority. Returns how many pieces the first two messages took.
+fn header(prompt: &mut Prompt, preamble: &Preamble) -> usize {
+    let instructions: Vec<_> = preamble
+        .instructions
+        .iter()
+        .map(|text| text.trim())
+        .collect();
+    let reasoning = reasoning(preamble.effort);
+    let system = format!("{IDENTITY}\n\n{reasoning}\n\n{CHANNELS}");
     let developer = format!(
         "# Instructions\n\n{}\n\n{}",
         instructions.join("\n\n"),
@@ -153,11 +140,21 @@ fn header(prompt: &mut Prompt, preamble: &[PromptMessage]) -> usize {
     prompt.message(Header::of("system"), &system);
     prompt.message(Header::of("developer"), &developer);
     let head = prompt.pieces.len();
-    if !facts.is_empty() {
-        let facts = format!("# Instructions\n\n{}", facts.join("\n\n"));
-        prompt.message(Header::of("developer"), &facts);
-    }
+    let today = wording::date(&preamble.today);
+    let facts = format!("# Instructions\n\n{today}");
+    prompt.message(Header::of("developer"), &facts);
     head
+}
+
+/// The requested effort as the encoder's reasoning line, at the nearest of the three levels
+/// it names. The line works only in the system message: in a developer message it changed
+/// how long gpt-oss thought by about a tenth, against more than fivefold where it was trained.
+fn reasoning(effort: Effort) -> &'static str {
+    match Grade::of(effort) {
+        Grade::Low => "Reasoning: low",
+        Grade::Medium => "Reasoning: medium",
+        Grade::High => "Reasoning: high",
+    }
 }
 
 /// Declare please's tools as the encoder's TypeScript `functions` namespace.
@@ -229,10 +226,7 @@ fn frame(prompt: &mut Prompt, message: &PromptMessage) {
         ..Header::default()
     };
     match message {
-        PromptMessage::Effort(_) => {}
-        PromptMessage::Instructions(content)
-        | PromptMessage::Fact(content)
-        | PromptMessage::Note(content) => prompt.message(Header::of("developer"), content),
+        PromptMessage::Note(content) => prompt.message(Header::of("developer"), content),
         PromptMessage::User(content) => prompt.message(Header::of("user"), content),
         PromptMessage::Answer(content) => prompt.message(assistant("final"), content),
         PromptMessage::Thinking(content) if content.is_empty() => {}
@@ -260,9 +254,13 @@ fn frame(prompt: &mut Prompt, message: &PromptMessage) {
     }
 }
 
-/// Encode worded messages as Harmony, over the checkpoint's own vocabulary.
-pub fn encode(tokenizer: &Tokenizer, messages: &[PromptMessage]) -> Result<Rendered> {
-    let (prompt, head) = render(messages);
+/// Encode the preamble and worded messages as Harmony, over the checkpoint's own vocabulary.
+pub fn encode(
+    tokenizer: &Tokenizer,
+    preamble: &Preamble,
+    messages: &[PromptMessage],
+) -> Result<Rendered> {
+    let (prompt, head) = render(preamble, messages);
     encode_prompt(tokenizer, &prompt.pieces, head)
 }
 

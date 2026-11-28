@@ -10,7 +10,7 @@ fn some_advance(messages: Vec<Message>) -> Frame {
         },
         setting: Setting {
             today: "2040-02-03".into(),
-            effort: Effort::Medium,
+            effort: Effort::MEDIUM,
             redirection: None,
         },
         id: 1,

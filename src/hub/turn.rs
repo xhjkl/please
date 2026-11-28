@@ -1,7 +1,7 @@
 //! The hub's part of a turn, in the place's room: keep what the probe delivers, compact the
 //! conversation when it nears the context's end, generate, run the hub's own tools, and keep
 //! each step. The probe sends only what is new; the conversation so far lives in the room.
-use super::dialect::{Delta, FunctionCall, prompting};
+use super::dialect::{Delta, FunctionCall, wording};
 use super::inference::{self, Engine, clipping};
 use super::rooms::{Entry, Room};
 use super::transcript;
@@ -107,7 +107,7 @@ pub async fn advance(
         let calls = match step.calls {
             Err(error) => {
                 // No call is kept for what could not be parsed, so its result has its own ID.
-                let content = prompting::unparsed(&error);
+                let content = wording::unparsed(&error);
                 kept.push(result(entry(&kept), "tool_call_parse_error", content));
                 room.append(&kept)?;
                 continue;
@@ -127,7 +127,7 @@ pub async fn advance(
             let (line, content) = match refused(call) {
                 true => (
                     format!("skipped a repeated {} call", call.name),
-                    prompting::repeated(),
+                    wording::repeated(),
                 ),
                 false => (
                     format!("recall {}", call.arguments),
@@ -327,7 +327,7 @@ fn unanswered(kept: &[Message]) -> Vec<Message> {
     kept[kept.len() - open..]
         .iter()
         .map(|message| match message {
-            Message::Call(call) => result(call.id, &call.name, prompting::unrecorded()),
+            Message::Call(call) => result(call.id, &call.name, wording::unrecorded()),
             _ => unreachable!("only calls end the conversation here"),
         })
         .collect()
@@ -497,7 +497,7 @@ mod tests {
         let answer = Message::Result(ToolResult {
             id: 6,
             name: "run_command".into(),
-            content: prompting::unrecorded(),
+            content: wording::unrecorded(),
         });
         assert_eq!(conversation[6], answer);
         assert_eq!(conversation[7], Message::User("next".into()));

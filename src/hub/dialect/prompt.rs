@@ -1,20 +1,61 @@
-//! The worded form of a prompt, between the protocol's neutral messages and a dialect's
-//! framing, with what every dialect needs to prepare it.
-use super::prompting;
+//! A prompt before framing: its preamble, and its messages as worded from the protocol's
+//! neutral history, with what every dialect needs to prepare them.
+use super::wording;
 use crate::protocol::{Effort, Message, Note, Setting};
 use crate::tools::{ParamKind, Spec};
 use eyre::{Result, WrapErr};
 use serde_json::{Map, Value, json};
 
-/// One message of a prompt, worded and ready for a dialect to frame.
+/// What opens every prompt. The instructions are the same for every invocation, so with the
+/// tool declarations they make the head a hub may prefill once and cache. This invocation's
+/// facts, the date and the effort, each family states in its own words: after the head,
+/// unless the family heeds one only inside it, as gpt-oss does the effort.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Preamble {
+    pub instructions: Vec<&'static str>,
+    pub today: String,
+    pub effort: Effort,
+}
+
+impl Preamble {
+    /// Open a prompt for an invocation in `setting`.
+    pub fn new(setting: &Setting) -> Self {
+        Self {
+            instructions: vec![wording::ROLE, wording::TOOL_GUIDANCE.trim()],
+            today: setting.today.clone(),
+            effort: setting.effort,
+        }
+    }
+}
+
+/// The effort as a family with only three names for it hears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grade {
+    Low,
+    Medium,
+    High,
+}
+
+impl Grade {
+    /// Name the effort whose level on Inkling's scale is nearest to `effort`'s, so each of
+    /// `PLEASE_TRY`'s words comes back as itself.
+    pub fn of(effort: Effort) -> Self {
+        let level = effort.level();
+        let halfway = |one: Effort, other: Effort| (one.level() + other.level()) / 2.0;
+        if level < halfway(Effort::LOW, Effort::MEDIUM) {
+            return Self::Low;
+        }
+        if level < halfway(Effort::MEDIUM, Effort::HIGH) {
+            return Self::Medium;
+        }
+        Self::High
+    }
+}
+
+/// One message of a prompt after its preamble: a `Message` as the model reads it, with notes
+/// in words and calls as dialects write them, ready for a dialect to frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptMessage {
-    /// Requested reasoning effort, stated wherever each dialect's chat template expects it.
-    Effort(Effort),
-    /// The harness's standing instructions, the same for every invocation.
-    Instructions(String),
-    /// A fact about this invocation (the date), placed after all standing text.
-    Fact(String),
     /// The harness's word in the middle of a turn.
     Note(String),
     User(String),
@@ -35,19 +76,8 @@ pub struct FunctionCall {
     pub arguments: Value,
 }
 
-/// Split off the leading entries that dialects fold into their header.
-pub fn split_preamble(messages: &[PromptMessage]) -> (&[PromptMessage], &[PromptMessage]) {
-    let preamble = messages.iter().take_while(|message| {
-        matches!(
-            message,
-            PromptMessage::Effort(_) | PromptMessage::Instructions(_) | PromptMessage::Fact(_)
-        )
-    });
-    messages.split_at(preamble.count())
-}
-
-/// Encoded prompt and how many of its leading tokens are the same for every invocation
-/// with this effort: the part a hub may prefill once and cache.
+/// Encoded prompt and how many of its leading tokens are the same for every invocation, at
+/// this effort where the family's head holds it: the head a hub may prefill once and cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
     pub tokens: Vec<u32>,
@@ -180,27 +210,26 @@ pub fn fit_command_results(
     Ok(())
 }
 
-/// Word the setting and the history: standing instructions first, then per-invocation facts,
-/// the history itself, and where the answer goes last, so a different redirect leaves
+/// Word the history for the model, with where the answer goes last, so a different redirect
 /// leaves everything before it reusable.
 pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<PromptMessage>> {
-    let mut out = prompting::preamble(setting);
+    let mut out = Vec::new();
     for message in history {
         let worded = match message {
             Message::User(text) => PromptMessage::User(text.clone()),
             Message::Input(data) => {
-                out.push(PromptMessage::Note(prompting::INPUT.into()));
+                out.push(PromptMessage::Note(wording::INPUT.into()));
                 PromptMessage::User(data.clone())
             }
             // The draft is the model's own message, and the chunk is material, not instructions.
             Message::Note(note @ Note::Summarize { draft, chunk }) => {
-                out.push(PromptMessage::Note(prompting::note(note)));
+                out.push(PromptMessage::Note(wording::note(note)));
                 if let Some(draft) = draft {
                     out.push(PromptMessage::Answer(draft.clone()));
                 }
                 PromptMessage::User(chunk.clone())
             }
-            Message::Note(note) => PromptMessage::Note(prompting::note(note)),
+            Message::Note(note) => PromptMessage::Note(wording::note(note)),
             Message::Thinking(text) => PromptMessage::Thinking(text.clone()),
             Message::Answer(text) => PromptMessage::Answer(text.clone()),
             Message::Call(call) => PromptMessage::ToolCall(FunctionCall {
@@ -216,7 +245,7 @@ pub fn prepare(setting: &Setting, history: &[Message]) -> Result<Vec<PromptMessa
         out.push(worded);
     }
     if let Some(target) = &setting.redirection {
-        out.push(PromptMessage::Note(prompting::redirection(target)));
+        out.push(PromptMessage::Note(wording::redirection(target)));
     }
     Ok(out)
 }

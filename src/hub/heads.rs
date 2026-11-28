@@ -10,8 +10,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Heads kept across all checkpoints, least recently used out first: one per reasoning effort
-/// of the default model, whose sentence opens its prompt, plus the fallback's.
+/// Heads kept across all checkpoints, least recently used out first; a checkpoint has one,
+/// or one per effort for gpt-oss, whose head holds it.
 const KEPT: usize = 4;
 
 /// Where cached heads live, beside `~/.please/weights`.

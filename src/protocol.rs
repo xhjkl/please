@@ -2,16 +2,36 @@
 use eyre::{Result, eyre};
 use serde::{Deserialize, Serialize};
 
-/// How hard the model should think before answering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Effort {
-    Low,
-    Medium,
-    High,
+/// How hard the model should think before answering, as a level on Inkling's scale from 0
+/// to 1. Other families of checkpoints hear the nearest effort they have a name for.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Effort(f32);
+
+impl Effort {
+    /// What `PLEASE_TRY=light` stands for.
+    pub const LOW: Self = Self(0.2);
+    /// What `PLEASE_TRY=medium` stands for, and the default.
+    pub const MEDIUM: Self = Self(0.7);
+    /// What `PLEASE_TRY=hard` stands for.
+    pub const HIGH: Self = Self(0.9);
+
+    /// An effort at `level`, if that lies on the scale.
+    pub fn new(level: f32) -> Option<Self> {
+        (0.0..=1.0).contains(&level).then_some(Self(level))
+    }
+
+    /// The level on Inkling's scale.
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub fn level(self) -> f32 {
+        self.0
+    }
 }
 
 /// Facts about this invocation that the hub states to the model; they hold for every message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Setting {
     pub today: String,
     pub effort: Effort,

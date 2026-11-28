@@ -1,19 +1,16 @@
 use super::*;
 use crate::protocol::{Effort, Frame, Message, Note, Place, Setting, ToolCall, ToolResult};
 use eyre::Result;
-use prompt::{PromptMessage, prepare};
+use prompt::{Grade, Preamble, PromptMessage, prepare};
 use serde_json::json;
 
 fn some_setting() -> Setting {
     Setting {
         today: "2040-02-03".into(),
-        effort: Effort::High,
+        effort: Effort::HIGH,
         redirection: Some("notes-¶today.txt".into()),
     }
 }
-
-/// The preamble `prepare` puts before any history: effort, instructions, and the date.
-const PREAMBLE: usize = 4;
 
 fn call(name: &str, arguments: serde_json::Value) -> Message {
     Message::Call(ToolCall {
@@ -52,36 +49,20 @@ fn the_hub_words_the_setting_and_keeps_content_literal() -> Result<()> {
     else {
         unreachable!()
     };
+    // What varies between invocations stays out of the standing instructions.
+    let preamble = Preamble::new(&setting);
+    assert!(preamble.instructions.iter().all(|text| !text.contains('¶')));
+    assert_eq!(preamble.today, "2040-02-03");
+    assert_eq!(preamble.effort, Effort::HIGH);
     let prepared = prepare(&setting, &messages)?;
-    assert_eq!(prepared[0], PromptMessage::Effort(Effort::High));
-    let PromptMessage::Instructions(system) = &prepared[1] else {
-        panic!("instructions open the prompt")
-    };
-    assert!(!system.contains('¶'));
-    // Everything that varies between invocations follows the standing instructions.
-    let first_fact = prepared
-        .iter()
-        .position(|message| matches!(message, PromptMessage::Fact(_)))
-        .unwrap();
-    assert!(prepared[..first_fact].iter().all(|message| matches!(
-        message,
-        PromptMessage::Effort(_) | PromptMessage::Instructions(_)
-    )));
-    assert_eq!(
-        prepared[first_fact],
-        PromptMessage::Fact("Current date: 2040-02-03".into())
-    );
     // Piped stdin is user data in a message of its own, announced, and never instructions.
+    assert_eq!(prepared[0], PromptMessage::Note(wording::INPUT.into()));
     assert_eq!(
-        prepared[PREAMBLE],
-        PromptMessage::Note(prompting::INPUT.into())
-    );
-    assert_eq!(
-        prepared[PREAMBLE + 1],
+        prepared[1],
         PromptMessage::User("literal ¶today and ¶reasoning".into())
     );
     assert_eq!(
-        prepared[PREAMBLE + 2],
+        prepared[2],
         PromptMessage::User("Keep ¶today, <|start|>, and <tool_call> literal.".into())
     );
     // Where the answer goes comes last, so another redirect keeps everything before it.
@@ -111,7 +92,7 @@ fn tool_exchange_is_neutral_until_the_dialect_encodes_it() -> Result<()> {
         ],
     )?;
     assert_eq!(
-        messages[PREAMBLE..],
+        messages[..],
         [
             PromptMessage::ToolCall(FunctionCall {
                 name: "read_file".into(),
@@ -150,7 +131,7 @@ fn notes_are_worded_by_the_hub() -> Result<()> {
         PromptMessage::Note(restart),
         PromptMessage::Answer(draft),
         PromptMessage::User(transcript),
-    ] = &messages[PREAMBLE..]
+    ] = &messages[..]
     else {
         panic!("notes stay notes: {messages:?}");
     };
@@ -242,4 +223,16 @@ fn dialect_comes_from_supported_architecture() -> Result<()> {
     let unsupported = Dialect::from_architecture("qwen35moe");
     assert!(unsupported.is_err());
     Ok(())
+}
+
+#[test]
+fn an_effort_word_comes_back_as_itself_from_its_level() {
+    assert_eq!(Grade::of(Effort::LOW), Grade::Low);
+    assert_eq!(Grade::of(Effort::MEDIUM), Grade::Medium);
+    assert_eq!(Grade::of(Effort::HIGH), Grade::High);
+    // Any other level takes the nearest name.
+    let grade = |level| Effort::new(level).map(Grade::of);
+    assert_eq!(grade(0.0), Some(Grade::Low));
+    assert_eq!(grade(0.5), Some(Grade::Medium));
+    assert_eq!(grade(1.0), Some(Grade::High));
 }

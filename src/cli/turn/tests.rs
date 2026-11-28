@@ -12,7 +12,7 @@ fn some_place() -> Place {
 fn some_setting() -> Setting {
     Setting {
         today: "2040-02-03".into(),
-        effort: Effort::Medium,
+        effort: Effort::MEDIUM,
         redirection: None,
     }
 }

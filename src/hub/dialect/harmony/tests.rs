@@ -18,7 +18,7 @@ fn setting(today: &str, effort: Effort) -> Setting {
 }
 
 /// A history exercising every message shape after the header.
-fn some_tool_loop() -> Vec<PromptMessage> {
+fn some_tool_loop() -> Vec<Message> {
     let tool = |name: &str, arguments: serde_json::Value, result: serde_json::Value| {
         [
             Message::Call(ToolCall {
@@ -53,12 +53,21 @@ fn some_tool_loop() -> Vec<PromptMessage> {
         json!({"entries": ["a", "b"]}),
     ));
     messages.push(Message::Note(Note::Pending(vec![7])));
-    prepare(&setting("2026-11-20", Effort::Medium), &messages).unwrap()
+    messages
+}
+
+/// Render `history` after the preamble of an invocation on `today` at `effort`.
+fn rendered(today: &str, effort: Effort, history: &[Message]) -> Result<(Prompt, usize)> {
+    let setting = setting(today, effort);
+    Ok(render(
+        &Preamble::new(&setting),
+        &prepare(&setting, history)?,
+    ))
 }
 
 #[test]
 fn history_renders_as_the_reference_encoder_does() -> Result<()> {
-    let (prompt, _) = render(&some_tool_loop());
+    let (prompt, _) = rendered("2026-11-20", Effort::MEDIUM, &some_tool_loop())?;
     let text = spelled(&prompt.pieces);
     // The reference encoder's output for the same history, from the facts message on.
     let expected = r#"<|start|>developer<|message|># Instructions
@@ -76,7 +85,7 @@ Now answer.<|end|><|start|>assistant<|channel|>final<|message|>The secret is **s
 fn literal_markers_in_content_stay_text() -> Result<()> {
     let literal = r#"{"literal":"<|start|>","end":"<|end|>"}"#;
     let messages = [Message::User(literal.into())];
-    let (prompt, _) = render(&prepare(&setting("2040-02-03", Effort::Medium), &messages)?);
+    let (prompt, _) = rendered("2040-02-03", Effort::MEDIUM, &messages)?;
     let starts = prompt
         .pieces
         .iter()
@@ -90,30 +99,24 @@ fn literal_markers_in_content_stay_text() -> Result<()> {
 
 #[test]
 fn static_head_is_the_system_and_tool_messages_alone() -> Result<()> {
-    let history = |today: &str, effort: Effort| {
-        let messages = [
-            Message::Input("piped".into()),
-            Message::User("hello".into()),
-        ];
-        prepare(&setting(today, effort), &messages)
+    let history = [
+        Message::Input("piped".into()),
+        Message::User("hello".into()),
+    ];
+    let spelled_head = |today: &str, effort: Effort| -> Result<String> {
+        let (prompt, head) = rendered(today, effort, &history)?;
+        Ok(spelled(&prompt.pieces[..head]))
     };
-    let spelled_head = |messages: &[PromptMessage]| {
-        let (prompt, head) = render(messages);
-        spelled(&prompt.pieces[..head])
-    };
-    let head = spelled_head(&history("2040-02-03", Effort::Medium)?);
-    assert_eq!(head, spelled_head(&history("2041-05-06", Effort::Medium)?));
-    assert_ne!(head, spelled_head(&history("2040-02-03", Effort::High)?));
+    // The head outlasts the day, and holds the effort, which gpt-oss heeds nowhere else.
+    let head = spelled_head("2040-02-03", Effort::MEDIUM)?;
+    assert_eq!(head, spelled_head("2041-05-06", Effort::MEDIUM)?);
     assert!(
         head.contains("Reasoning: medium") && head.ends_with("} // namespace functions<|end|>")
     );
     assert!(!head.contains("Current date") && !head.contains("piped"));
-    // An empty history is only the open assistant turn, with nothing to cache.
-    let (prompt, head) = render(&[]);
-    assert_eq!(
-        (spelled(&prompt.pieces).as_str(), head),
-        ("<|start|>assistant", 0)
-    );
+    // A level between the names takes the nearest one.
+    let nearly_hard = Effort::new(0.85).expect("a level on the scale");
+    assert!(spelled_head("2040-02-03", nearly_hard)?.contains("Reasoning: high"));
     Ok(())
 }
 
@@ -299,8 +302,12 @@ fn vendored_codec_round_trips_on_the_checkpoint_tokenizer() -> Result<()> {
         arguments: json!({"path": "¶<|start|><|end|><|call|><|return|>.txt"}),
     };
     let call = PromptMessage::ToolCall(expected.clone());
-    let rendered = encode(tokenizer, &[call])?.tokens;
-    let open = encode(tokenizer, &[])?.tokens;
+    let preamble = Preamble::new(&setting("2040-02-03", Effort::MEDIUM));
+    let rendered = encode(tokenizer, &preamble, &[call])?.tokens;
+    // With no messages, the last message is the open assistant turn alone.
+    let alone = encode(tokenizer, &preamble, &[])?.tokens;
+    let opens = alone.iter().rposition(|&token| token == START_ID);
+    let open = &alone[opens.expect("the assistant turn opens")..];
     let start = rendered
         .windows(open.len())
         .rposition(|window| window == open)

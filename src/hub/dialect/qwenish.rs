@@ -4,10 +4,13 @@
 //! inserted by ID, so marker spellings inside user, stdin, or tool content stay ordinary text.
 //! Deliberate departures from the template: such literal markers are never promoted to
 //! control tokens; instructions that arrive mid-prompt become user messages instead of
-//! an error; and tool exchanges with no intervening assistant entry share one assistant step.
+//! an error; tool exchanges with no intervening assistant entry share one assistant step; and
+//! the template's effort sentences follow the instructions, after the date, rather than open
+//! the system message, so one head serves every effort.
 use super::OutputParser;
 use super::piece::{Piece, encode_pieces, special};
-use super::prompt::{FunctionCall, PromptMessage, Rendered, split_preamble};
+use super::prompt::{FunctionCall, Grade, Preamble, PromptMessage, Rendered};
+use super::wording;
 use crate::protocol::Effort;
 use eyre::{Result, eyre};
 use oco::Tokenizer;
@@ -21,16 +24,17 @@ const CALL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply
 /// Control tokens that the template's own instruction text spells out.
 const MARKERS: [&str; 2] = ["<tool_call>", "</tool_call>"];
 
-/// The template's effort sentences; medium, which is also please's default, has none.
-fn effort_instructions(effort: Effort) -> Option<&'static str> {
-    match effort {
-        Effort::High => Some(
+/// The requested effort in the template's own sentences, at the nearest effort it has any
+/// for; medium, which is also please's default, has none.
+fn effort(requested: Effort) -> Option<&'static str> {
+    match Grade::of(requested) {
+        Grade::High => Some(
             "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
         ),
-        Effort::Low => Some(
+        Grade::Low => Some(
             "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
         ),
-        Effort::Medium => None,
+        Grade::Medium => None,
     }
 }
 
@@ -145,13 +149,9 @@ impl Prompt {
 
     /// Lead with tools, then the merged leading system and developer messages, as the template does.
     /// Static instructions precede per-invocation facts, so everything before the facts is cacheable.
-    fn system(&mut self, effort: Option<Effort>, instructions: &str, facts: &str) {
+    fn system(&mut self, instructions: &str, facts: &str) {
         self.marker("<|im_start|>");
         self.text("system\n");
-        if let Some(instructions) = effort.and_then(effort_instructions) {
-            self.text(instructions);
-            self.text("\n\n");
-        }
         self.text("# Tools\n\nYou have access to the following functions:\n\n<tools>");
         for schema in super::prompt::tool_schemas() {
             self.text("\n");
@@ -227,29 +227,23 @@ impl Prompt {
     }
 }
 
-/// Render neutral history into template pieces, ending with an open assistant turn in thinking.
-fn render(messages: &[PromptMessage]) -> Result<Prompt> {
+/// Render the preamble and worded history into template pieces, ending with an open assistant
+/// turn in thinking.
+fn render(preamble: &Preamble, messages: &[PromptMessage]) -> Result<Prompt> {
     use PromptMessage::*;
     let mut prompt = Prompt::default();
-    let (preamble, mut rest) = split_preamble(messages);
-    if !messages.is_empty() {
-        let mut effort = None;
-        let mut instructions = Vec::new();
-        let mut facts = Vec::new();
-        for message in preamble {
-            match message {
-                Effort(level) => effort = Some(*level),
-                Instructions(text) if !text.trim().is_empty() => instructions.push(text.trim()),
-                Fact(text) if !text.trim().is_empty() => facts.push(text.trim()),
-                _ => {}
-            }
-        }
-        prompt.system(effort, &instructions.join("\n"), &facts.join("\n"));
-    }
+    let instructions: Vec<_> = preamble
+        .instructions
+        .iter()
+        .map(|text| text.trim())
+        .collect();
+    let mut facts = vec![wording::date(&preamble.today)];
+    facts.extend(effort(preamble.effort).map(String::from));
+    prompt.system(&instructions.join("\n"), &facts.join("\n"));
+    let mut rest = messages;
     while let Some(first) = rest.first() {
         match first {
-            Effort(_) => rest = &rest[1..],
-            Instructions(text) | Fact(text) | Note(text) | User(text) => {
+            Note(text) | User(text) => {
                 prompt.message("user", text);
                 rest = &rest[1..];
             }
@@ -312,9 +306,13 @@ fn results(messages: &[PromptMessage]) -> Vec<&str> {
         .collect()
 }
 
-/// Encode worded messages as dense Qwen's chat template would.
-pub fn encode(tokenizer: &Tokenizer, messages: &[PromptMessage]) -> Result<Rendered> {
-    render(messages)?.encode(tokenizer)
+/// Encode the preamble and worded messages as dense Qwen's chat template would.
+pub fn encode(
+    tokenizer: &Tokenizer,
+    preamble: &Preamble,
+    messages: &[PromptMessage],
+) -> Result<Rendered> {
+    render(preamble, messages)?.encode(tokenizer)
 }
 
 /// Start decoding a response with its native XML tool calls.

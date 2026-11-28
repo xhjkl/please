@@ -42,14 +42,15 @@ impl Dialect {
         history: &[Message],
         tail_budget: usize,
     ) -> Result<Rendered> {
+        let preamble = prompt::Preamble::new(setting);
         let mut messages = prompt::prepare(setting, history)?;
         prompt::fit_command_results(&mut messages, tail_budget, |text| {
             Ok(tokenizer.encode(text)?.len())
         })?;
         match self {
-            Self::Inkling => inkling::encode(tokenizer, &messages),
-            Self::Qwenish => qwenish::encode(tokenizer, &messages),
-            Self::Harmony => harmony::encode(tokenizer, &messages),
+            Self::Inkling => inkling::encode(tokenizer, &preamble, &messages),
+            Self::Qwenish => qwenish::encode(tokenizer, &preamble, &messages),
+            Self::Harmony => harmony::encode(tokenizer, &preamble, &messages),
         }
     }
 
@@ -79,8 +80,8 @@ mod harmony;
 mod inkling;
 mod piece;
 mod prompt;
-pub(super) mod prompting;
 mod qwenish;
 #[cfg(test)]
 mod tests;
+pub(super) mod wording;
 pub(super) use prompt::{Delta, FunctionCall, Rendered};

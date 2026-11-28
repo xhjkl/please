@@ -1,7 +1,8 @@
 //! Inkling 2 chat framing from the checkpoint's `tokenizer.chat_template`.
 use super::OutputParser;
 use super::piece::{Piece, encode_prompt};
-use super::prompt::{FunctionCall, PromptMessage, Rendered, split_preamble};
+use super::prompt::{FunctionCall, Preamble, PromptMessage, Rendered};
+use super::wording;
 use crate::protocol::Effort;
 use eyre::{Result, eyre};
 use oco::Tokenizer;
@@ -50,13 +51,10 @@ fn tool_declarations() -> String {
     tools.to_string()
 }
 
-/// The checkpoint's thinking-effort scale, from 0 to 1.
-fn effort(level: Effort) -> &'static str {
-    match level {
-        Effort::Low => "0.2",
-        Effort::Medium => "0.7",
-        Effort::High => "0.9",
-    }
+/// The requested effort as the checkpoint's template states it, on its scale from 0 to 1.
+fn effort(requested: Effort) -> String {
+    // Debug formatting, so a whole level keeps its decimal point: `1.0`, not `1`.
+    format!("Thinking effort level: {:?}", requested.level())
 }
 
 /// Replay one model step and its results, which may interleave with its calls.
@@ -100,8 +98,8 @@ fn emit_call(prompt: &mut Vec<Piece>, call: &FunctionCall) -> Result<()> {
     Ok(())
 }
 
-/// Render complete messages. The next role token is sampled by the model.
-fn render(messages: &[PromptMessage]) -> Result<(Vec<Piece>, usize)> {
+/// Render the preamble and complete messages. The next role token is sampled by the model.
+fn render(preamble: &Preamble, messages: &[PromptMessage]) -> Result<(Vec<Piece>, usize)> {
     use PromptMessage::*;
     let mut prompt = Vec::new();
     let declarations = tool_declarations();
@@ -112,30 +110,16 @@ fn render(messages: &[PromptMessage]) -> Result<(Vec<Piece>, usize)> {
         "<|content_xml|>",
         &declarations,
     );
-    let (preamble, mut rest) = split_preamble(messages);
-    let mut level = crate::protocol::Effort::High;
-    let mut head = None;
-    for message in preamble {
-        match message {
-            Effort(effort) => level = *effort,
-            Instructions(text) => frame(&mut prompt, SYSTEM, "", TEXT, text),
-            Fact(text) => {
-                head.get_or_insert(prompt.len());
-                frame(&mut prompt, SYSTEM, "", TEXT, text);
-            }
-            _ => unreachable!(),
-        }
+    for instructions in &preamble.instructions {
+        frame(&mut prompt, SYSTEM, "", TEXT, instructions);
     }
-    let head = head.unwrap_or(prompt.len());
-    let level = effort(level);
-    frame(
-        &mut prompt,
-        SYSTEM,
-        "",
-        TEXT,
-        &format!("Thinking effort level: {level}"),
-    );
+    // The head ends here: what follows differs from one invocation to the next.
+    let head = prompt.len();
+    let today = wording::date(&preamble.today);
+    frame(&mut prompt, SYSTEM, "", TEXT, &today);
+    frame(&mut prompt, SYSTEM, "", TEXT, &effort(preamble.effort));
 
+    let mut rest = messages;
     while let Some((first, next)) = rest.split_first() {
         match first {
             Thinking(_) | Answer(_) | ToolCall(_) => {
@@ -143,10 +127,7 @@ fn render(messages: &[PromptMessage]) -> Result<(Vec<Piece>, usize)> {
                 rest = &rest[consumed..];
                 continue;
             }
-            Effort(_) => {}
-            Instructions(text) | Fact(text) | Note(text) => {
-                frame(&mut prompt, SYSTEM, "", TEXT, text)
-            }
+            Note(text) => frame(&mut prompt, SYSTEM, "", TEXT, text),
             User(text) => frame(&mut prompt, USER, "", TEXT, text),
             ToolResult { name, content } => frame(&mut prompt, TOOL, name, TEXT, content),
         }
@@ -155,9 +136,13 @@ fn render(messages: &[PromptMessage]) -> Result<(Vec<Piece>, usize)> {
     Ok((prompt, head))
 }
 
-/// Encode worded messages in Inkling's native framing.
-pub fn encode(tokenizer: &Tokenizer, messages: &[PromptMessage]) -> Result<Rendered> {
-    let (pieces, head) = render(messages)?;
+/// Encode the preamble and worded messages in Inkling's native framing.
+pub fn encode(
+    tokenizer: &Tokenizer,
+    preamble: &Preamble,
+    messages: &[PromptMessage],
+) -> Result<Rendered> {
+    let (pieces, head) = render(preamble, messages)?;
     encode_prompt(tokenizer, &pieces, head)
 }
 
