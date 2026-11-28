@@ -64,7 +64,7 @@ impl super::OutputParser for Parser<'_> {
 
 /// A control token that frames Harmony messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Marker {
+enum Marker {
     /// Opens a message.
     Start,
     /// Introduces the header's channel.
@@ -83,7 +83,7 @@ pub(super) enum Marker {
 
 impl Marker {
     /// Every marker, `Start` first.
-    pub(super) const ALL: [Self; 7] = [
+    const ALL: [Self; 7] = [
         Self::Start,
         Self::Channel,
         Self::Constrain,
@@ -94,7 +94,7 @@ impl Marker {
     ];
 
     /// The control token's spelling in the vocabulary, and in headers read as text.
-    pub(super) fn spelling(self) -> &'static str {
+    fn spelling(self) -> &'static str {
         match self {
             Self::Start => START,
             Self::Channel => CHANNEL,
@@ -114,7 +114,7 @@ impl Marker {
 
 /// One generated token: decoded content, which may be empty mid-character, or a marker.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum Event<'a> {
+enum Event<'a> {
     Text(&'a str),
     Marker(Marker),
 }
@@ -143,7 +143,7 @@ struct Header {
 
 /// Tokenizer-free Harmony message state machine.
 #[derive(Debug)]
-pub(super) struct Stream {
+struct Stream {
     /// The `<|start|>` ID, named when anything else arrives between messages.
     start: u32,
     state: State,
@@ -157,7 +157,7 @@ pub(super) struct Stream {
 
 impl Stream {
     /// Resume inside the assistant header that the prompt opened.
-    pub(super) fn new(start: u32) -> Self {
+    fn new(start: u32) -> Self {
         Self {
             start,
             state: State::Header {
@@ -171,7 +171,7 @@ impl Stream {
     }
 
     /// Consume one token and return the content it made visible.
-    pub(super) fn push(&mut self, token: u32, event: Event) -> Result<Vec<Delta>> {
+    fn push(&mut self, token: u32, event: Event) -> Result<Vec<Delta>> {
         match (&mut self.state, event) {
             (State::Idle, Event::Marker(Marker::Start)) => {
                 self.state = State::Header {
@@ -226,7 +226,7 @@ impl Stream {
     }
 
     /// Keep text that never formed a whole character in the message being read, unshown.
-    pub(super) fn tail(&mut self, rest: &str) {
+    fn tail(&mut self, rest: &str) {
         match &mut self.state {
             State::Header { text, .. } | State::Content { text, .. } => text.push_str(rest),
             State::Idle => {}
@@ -234,7 +234,7 @@ impl Stream {
     }
 
     /// End the response, closing a message the output limit cut off, and return its calls.
-    pub(super) fn finish(&mut self) -> Result<Vec<FunctionCall>> {
+    fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         match self.state {
             State::Header { .. } => {
                 bail!("Unexpected EOS while waiting for message header to complete");
@@ -347,3 +347,6 @@ fn parse_header(header: &str, first: bool) -> Result<Header> {
         channel,
     })
 }
+
+#[cfg(test)]
+mod tests;

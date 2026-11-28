@@ -63,7 +63,7 @@ impl OutputParser for Parser<'_> {
 
 /// One step of generated output: decoded content, or a structure token.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum Event<'a> {
+enum Event<'a> {
     Text(&'a str),
     ThinkEnd,
     CallStart,
@@ -74,7 +74,7 @@ pub(super) enum Event<'a> {
 /// Whitespace that the template puts around boundaries is structure, not content: it is
 /// dropped at the start of each section and held back until later text proves it inner.
 #[derive(Default)]
-pub(super) struct Stream {
+struct Stream {
     answering: bool,
     /// Visible text has been emitted since the last boundary.
     inner: bool,
@@ -85,7 +85,7 @@ pub(super) struct Stream {
 }
 
 impl Stream {
-    pub(super) fn push(&mut self, event: Event) -> Vec<Delta> {
+    fn push(&mut self, event: Event) -> Vec<Delta> {
         let mut deltas = Vec::new();
         match event {
             Event::Text(text) => self.text(text, &mut deltas),
@@ -165,7 +165,7 @@ impl Stream {
         });
     }
 
-    pub(super) fn finish(&mut self) -> Result<Vec<FunctionCall>> {
+    fn finish(&mut self) -> Result<Vec<FunctionCall>> {
         if self.current_call.is_some() {
             eyre::bail!("incomplete Qwen tool call");
         }
@@ -192,7 +192,7 @@ fn value_end(rest: &str, parameters: &[Param]) -> Option<(usize, usize)> {
 }
 
 /// Parse Qwen's native function/parameter blocks using the declared parameter types.
-pub(super) fn parse_call(source: &str) -> Result<FunctionCall> {
+fn parse_call(source: &str) -> Result<FunctionCall> {
     let source = source.trim();
     let source = source
         .strip_prefix("<function=")
@@ -276,3 +276,6 @@ pub(super) fn parse_call(source: &str) -> Result<FunctionCall> {
         arguments: Value::Object(arguments),
     })
 }
+
+#[cfg(test)]
+mod tests;
