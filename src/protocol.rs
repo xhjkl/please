@@ -190,7 +190,7 @@ pub async fn greet(stream: &mut tokio::net::UnixStream) -> Result<()> {
     let hello = Frame::Hello { probe: probe_id() };
     write_frame(stream, &hello).await?;
     let mut store = Vec::new();
-    let greeting = read_frame(stream, &mut store, None, None).await?;
+    let greeting = read_frame(stream, &mut store, None).await?;
     match greeting {
         Frame::Welcome => Ok(()),
         Frame::Busy => Err(HubBusy.into()),
@@ -208,19 +208,16 @@ pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin, T: serde::Serializ
     Ok(())
 }
 
-/// Read a single postcard frame from the stream, buffering as needed.
+/// Read a single postcard frame from the stream, buffering as needed. With `patience`, the
+/// whole frame must arrive within it.
 pub async fn read_frame<T: serde::de::DeserializeOwned>(
     stream: &mut tokio::net::UnixStream,
     store: &mut Vec<u8>,
-    per_read_timeout: Option<std::time::Duration>,
-    total_timeout: Option<std::time::Duration>,
+    patience: Option<std::time::Duration>,
 ) -> std::result::Result<T, ProtocolError> {
     use tokio::io::AsyncReadExt;
-    use tokio::time::Instant;
 
-    let start = Instant::now();
-    let per_read_timeout = per_read_timeout.unwrap_or(std::time::Duration::MAX);
-    let total_timeout = total_timeout.unwrap_or(std::time::Duration::MAX);
+    let deadline = patience.map(|patience| tokio::time::Instant::now() + patience);
     let mut chunk = [0u8; 4096];
 
     loop {
@@ -238,17 +235,18 @@ pub async fn read_frame<T: serde::de::DeserializeOwned>(
             }
         }
 
-        if start.elapsed() > total_timeout {
-            return Err(ProtocolError::Timeout);
-        }
-
-        let read = tokio::time::timeout(per_read_timeout, stream.read(&mut chunk)).await;
+        let read = stream.read(&mut chunk);
+        let read = match deadline {
+            Some(deadline) => {
+                let read = tokio::time::timeout_at(deadline, read).await;
+                read.map_err(|_| ProtocolError::Timeout)?
+            }
+            None => read.await,
+        };
         match read {
-            Ok(Err(e)) => return Err(ProtocolError::Io(e)),
-            Ok(Ok(0)) => return Err(ProtocolError::Disconnect),
-            // Rechecking the total deadline before reading on.
-            Err(_) => {}
-            Ok(Ok(n)) => store.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(ProtocolError::Io(e)),
+            Ok(0) => return Err(ProtocolError::Disconnect),
+            Ok(n) => store.extend_from_slice(&chunk[..n]),
         }
     }
 }

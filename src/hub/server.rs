@@ -82,9 +82,7 @@ async fn read_request(
     stream: &mut UnixStream,
     store: &mut Vec<u8>,
 ) -> std::result::Result<Frame, ProtocolError> {
-    let per_read_timeout = Some(Duration::from_millis(250));
-    let total_timeout = Some(Duration::from_secs(30));
-    read_frame(stream, store, per_read_timeout, total_timeout).await
+    read_frame(stream, store, Some(Duration::from_secs(30))).await
 }
 
 /// Wait for another request, allowing the probe to run tools before sending it.

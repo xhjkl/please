@@ -140,7 +140,7 @@ mod tests {
         let (mut hub, _) = listener.accept().await?;
         write_frame(&mut hub, &Frame::Answer("forwarded hub".into())).await?;
         let mut store = Vec::new();
-        let response: Frame = read_frame(&mut probe, &mut store, None, None).await?;
+        let response: Frame = read_frame(&mut probe, &mut store, None).await?;
         assert!(matches!(response, Frame::Answer(text) if text == "forwarded hub"));
         Ok(())
     }
@@ -151,7 +151,7 @@ mod tests {
             let (mut probe, mut hub) = UnixStream::pair()?;
             let serving = tokio::spawn(async move {
                 let mut store = Vec::new();
-                let hello: Frame = read_frame(&mut hub, &mut store, None, None).await?;
+                let hello: Frame = read_frame(&mut hub, &mut store, None).await?;
                 assert!(matches!(hello, Frame::Hello { .. }));
                 write_frame(&mut hub, &reply).await
             });

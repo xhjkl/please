@@ -19,7 +19,7 @@ fn some_setting() -> Setting {
 
 /// The messages the probe delivers next.
 async fn next_delivery(server: &mut UnixStream, store: &mut Vec<u8>) -> Result<Vec<Message>> {
-    match read_frame(server, store, None, None).await? {
+    match read_frame(server, store, None).await? {
         Frame::Advance { messages, .. } => Ok(messages),
         frame => Err(eyre!("expected a request, got {frame:?}")),
     }

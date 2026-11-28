@@ -92,7 +92,7 @@ async fn attempt_turn(
         let mut order = Vec::new();
 
         loop {
-            let frame = read_frame(stream, &mut store, None, None).await?;
+            let frame = read_frame(stream, &mut store, None).await?;
             // Stop the spinner before its line clear can erase streamed output.
             if let Some(spinner) = spinner.take() {
                 spinner.stop().await;
@@ -370,7 +370,7 @@ pub async fn restart(
         let mut store = Vec::new();
         let mut answered = false;
         loop {
-            let frame = read_frame(connection, &mut store, None, None).await?;
+            let frame = read_frame(connection, &mut store, None).await?;
             match frame {
                 Frame::Log(line) => display.show_log(&line),
                 // Asked for, the summary is the answer.
